@@ -188,7 +188,7 @@ func TestRecordApiKeyUsageConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < perGoroutine; i++ {
-				if err := RecordApiKeyUsage(created.ID, 7, 0.5); err != nil {
+				if err := RecordApiKeyUsage(created.ID, 7, 0.5, "", false); err != nil {
 					atomic.AddInt32(&failures, 1)
 					return
 				}
@@ -227,7 +227,7 @@ func TestResetApiKeyUsage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("add: %v", err)
 	}
-	if err := RecordApiKeyUsage(created.ID, 100, 1.5); err != nil {
+	if err := RecordApiKeyUsage(created.ID, 100, 1.5, "", false); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	if err := ResetApiKeyUsage(created.ID); err != nil {

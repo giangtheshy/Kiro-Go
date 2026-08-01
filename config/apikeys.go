@@ -221,9 +221,14 @@ func HasApiKeys() bool {
 }
 
 // RecordApiKeyUsage atomically adds tokens and credits to the entry's counters,
-// updates LastUsedAt, and increments RequestsCount. This is a hot-path call, so it
-// only marks the config dirty; the backgroundStatsSaver persists via FlushDirty.
-func RecordApiKeyUsage(id string, tokens int64, credits float64) error {
+// updates LastUsedAt, and increments RequestsCount. It also folds the usage into the
+// per-day bucket and per-model tally maintained by config/usage_history.go, so the
+// trends survive a restart. This is a hot-path call, so it only marks the config
+// dirty; the backgroundStatsSaver persists via FlushDirty.
+//
+// model may be empty (treated as "unknown"). failed, when true, only increments the
+// failure counters without touching token or credit totals.
+func RecordApiKeyUsage(id string, tokens int64, credits float64, model string, failed bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	if cfg == nil {
@@ -231,17 +236,27 @@ func RecordApiKeyUsage(id string, tokens int64, credits float64) error {
 	}
 	for i := range cfg.ApiKeys {
 		if cfg.ApiKeys[i].ID == id {
-			if tokens > 0 {
-				cfg.ApiKeys[i].TokensUsed += tokens
-				cfg.ApiKeys[i].LifetimeTokens += tokens
+			e := &cfg.ApiKeys[i]
+			if !failed {
+				if tokens > 0 {
+					e.TokensUsed += tokens
+					e.LifetimeTokens += tokens
+				}
+				if credits > 0 {
+					e.CreditsUsed += credits
+					e.LifetimeCredits += credits
+				}
+				e.RequestsCount++
+				e.LifetimeRequests++
 			}
-			if credits > 0 {
-				cfg.ApiKeys[i].CreditsUsed += credits
-				cfg.ApiKeys[i].LifetimeCredits += credits
+			e.LastUsedAt = time.Now().Unix()
+			// Persist rolling usage history (daily buckets + model breakdown).
+			inTok := tokens
+			if failed {
+				inTok = 0
 			}
-			cfg.ApiKeys[i].RequestsCount++
-			cfg.ApiKeys[i].LifetimeRequests++
-			cfg.ApiKeys[i].LastUsedAt = time.Now().Unix()
+			addDailyUsageLocked(e, inTok, 0, credits, failed)
+			addModelTallyLocked(e, model, inTok, 0, credits, failed)
 			markDirtyLocked()
 			return nil
 		}
@@ -365,6 +380,20 @@ func MaskApiKey(key string) string {
 // in the past. Keys with ExpiresAt == 0 never expire.
 func ApiKeyExpired(e ApiKeyEntry) bool {
 	return e.ExpiresAt > 0 && time.Now().Unix() >= e.ExpiresAt
+}
+
+// ApiKeyRemaining returns how many credits remain for a key.
+// A zero CreditLimit (unlimited) returns -1.
+// A limit with zero usage returns the full limit.
+func ApiKeyRemaining(e ApiKeyEntry) float64 {
+	if e.CreditLimit <= 0 {
+		return -1
+	}
+	r := e.CreditLimit - e.CreditsUsed
+	if r < 0 {
+		return 0
+	}
+	return r
 }
 
 // ApiKeyOverLimit returns (overToken, overCredit) for the entry. Limits with value 0

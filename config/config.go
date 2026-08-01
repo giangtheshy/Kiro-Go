@@ -218,6 +218,15 @@ type ApiKeyEntry struct {
 	IPAllowlist []string `json:"ipAllowlist,omitempty"`
 	TPMLimit    int      `json:"tpmLimit,omitempty"`
 
+	// Customer attribution. These let an operator answer "whose key is this?" from
+	// the admin panel alone, without opening the sales system's database. They are
+	// opaque labels to this service: nothing routes or authorizes on them.
+	// OwnerRef identifies the buyer (e.g. a Telegram user ID), OrderRef the order
+	// that produced the key, and Note is free-form operator text.
+	OwnerRef string `json:"ownerRef,omitempty"`
+	OrderRef string `json:"orderRef,omitempty"`
+	Note     string `json:"note,omitempty"`
+
 	// BoundAccountIDs restricts this key to a fixed set of accounts. When non-empty,
 	// a request authenticated with this key routes ONLY through these accounts (still
 	// subject to per-account cooldown/quota/model filtering). If none of the bound
@@ -249,6 +258,16 @@ type ApiKeyEntry struct {
 	LifetimeTokens   int64   `json:"lifetimeTokens,omitempty"`
 	LifetimeCredits  float64 `json:"lifetimeCredits,omitempty"`
 	LifetimeRequests int64   `json:"lifetimeRequests,omitempty"`
+
+	// Daily and ByModel are persisted rolling usage breakdowns kept by
+	// config/usage_history.go. They complement the cumulative counters above by
+	// letting an operator see per-day trends and model-level consumption without
+	// running a separate analytics service. Daily keeps the last UsageDaysKept
+	// calendar days; ByModel keeps up to ModelTallyKept entries. Both survive
+	// restarts because they live in config.json, unlike the in-memory usageStats
+	// in proxy/ which is lost on every restart.
+	Daily   []DailyUsage  `json:"daily,omitempty"`
+	ByModel []ModelTally  `json:"byModel,omitempty"`
 }
 
 // Config represents the global application configuration.
@@ -369,6 +388,36 @@ type Config struct {
 	// prompt so "what model are you?" answers with this name regardless of the real
 	// model. Empty = don't inject anything. See applyPromptFilters in proxy/translator.go.
 	IdentityModel string `json:"identityModel,omitempty"`
+
+	// --- Sales & operations fields ---
+
+	// BannedIPs holds the persistent IP block list, managed by config/ipban.go.
+	// The field is intentionally BanDisabled (not BanEnabled) so that a config
+	// written before this feature existed starts with the gate ON.
+	BannedIPs    []BannedIP `json:"bannedIps,omitempty"`
+	BanThreshold int        `json:"banThreshold,omitempty"` // 0 = use DefaultBanThreshold
+	BanDisabled  bool       `json:"banDisabled,omitempty"`  // true = gate off (inverted)
+
+	// CreditTopUps is the idempotency ledger for sales-bot top-up operations.
+	// It lives in config.json so idempotency survives restarts.
+	CreditTopUps []CreditTopUp `json:"creditTopUps,omitempty"`
+
+	// AuditLog records administrative actions. Capped to AuditLogKept entries.
+	AuditLog []AuditEntry `json:"auditLog,omitempty"`
+
+	// Alert configuration: thresholds and destinations for low-credits / expiry-soon
+	// notifications. AlertWebhook is a URL that receives POST requests with a JSON
+	// payload. Empty AlertWebhook disables HTTP notifications; the alert watcher still
+	// emits WARN log lines.
+	AlertWebhook          string  `json:"alertWebhook,omitempty"`
+	AlertCreditsPercent   float64 `json:"alertCreditsPercent,omitempty"`   // % remaining; 0 → default 10
+	AlertExpiryDays       int     `json:"alertExpiryDays,omitempty"`       // days ahead; 0 → default 3
+	AutoDisableExpired    bool    `json:"autoDisableExpired,omitempty"`    // disable keys past ExpiresAt
+
+	// Maintenance mode: when true, inference endpoints return a friendly notice
+	// instead of forwarding to Kiro. Admin endpoints and /health are unaffected.
+	MaintenanceMode    bool   `json:"maintenanceMode,omitempty"`
+	MaintenanceMessage string `json:"maintenanceMessage,omitempty"`
 }
 
 // PooledProxy is one outbound proxy in the shared pool, carrying persisted

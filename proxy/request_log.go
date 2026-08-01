@@ -29,6 +29,11 @@ type RequestLogEntry struct {
 	DurationMs   int64   `json:"durationMs"`
 	StatusCode   int     `json:"statusCode,omitempty"` // upstream/HTTP status on error
 	Error        string  `json:"error,omitempty"`      // error detail on failure
+	// ClientIP is the resolved real client IP address. Populated only when
+	// KIRO_TRUST_PROXY is enabled and the IP could be determined. The per-key
+	// self-service log endpoint strips this field before returning entries to
+	// the key owner: it is admin-only information.
+	ClientIP string `json:"clientIp,omitempty"`
 }
 
 // requestLogCapacity is the number of recent request entries retained in memory.

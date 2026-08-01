@@ -30,6 +30,12 @@ type apiKeyView struct {
 	IPAllowlist   []string `json:"ipAllowlist,omitempty"`
 	TPMLimit      int      `json:"tpmLimit,omitempty"`
 
+	// Customer attribution labels, surfaced so the admin panel can answer
+	// "whose key is this?" without querying the sales system.
+	OwnerRef string `json:"ownerRef,omitempty"`
+	OrderRef string `json:"orderRef,omitempty"`
+	Note     string `json:"note,omitempty"`
+
 	// BoundAccountIDs restricts routing to a fixed set of accounts (empty = shared pool).
 	BoundAccountIDs []string `json:"boundAccountIds,omitempty"`
 
@@ -62,6 +68,10 @@ func toApiKeyView(e config.ApiKeyEntry) apiKeyView {
 		IPLimit:       e.IPLimit,
 		IPAllowlist:   e.IPAllowlist,
 		TPMLimit:      e.TPMLimit,
+
+		OwnerRef: e.OwnerRef,
+		OrderRef: e.OrderRef,
+		Note:     e.Note,
 
 		BoundAccountIDs: e.BoundAccountIDs,
 		Models:          e.Models,
@@ -102,6 +112,10 @@ type apiKeyCreateRequest struct {
 	IPLimit     int      `json:"ipLimit,omitempty"`
 	IPAllowlist []string `json:"ipAllowlist,omitempty"`
 	TPMLimit    int      `json:"tpmLimit,omitempty"`
+
+	OwnerRef string `json:"ownerRef,omitempty"`
+	OrderRef string `json:"orderRef,omitempty"`
+	Note     string `json:"note,omitempty"`
 
 	BoundAccountIDs []string `json:"boundAccountIds,omitempty"`
 	// Models is the per-key model allowlist. Model is a legacy single-value alias folded
@@ -156,6 +170,9 @@ func createApiKeyFromRequest(req apiKeyCreateRequest) (config.ApiKeyEntry, error
 		IPLimit:         req.IPLimit,
 		IPAllowlist:     sanitizeIPAllowlist(req.IPAllowlist),
 		TPMLimit:        req.TPMLimit,
+		OwnerRef:        strings.TrimSpace(req.OwnerRef),
+		OrderRef:        strings.TrimSpace(req.OrderRef),
+		Note:            strings.TrimSpace(req.Note),
 		BoundAccountIDs: req.BoundAccountIDs,
 		Models:          mergeModelList(req.Models, req.Model),
 	})
@@ -285,6 +302,10 @@ type apiKeyUpdateRequest struct {
 	IPAllowlist *[]string `json:"ipAllowlist,omitempty"`
 	TPMLimit    *int      `json:"tpmLimit,omitempty"`
 
+	OwnerRef *string `json:"ownerRef,omitempty"`
+	OrderRef *string `json:"orderRef,omitempty"`
+	Note     *string `json:"note,omitempty"`
+
 	BoundAccountIDs *[]string `json:"boundAccountIds,omitempty"`
 
 	// Models is the per-key model allowlist. Model is a legacy single-value alias kept
@@ -338,6 +359,15 @@ func (h *Handler) apiUpdateApiKey(w http.ResponseWriter, r *http.Request, id str
 	}
 	if req.TPMLimit != nil {
 		patch.TPMLimit = *req.TPMLimit
+	}
+	if req.OwnerRef != nil {
+		patch.OwnerRef = strings.TrimSpace(*req.OwnerRef)
+	}
+	if req.OrderRef != nil {
+		patch.OrderRef = strings.TrimSpace(*req.OrderRef)
+	}
+	if req.Note != nil {
+		patch.Note = strings.TrimSpace(*req.Note)
 	}
 	if req.BoundAccountIDs != nil {
 		patch.BoundAccountIDs = *req.BoundAccountIDs

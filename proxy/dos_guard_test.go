@@ -255,7 +255,7 @@ func TestBug2GlobalSlotHeldDuringThrottleSleep(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed unrelated key: %v", err)
 	}
-	if err := config.RecordApiKeyUsage(unrelated.ID, 1, 0); err != nil {
+	if err := config.RecordApiKeyUsage(unrelated.ID, 1, 0, "", false); err != nil {
 		t.Fatalf("record over-limit usage: %v", err)
 	}
 	if err := config.SetLimitNoticeMessage("quota exhausted"); err != nil {

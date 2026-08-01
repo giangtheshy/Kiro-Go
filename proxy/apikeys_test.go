@@ -118,7 +118,7 @@ func TestAuthenticateRejectsOverTokenLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := config.RecordApiKeyUsage(created.ID, 100, 0); err != nil {
+	if err := config.RecordApiKeyUsage(created.ID, 100, 0, "", false); err != nil {
 		t.Fatalf("record usage: %v", err)
 	}
 	requireAuth(t)
@@ -143,7 +143,7 @@ func TestAuthenticateRejectsOverCreditLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := config.RecordApiKeyUsage(created.ID, 0, 1.0); err != nil {
+	if err := config.RecordApiKeyUsage(created.ID, 0, 1.0, "", false); err != nil {
 		t.Fatalf("record usage: %v", err)
 	}
 	requireAuth(t)
@@ -228,7 +228,7 @@ func TestRouteOverLimitRendersNoticeOpenAI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := config.RecordApiKeyUsage(created.ID, 50, 0); err != nil {
+	if err := config.RecordApiKeyUsage(created.ID, 50, 0, "", false); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	if err := config.SetLimitNoticeMessage("quota gone, renew via bot"); err != nil {
@@ -258,7 +258,7 @@ func TestRecordSuccessForApiKeyUpdatesEntry(t *testing.T) {
 	}
 
 	h := &Handler{}
-	h.recordSuccessForApiKey(created.ID, 25, 30, 0.75, "claude-test", nil, "claude", time.Time{})
+	h.recordSuccessForApiKey(created.ID, 25, 30, 0.75, "claude-test", nil, "claude", time.Time{}, "")
 
 	got := config.GetApiKeyEntry(created.ID)
 	if got == nil {
@@ -283,7 +283,7 @@ func TestRecordSuccessForApiKeyEmptyIDIsNoop(t *testing.T) {
 	}
 
 	h := &Handler{}
-	h.recordSuccessForApiKey("", 100, 100, 1, "claude-test", nil, "claude", time.Time{})
+	h.recordSuccessForApiKey("", 100, 100, 1, "claude-test", nil, "claude", time.Time{}, "")
 	got := config.GetApiKeyEntry(created.ID)
 	if got == nil {
 		t.Fatalf("entry missing")

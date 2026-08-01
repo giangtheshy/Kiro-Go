@@ -57,6 +57,15 @@ type Handler struct {
 	// adminSessions holds opaque, expiring admin session tokens so the browser never
 	// stores the raw admin password (H5) and the plaintext-password cookie is retired (M5).
 	adminSessions *adminSessionStore
+	// ipBanGate blocks addresses on the persistent ban list and promotes repeat
+	// auth failures onto it.
+	ipBanGate *ipBanGate
+	// keyLogHub fans per-key request records out to live SSE subscribers.
+	keyLogHub *keyLogHub
+	// streamTickets exchanges an API key for a short-lived token so an
+	// EventSource (which cannot set headers) can open the per-key stream.
+	streamTickets    *streamTicketStore
+	stopAlertWatcher chan struct{}
 }
 
 // safeGo runs fn in a new goroutine with panic containment: a panic inside fn is
@@ -271,12 +280,18 @@ func NewHandler() *Handler {
 		adminGuard:      loadAdminAuthGuard(),
 		adminSessions:   newAdminSessionStore(adminSessionTTL),
 	}
+	h.ipBanGate = newIPBanGate()
+	h.keyLogHub = newKeyLogHub()
+	h.streamTickets = newStreamTicketStore()
+	h.stopAlertWatcher = make(chan struct{})
 	// 启动后台刷新
 	safeGo(func() { h.backgroundRefresh() })
 	// 启动后台统计保存 (每30秒保存一次)
 	safeGo(func() { h.backgroundStatsSaver() })
 	// 清理过期的 stored responses（>30 天），定时循环而非仅启动时一次
 	safeGo(func() { h.backgroundPurge() })
+	// 低额度 / 即将过期告警扫描
+	safeGo(func() { h.backgroundAlertWatcher() })
 	return h
 }
 
@@ -306,6 +321,10 @@ func (h *Handler) Shutdown() {
 		close(h.stopRefresh)
 		close(h.stopStatsSaver)
 		close(h.stopPurge)
+		close(h.stopAlertWatcher)
+		if h.ipBanGate != nil {
+			h.ipBanGate.close()
+		}
 		// Capture the latest in-memory global counters and persist synchronously,
 		// so the caller can rely on a durable write having happened by the time
 		// Shutdown returns (backgroundStatsSaver's own stop-branch flush races us,
@@ -462,6 +481,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	clientIP := h.resolveClientIP(r)
 	r = withClientIP(r, clientIP)
 
+	// Persistent IP ban list. Checked before everything except CORS preflight so a
+	// banned address cannot reach auth, the admin panel, or the upstream call path.
+	// /health and /status stay reachable so external monitors keep working.
+	if h.ipBanGate != nil && path != "/health" && path != "/status" && h.ipBanGate.isBanned(clientIP) {
+		h.ipBanGate.reject(w)
+		return
+	}
+
 	// 应用层 DoS 防护：仅作用于会触发上游调用 / 鉴权的公开 API 端点。
 	// 管理端点 (/admin/*) 由独立密码保护且非公开分享，不在此限。
 	// 在路由前完成：每 IP 拒绝式限速 → 请求体大小上限。全局并发槽故意 NOT 在此获取，
@@ -474,6 +501,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if h.guard.maxBodyBytes > 0 {
 			r.Body = http.MaxBytesReader(w, r.Body, h.guard.maxBodyBytes)
+		}
+	}
+
+	// Maintenance mode blocks inference only. Admin, health, status and the
+	// self-service endpoints stay up so an operator can still work and customers
+	// can still see why their requests are failing.
+	switch path {
+	case "/v1/messages", "/messages", "/anthropic/v1/messages",
+		"/v1/chat/completions", "/chat/completions",
+		"/v1/responses", "/responses":
+		if h.isMaintenanceMode(w, r, path) {
+			return
 		}
 	}
 
@@ -531,6 +570,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.apiKeySelfInfo(w, r)
 	case path == "/v1/key/logs" || path == "/key/logs":
 		h.apiKeySelfLogs(w, r)
+	case path == "/v1/key/stream-ticket" && r.Method == "POST":
+		h.apiKeyStreamTicket(w, r)
+	case path == "/v1/key/logs/stream" && r.Method == "GET":
+		h.apiKeyLogStream(w, r)
+	// 销售机器人 API（管理员密码 / 会话鉴权）
+	case strings.HasPrefix(path, "/api/sales/v1/"):
+		h.handleSalesAPI(w, r)
+	// 公开状态端点（无需鉴权，供监控与机器人轮询）
+	case path == "/status" && r.Method == "GET":
+		h.handlePublicStatus(w, r)
 	case path == "/api/event_logging/batch":
 		// Claude Code 遥测端点 - 直接返回 200 OK
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -1528,7 +1577,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			if !messageStarted {
 				continue
 			}
-			h.recordFailureForApiKey(apiKeyID, "claude", model, 0, err.Error(), startedAt)
+			h.recordFailureForApiKey(apiKeyID, "claude", model, 0, err.Error(), startedAt, "")
 			h.sendSSE(w, flusher, "error", map[string]interface{}{
 				"type":  "error",
 				"error": map[string]string{"type": "api_error", "message": err.Error()},
@@ -1557,7 +1606,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 		outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model, account, "claude", startedAt)
+		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model, account, "claude", startedAt, "")
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
@@ -1584,14 +1633,14 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	if lastErr == nil {
-		h.recordFailureForApiKey(apiKeyID, "claude", model, 503, "No available accounts", startedAt)
+		h.recordFailureForApiKey(apiKeyID, "claude", model, 503, "No available accounts", startedAt, "")
 		h.sendClaudeError(w, 503, "api_error", "No available accounts")
 		return
 	}
 
 	status := statusForUpstreamError(lastErr)
 	applyRetryAfterHeader(w, lastErr)
-	h.recordFailureForApiKey(apiKeyID, "claude", model, status, lastErr.Error(), startedAt)
+	h.recordFailureForApiKey(apiKeyID, "claude", model, status, lastErr.Error(), startedAt, "")
 	h.sendClaudeError(w, status, "api_error", lastErr.Error())
 }
 
@@ -1660,16 +1709,29 @@ func (h *Handler) recordSuccess(inputTokens, outputTokens int, credits float64) 
 // When apiKeyID is empty (legacy single-key path or unauthenticated path), only the
 // global counters are updated. Persistence errors are logged but do not propagate.
 // model is recorded in the per-request log for the admin API Log view.
-func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTokens int, credits float64, model string, account *config.Account, endpoint string, startedAt time.Time) {
+// clientIP is the resolved real client IP (may be empty if KIRO_TRUST_PROXY is off
+// and RemoteAddr could not be parsed); stored in the request log for admin use only.
+func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTokens int, credits float64, model string, account *config.Account, endpoint string, startedAt time.Time, clientIP string) {
 	h.recordSuccess(inputTokens, outputTokens, credits)
 
 	keyName, keyMasked := apiKeyLabels(apiKeyID)
 	if apiKeyID != "" {
-		if err := config.RecordApiKeyUsage(apiKeyID, int64(inputTokens+outputTokens), credits); err != nil {
+		if err := config.RecordApiKeyUsage(apiKeyID, int64(inputTokens+outputTokens), credits, model, false); err != nil {
 			logger.Warnf("[ApiKey] failed to record usage for key %s: %v", apiKeyID, err)
 		}
 		if h.usage != nil {
 			h.usage.recordSuccess(apiKeyID, model, int64(inputTokens), 0, int64(outputTokens))
+		}
+		if h.keyLogHub != nil {
+			h.keyLogHub.publish(apiKeyID, keyLogEntry{
+				Status:     "ok",
+				Model:      model,
+				InTokens:   inputTokens,
+				OutTokens:  outputTokens,
+				Credits:    credits,
+				DurationMs: durationMs(startedAt),
+				ClientIP:   clientIP,
+			})
 		}
 	}
 
@@ -1693,6 +1755,7 @@ func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTok
 		OutputTokens: outputTokens,
 		Credits:      credits,
 		DurationMs:   durationMs(startedAt),
+		ClientIP:     clientIP,
 	})
 }
 
@@ -1716,10 +1779,25 @@ func durationMs(startedAt time.Time) int64 {
 
 // recordFailureForApiKey is recordFailure + a failure entry in the per-request log so the
 // admin API Log view shows what went wrong (endpoint, model, status code, error detail).
-func (h *Handler) recordFailureForApiKey(apiKeyID, endpoint, model string, statusCode int, errMsg string, startedAt time.Time) {
+// It also drives the per-key usage history with a failure tick so daily/byModel stay accurate.
+func (h *Handler) recordFailureForApiKey(apiKeyID, endpoint, model string, statusCode int, errMsg string, startedAt time.Time, clientIP string) {
 	h.recordFailure()
-	if apiKeyID != "" && h.usage != nil {
-		h.usage.recordFailure(apiKeyID, model)
+	if apiKeyID != "" {
+		if h.usage != nil {
+			h.usage.recordFailure(apiKeyID, model)
+		}
+		if err := config.RecordApiKeyUsage(apiKeyID, 0, 0, model, true); err != nil {
+			logger.Warnf("[ApiKey] failed to record failure for key %s: %v", apiKeyID, err)
+		}
+		if h.keyLogHub != nil {
+			h.keyLogHub.publish(apiKeyID, keyLogEntry{
+				Status:     "error",
+				Model:      model,
+				Error:      errMsg,
+				DurationMs: durationMs(startedAt),
+				ClientIP:   clientIP,
+			})
+		}
 	}
 	name, masked := apiKeyLabels(apiKeyID)
 	logRequest(RequestLogEntry{
@@ -1732,6 +1810,7 @@ func (h *Handler) recordFailureForApiKey(apiKeyID, endpoint, model string, statu
 		StatusCode:   statusCode,
 		Error:        errMsg,
 		DurationMs:   durationMs(startedAt),
+		ClientIP:     clientIP,
 	})
 }
 
@@ -1814,7 +1893,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model, account, "claude", startedAt)
+		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model, account, "claude", startedAt, "")
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
@@ -1854,14 +1933,14 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 	}
 
 	if lastErr == nil {
-		h.recordFailureForApiKey(apiKeyID, "claude", model, 503, "No available accounts", startedAt)
+		h.recordFailureForApiKey(apiKeyID, "claude", model, 503, "No available accounts", startedAt, "")
 		h.sendClaudeError(w, 503, "api_error", "No available accounts")
 		return
 	}
 
 	status := statusForUpstreamError(lastErr)
 	applyRetryAfterHeader(w, lastErr)
-	h.recordFailureForApiKey(apiKeyID, "claude", model, status, lastErr.Error(), startedAt)
+	h.recordFailureForApiKey(apiKeyID, "claude", model, status, lastErr.Error(), startedAt, "")
 	h.sendClaudeError(w, status, "api_error", lastErr.Error())
 }
 
@@ -2307,7 +2386,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			if !responseStarted {
 				continue
 			}
-			h.recordFailureForApiKey(apiKeyID, "openai", model, 0, err.Error(), startedAt)
+			h.recordFailureForApiKey(apiKeyID, "openai", model, 0, err.Error(), startedAt, "")
 			return
 		}
 
@@ -2335,7 +2414,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			outputTokens += estimateApproxTokens(tc.Function.Arguments)
 		}
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model, account, "openai", startedAt)
+		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model, account, "openai", startedAt, "")
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		logSuspiciousReq("openai", model, inputTokens, outputTokens, len(toolCalls) > 0)
@@ -2442,7 +2521,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model, account, "openai", startedAt)
+		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model, account, "openai", startedAt, "")
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		logSuspiciousReq("openai", model, inputTokens, outputTokens, len(toolUses) > 0)
@@ -2455,14 +2534,14 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 	}
 
 	if lastErr == nil {
-		h.recordFailureForApiKey(apiKeyID, "openai", model, 503, "No available accounts", startedAt)
+		h.recordFailureForApiKey(apiKeyID, "openai", model, 503, "No available accounts", startedAt, "")
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
 
 	status := statusForUpstreamError(lastErr)
 	applyRetryAfterHeader(w, lastErr)
-	h.recordFailureForApiKey(apiKeyID, "openai", model, status, lastErr.Error(), startedAt)
+	h.recordFailureForApiKey(apiKeyID, "openai", model, status, lastErr.Error(), startedAt, "")
 	h.sendOpenAIError(w, status, errorTypeForOpenAIStatus(status), lastErr.Error())
 }
 
@@ -2792,6 +2871,26 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiUpdateApiKey(w, r, strings.TrimPrefix(path, "/api-keys/"))
 	case strings.HasPrefix(path, "/api-keys/") && r.Method == "DELETE":
 		h.apiDeleteApiKey(w, r, strings.TrimPrefix(path, "/api-keys/"))
+
+	// IP 封禁 / 审计 / 异常检测 / 维护模式 / 充值台账
+	case path == "/ip-bans" && r.Method == "GET":
+		h.apiGetIPBans(w, r)
+	case path == "/ip-bans" && r.Method == "POST":
+		h.apiAddIPBan(w, r)
+	case path == "/ip-bans" && r.Method == "DELETE":
+		h.apiClearIPBans(w, r)
+	case path == "/ip-bans/settings" && r.Method == "PATCH":
+		h.apiUpdateIPBanSettings(w, r)
+	case strings.HasPrefix(path, "/ip-bans/") && r.Method == "DELETE":
+		h.apiDeleteIPBan(w, r, strings.TrimPrefix(path, "/ip-bans/"))
+	case path == "/anomalies" && r.Method == "GET":
+		h.apiGetAnomalies(w, r)
+	case path == "/audit-log" && r.Method == "GET":
+		h.apiGetAuditLog(w, r)
+	case path == "/maintenance" && r.Method == "POST":
+		h.apiSetMaintenanceMode(w, r)
+	case path == "/credit-topups" && r.Method == "GET":
+		h.salesTopupsAdmin(w, r)
 	default:
 		w.WriteHeader(404)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Not Found"})
@@ -3970,6 +4069,9 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 		"totalTokens":     h.totalTokens,
 		"totalCredits":    h.totalCredits,
 		"uptime":          time.Now().Unix() - h.startTime,
+
+		"maintenance":        config.GetMaintenanceMode(),
+		"maintenanceMessage": config.GetMaintenanceMessage(),
 	})
 }
 

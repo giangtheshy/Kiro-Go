@@ -659,6 +659,7 @@
   function showMain() {
     $('loginPage').classList.add('hidden');
     $('mainPage').classList.remove('hidden');
+    restoreTabFromUrl();
   }
 
   // Data loaders
@@ -680,6 +681,7 @@
     $('statFailed').textContent = d.failedRequests || 0;
     $('statTokens').textContent = formatNum(d.totalTokens || 0);
     $('statCredits').textContent = (d.totalCredits || 0).toFixed(1);
+    renderMaintenanceState(!!d.maintenance, d.maintenanceMessage);
   }
   async function loadAccounts() {
     const res = await api('/accounts');
@@ -1955,6 +1957,15 @@
       const modelList = Array.isArray(item.models) ? item.models.filter(Boolean) : [];
       const modelValue = modelList.length ? modelList.join(', ') : t('apiKeys.modelDefault');
       const modelsLine = '<div class="text-xs muted-text">' + escapeHtml(t('apiKeys.model')) + ': ' + escapeHtml(modelValue) + '</div>';
+      // Customer attribution line — only rendered when at least one field is set, so
+      // deployments that never use these labels keep the card compact.
+      const customerParts = [];
+      if (item.ownerRef) customerParts.push(t('apiKeys.ownerRef') + ': ' + item.ownerRef);
+      if (item.orderRef) customerParts.push(t('apiKeys.orderRef') + ': ' + item.orderRef);
+      if (item.note) customerParts.push(t('apiKeys.note') + ': ' + item.note);
+      const customerLine = customerParts.length
+        ? '<div class="text-xs muted-text">' + escapeHtml(customerParts.join(' · ')) + '</div>'
+        : '';
       return '<div class="card" data-apikey-id="' + id + '" style="margin-top:0.5rem;padding:0.75rem;">' +
         '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
           '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' +
@@ -1987,6 +1998,7 @@
           expiryLine +
           boundLine +
           modelsLine +
+          customerLine +
         '</div>' +
       '</div>';
     }).join('');
@@ -2129,6 +2141,9 @@
     if ($('apiKeyForm_ipLimit')) $('apiKeyForm_ipLimit').value = entry ? String(entry.ipLimit || 0) : '0';
     if ($('apiKeyForm_ipAllowlist')) $('apiKeyForm_ipAllowlist').value = (entry && Array.isArray(entry.ipAllowlist)) ? entry.ipAllowlist.join('\n') : '';
     if ($('apiKeyForm_tpmLimit')) $('apiKeyForm_tpmLimit').value = entry ? String(entry.tpmLimit || 0) : '0';
+    if ($('apiKeyForm_ownerRef')) $('apiKeyForm_ownerRef').value = entry ? (entry.ownerRef || '') : '';
+    if ($('apiKeyForm_orderRef')) $('apiKeyForm_orderRef').value = entry ? (entry.orderRef || '') : '';
+    if ($('apiKeyForm_note')) $('apiKeyForm_note').value = entry ? (entry.note || '') : '';
     initApiKeyModels('apiKeyForm_models', apiKeyModelsSelected, entry && Array.isArray(entry.models) ? entry.models : []);
     initApiKeyBoundAccounts(entry && Array.isArray(entry.boundAccountIds) ? entry.boundAccountIds : []);
     apiKeyModalSubmitting = false;
@@ -2254,6 +2269,9 @@
         ipLimit: isNaN(ipLimit) || ipLimit < 0 ? 0 : ipLimit,
         ipAllowlist: ipAllowlist,
         tpmLimit: isNaN(tpmLimit) || tpmLimit < 0 ? 0 : tpmLimit,
+        ownerRef: $('apiKeyForm_ownerRef') ? $('apiKeyForm_ownerRef').value.trim() : '',
+        orderRef: $('apiKeyForm_orderRef') ? $('apiKeyForm_orderRef').value.trim() : '',
+        note: $('apiKeyForm_note') ? $('apiKeyForm_note').value.trim() : '',
         boundAccountIds: selectedBoundAccountIds(),
         models: Array.from(apiKeyModelsSelected)
       };
@@ -3948,6 +3966,7 @@
         (e.apiKeyName || '').toLowerCase().includes(kw) ||
         (e.apiKeyMasked || '').toLowerCase().includes(kw) ||
         (e.accountEmail || '').toLowerCase().includes(kw) ||
+        (e.clientIp || '').toLowerCase().includes(kw) ||
         (e.error || '').toLowerCase().includes(kw));
     }
     return out;
@@ -4006,11 +4025,18 @@
         : dash;
       const durationCell = e.durationMs ? escapeHtml(formatNumber(e.durationMs)) + 'ms' : dash;
       const numOrDash = v => (isError && !v) ? dash : escapeHtml(formatNumber(v || 0));
+      // Client IP cell doubles as a one-click ban entry point for abusive callers.
+      const ipCell = e.clientIp
+        ? '<span class="text-xs font-mono">' + escapeHtml(e.clientIp) + '</span>' +
+          ' <button class="btn btn-outline btn-xs" type="button" data-log-action="ban-ip" data-ip="' +
+          escapeAttr(e.clientIp) + '">' + escapeHtml(t('requestLogs.banIp')) + '</button>'
+        : dash;
       return '<tr>' +
         '<td class="text-xs font-mono">' + escapeHtml(formatLogTime(e.time)) + '</td>' +
         '<td>' + statusBadge + '</td>' +
         '<td class="text-xs">' + escapeHtml(e.endpoint || '') + '</td>' +
         '<td>' + keyLabel + '</td>' +
+        '<td>' + ipCell + '</td>' +
         '<td class="text-xs">' + escapeHtml(e.model || '') + '</td>' +
         '<td>' + (isError ? dash : accountLabel) + '</td>' +
         '<td class="num text-xs"><span style="color:#22c55e;">&#9660; ' + numOrDash(e.inputTokens) + '</span> / <span style="color:#f59e0b;">&#9650; ' + numOrDash(e.outputTokens) + '</span></td>' +
@@ -4049,7 +4075,7 @@
     if (!entries.length) { toast(t('logs.exportFailed'), 'error'); return; }
     let blob;
     if (format === 'csv') {
-      const cols = ['time', 'status', 'endpoint', 'apiKeyName', 'apiKeyMasked', 'model', 'accountEmail', 'inputTokens', 'outputTokens', 'totalTokens', 'credits', 'durationMs', 'statusCode', 'error'];
+      const cols = ['time', 'status', 'endpoint', 'apiKeyName', 'apiKeyMasked', 'clientIp', 'model', 'accountEmail', 'inputTokens', 'outputTokens', 'totalTokens', 'credits', 'durationMs', 'statusCode', 'error'];
       const esc = v => {
         const s = String(v == null ? '' : v);
         return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
@@ -4095,6 +4121,364 @@
     refreshCustomSelects($('tabApilog'));
   }
 
+  // ---------------------------------------------------------------------------
+  // IP bans
+  // ---------------------------------------------------------------------------
+
+  async function loadIPBans() {
+    const body = $('ipBanBody');
+    if (!body) return;
+    try {
+      const res = await api('/ip-bans');
+      const d = await res.json().catch(() => ({}));
+      renderIPBans(d || {});
+    } catch (e) {
+      renderIPBans({});
+    }
+  }
+
+  function renderIPBans(data) {
+    const body = $('ipBanBody');
+    const empty = $('ipBanEmpty');
+    if (!body) return;
+
+    const enabledEl = $('ipBanEnabled');
+    if (enabledEl) enabledEl.checked = !!data.enabled;
+    const thresholdEl = $('ipBanThreshold');
+    if (thresholdEl && data.threshold) thresholdEl.value = String(data.threshold);
+
+    const bans = Array.isArray(data.bans) ? data.bans : [];
+    if (!bans.length) {
+      body.innerHTML = '';
+      if (empty) empty.classList.remove('hidden');
+    } else {
+      if (empty) empty.classList.add('hidden');
+      body.innerHTML = bans.map(b => {
+        const ip = escapeAttr(b.ip || '');
+        return '<tr>' +
+          '<td class="text-xs font-mono">' + escapeHtml(b.ip || '') + '</td>' +
+          '<td class="text-xs">' + escapeHtml(b.reason || '') + '</td>' +
+          '<td class="num">' + escapeHtml(formatNumber(b.fails || 0)) + '</td>' +
+          '<td class="text-xs font-mono">' + escapeHtml(formatLogTime(b.bannedUnix)) + '</td>' +
+          '<td class="text-xs">' + escapeHtml(b.note || '') + '</td>' +
+          '<td><button class="btn btn-outline btn-sm" type="button" data-ipban-action="unban" data-ip="' + ip + '">' +
+            escapeHtml(t('ipBans.unban')) + '</button></td>' +
+          '</tr>';
+      }).join('');
+    }
+
+    const near = $('ipBanNearList');
+    if (near) {
+      const list = Array.isArray(data.nearThreshold) ? data.nearThreshold : [];
+      near.innerHTML = list.length
+        ? list.map(n => '<span class="apilog-chip">' + escapeHtml(n.ip || '') + ': ' +
+            escapeHtml(String(n.count || 0)) + '/' + escapeHtml(String(n.threshold || 0)) + '</span>').join('')
+        : '<span class="muted-text text-xs">' + escapeHtml(t('ipBans.noData')) + '</span>';
+    }
+  }
+
+  async function addIPBan(ip, note) {
+    ip = (ip || '').trim();
+    if (!ip) return;
+    try {
+      const res = await api('/ip-bans', { method: 'POST', body: JSON.stringify({ ip, note: note || '' }) });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(d.error || t('common.failed'));
+      toast(t('ipBans.banned', ip), 'success');
+      const ipEl = $('ipBanAddIp');
+      const noteEl = $('ipBanAddNote');
+      if (ipEl) ipEl.value = '';
+      if (noteEl) noteEl.value = '';
+      await loadIPBans();
+    } catch (e) {
+      toast((e && e.message) || t('common.failed'), 'error');
+    }
+  }
+
+  async function removeIPBan(ip) {
+    try {
+      const res = await api('/ip-bans/' + encodeURIComponent(ip), { method: 'DELETE' });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(d.error || t('common.failed'));
+      toast(t('ipBans.unbanned', ip), 'success');
+      await loadIPBans();
+    } catch (e) {
+      toast((e && e.message) || t('common.failed'), 'error');
+    }
+  }
+
+  async function clearIPBans() {
+    const ok = await confirmAction(t('ipBans.confirmClear'), {
+      title: t('ipBans.clearAll'),
+      confirmText: t('ipBans.clearAll'),
+      variant: 'danger'
+    });
+    if (!ok) return;
+    try {
+      const res = await api('/ip-bans', { method: 'DELETE' });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(d.error || t('common.failed'));
+      toast(t('ipBans.cleared', d.removed || 0), 'success');
+      await loadIPBans();
+    } catch (e) {
+      toast((e && e.message) || t('common.failed'), 'error');
+    }
+  }
+
+  async function saveIPBanSettings() {
+    const enabledEl = $('ipBanEnabled');
+    const thresholdEl = $('ipBanThreshold');
+    const threshold = parseInt(thresholdEl ? thresholdEl.value : '', 10);
+    if (isNaN(threshold) || threshold < 1) {
+      toast(t('ipBans.thresholdError'), 'error');
+      return;
+    }
+    try {
+      const res = await api('/ip-bans/settings', {
+        method: 'PATCH',
+        body: JSON.stringify({ enabled: !!(enabledEl && enabledEl.checked), threshold })
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(d.error || t('common.saveFailed'));
+      toast(t('common.saved'), 'success');
+      await loadIPBans();
+    } catch (e) {
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Anomaly dashboard
+  // ---------------------------------------------------------------------------
+
+  async function loadAnomalies() {
+    const body = $('anomalyBody');
+    if (!body) return;
+    try {
+      const res = await api('/anomalies');
+      const d = await res.json().catch(() => ({}));
+      renderAnomalies(d || {});
+    } catch (e) {
+      renderAnomalies({});
+    }
+  }
+
+  // Score colour bands mirror the backend's weighting: 60+ is worth interrupting an
+  // operator over, 30+ is worth a look, anything lower is informational.
+  function anomalyScoreColor(score) {
+    if (score >= 60) return '#ef4444';
+    if (score >= 30) return '#f59e0b';
+    return '#3b82f6';
+  }
+
+  function renderAnomalies(data) {
+    const body = $('anomalyBody');
+    const empty = $('anomalyEmpty');
+    if (!body) return;
+    const rows = Array.isArray(data.anomalies) ? data.anomalies : [];
+    if (!rows.length) {
+      body.innerHTML = '';
+      if (empty) empty.classList.remove('hidden');
+      return;
+    }
+    if (empty) empty.classList.add('hidden');
+    body.innerHTML = rows.map(a => {
+      const keyId = escapeAttr(a.keyId || '');
+      const label = a.keyName || a.keyId || '';
+      const owner = a.ownerRef
+        ? '<div class="text-xs muted-text">' + escapeHtml(a.ownerRef) + '</div>'
+        : '';
+      const reasons = Array.isArray(a.reasons) && a.reasons.length
+        ? a.reasons.map(r => '<div class="text-xs">' + escapeHtml(r) + '</div>').join('')
+        : '<span class="muted-text">-</span>';
+      const topIP = (Array.isArray(a.topIPs) && a.topIPs.length) ? (a.topIPs[0].ip || '') : '';
+      const banBtn = topIP
+        ? '<button class="btn btn-outline btn-sm" type="button" data-anomaly-action="ban-ip" data-ip="' +
+            escapeAttr(topIP) + '" title="' + escapeAttr(topIP) + '">' + escapeHtml(t('anomaly.banTopIp')) + '</button>'
+        : '';
+      const disableBtn = a.enabled
+        ? '<button class="btn btn-outline btn-sm" type="button" data-anomaly-action="disable" data-id="' + keyId + '">' +
+            escapeHtml(t('anomaly.disableKey')) + '</button>'
+        : '';
+      return '<tr>' +
+        '<td><div class="text-xs font-semibold">' + escapeHtml(label) + '</div>' + owner + '</td>' +
+        '<td class="num"><span style="color:' + anomalyScoreColor(a.score || 0) + ';font-weight:600;">' +
+          escapeHtml(formatNumber(a.score || 0)) + '</span></td>' +
+        '<td>' + reasons + '</td>' +
+        '<td class="num">' + escapeHtml(formatNumber(a.distinctIPs || 0)) + '</td>' +
+        '<td class="num">' + escapeHtml((a.errorRate || 0).toFixed(1)) + '%</td>' +
+        '<td class="num">' + escapeHtml(formatNumber(a.burstRpm || 0)) + '</td>' +
+        '<td><div class="flex items-center gap-2" style="flex-wrap:wrap;">' + disableBtn + banBtn +
+          '<button class="btn btn-outline btn-sm" type="button" data-anomaly-action="reset" data-id="' + keyId + '">' +
+          escapeHtml(t('anomaly.resetUsage')) + '</button></div></td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  async function anomalyDisableKey(id) {
+    const ok = await confirmAction(t('anomaly.confirmDisable'), {
+      title: t('anomaly.disableKey'),
+      confirmText: t('anomaly.disableKey'),
+      variant: 'danger'
+    });
+    if (!ok) return;
+    try {
+      const res = await api('/api-keys/' + encodeURIComponent(id), { method: 'PUT', body: JSON.stringify({ enabled: false }) });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
+      toast(t('common.saved'), 'success');
+      await loadAnomalies();
+    } catch (e) {
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+    }
+  }
+
+  async function anomalyResetUsage(id) {
+    const ok = await confirmAction(t('anomaly.confirmReset'), {
+      title: t('anomaly.resetUsage'),
+      confirmText: t('anomaly.resetUsage')
+    });
+    if (!ok) return;
+    try {
+      const res = await api('/api-keys/' + encodeURIComponent(id) + '/reset-usage', { method: 'POST' });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.failed'));
+      toast(t('apiKeys.usageReset'), 'success');
+      await loadAnomalies();
+    } catch (e) {
+      toast((e && e.message) || t('common.failed'), 'error');
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Audit log
+  // ---------------------------------------------------------------------------
+
+  let auditActionFilter = '';
+
+  async function loadAuditLog(action) {
+    const body = $('auditBody');
+    if (!body) return;
+    action = action || '';
+    try {
+      const qs = action ? ('?action=' + encodeURIComponent(action)) : '';
+      const res = await api('/audit-log' + qs);
+      const d = await res.json().catch(() => ({}));
+      renderAuditLog(d || {});
+    } catch (e) {
+      renderAuditLog({});
+    }
+  }
+
+  function renderAuditLog(data) {
+    const body = $('auditBody');
+    const empty = $('auditEmpty');
+    if (!body) return;
+    const entries = Array.isArray(data.entries) ? data.entries : [];
+    if (!entries.length) {
+      body.innerHTML = '';
+      if (empty) empty.classList.remove('hidden');
+      return;
+    }
+    if (empty) empty.classList.add('hidden');
+    const dash = '<span class="muted-text">-</span>';
+    body.innerHTML = entries.map(e => '<tr>' +
+      '<td class="text-xs font-mono">' + escapeHtml(formatLogTime(e.timeUnix)) + '</td>' +
+      '<td class="text-xs">' + escapeHtml(e.actor || '') + '</td>' +
+      '<td class="text-xs font-mono">' + escapeHtml(e.action || '') + '</td>' +
+      '<td class="text-xs">' + (e.target ? escapeHtml(e.target) : dash) + '</td>' +
+      '<td class="text-xs">' + (e.detail ? escapeHtml(e.detail) : dash) + '</td>' +
+      '<td class="text-xs font-mono">' + (e.ip ? escapeHtml(e.ip) : dash) + '</td>' +
+      '</tr>').join('');
+  }
+
+  // ---------------------------------------------------------------------------
+  // Maintenance mode
+  // ---------------------------------------------------------------------------
+
+  function renderMaintenanceState(enabled, message) {
+    const badge = $('maintenanceBadge');
+    if (badge) badge.classList.toggle('hidden', !enabled);
+    const msg = $('maintenanceMessage');
+    if (msg && typeof message === 'string' && message && document.activeElement !== msg) {
+      msg.value = message;
+    }
+  }
+
+  async function setMaintenanceMode(enabled) {
+    const msgEl = $('maintenanceMessage');
+    const message = msgEl ? msgEl.value.trim() : '';
+    try {
+      const res = await api('/maintenance', { method: 'POST', body: JSON.stringify({ enabled, message }) });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(d.error || t('common.saveFailed'));
+      renderMaintenanceState(enabled, message);
+      toast(t(enabled ? 'maintenance.enabled' : 'maintenance.disabled'), enabled ? 'error' : 'success');
+    } catch (e) {
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+    }
+  }
+
+  function bindSecurityEvents() {
+    const ipBanAdd = $('ipBanAddBtn');
+    if (ipBanAdd) ipBanAdd.addEventListener('click', () => {
+      addIPBan($('ipBanAddIp').value, $('ipBanAddNote') ? $('ipBanAddNote').value : '');
+    });
+    const ipBanAddIp = $('ipBanAddIp');
+    if (ipBanAddIp) ipBanAddIp.addEventListener('keypress', e => {
+      if (e.key === 'Enter') addIPBan(ipBanAddIp.value, $('ipBanAddNote') ? $('ipBanAddNote').value : '');
+    });
+    const ipBanRefresh = $('ipBanRefreshBtn');
+    if (ipBanRefresh) ipBanRefresh.addEventListener('click', loadIPBans);
+    const ipBanClear = $('ipBanClearBtn');
+    if (ipBanClear) ipBanClear.addEventListener('click', clearIPBans);
+    const ipBanSave = $('ipBanSettingsSaveBtn');
+    if (ipBanSave) ipBanSave.addEventListener('click', saveIPBanSettings);
+    const ipBanEnabled = $('ipBanEnabled');
+    if (ipBanEnabled) ipBanEnabled.addEventListener('change', saveIPBanSettings);
+    const ipBanBody = $('ipBanBody');
+    if (ipBanBody) ipBanBody.addEventListener('click', e => {
+      const btn = e.target.closest('[data-ipban-action="unban"]');
+      if (btn) removeIPBan(btn.dataset.ip);
+    });
+
+    const anomalyRefresh = $('anomalyRefreshBtn');
+    if (anomalyRefresh) anomalyRefresh.addEventListener('click', loadAnomalies);
+    const anomalyBody = $('anomalyBody');
+    if (anomalyBody) anomalyBody.addEventListener('click', e => {
+      const btn = e.target.closest('[data-anomaly-action]');
+      if (!btn) return;
+      const action = btn.dataset.anomalyAction;
+      if (action === 'disable') anomalyDisableKey(btn.dataset.id);
+      else if (action === 'reset') anomalyResetUsage(btn.dataset.id);
+      else if (action === 'ban-ip') addIPBan(btn.dataset.ip, 'anomaly dashboard');
+    });
+
+    const auditRefresh = $('auditRefreshBtn');
+    if (auditRefresh) auditRefresh.addEventListener('click', () => loadAuditLog(auditActionFilter));
+    const auditFilter = $('auditActionFilter');
+    if (auditFilter) auditFilter.addEventListener('change', () => {
+      auditActionFilter = auditFilter.value;
+      loadAuditLog(auditActionFilter);
+    });
+
+    const maintEnable = $('maintenanceEnableBtn');
+    if (maintEnable) maintEnable.addEventListener('click', () => setMaintenanceMode(true));
+    const maintDisable = $('maintenanceDisableBtn');
+    if (maintDisable) maintDisable.addEventListener('click', () => setMaintenanceMode(false));
+
+    const apiLogBody = $('apiLogBody');
+    if (apiLogBody) apiLogBody.addEventListener('click', e => {
+      const btn = e.target.closest('[data-log-action="ban-ip"]');
+      if (btn) addIPBan(btn.dataset.ip, 'request log');
+    });
+
+    window.addEventListener('popstate', () => {
+      const tab = new URLSearchParams(location.search).get('tab');
+      if (isKnownTab(tab)) switchTab(tab, false);
+    });
+  }
+
   // Tabs
   let tabPollTimer = null;
   const TAB_POLL_MS = 5000;
@@ -4112,15 +4496,35 @@
     loadApiKeys();
   }
 
-  function switchTab(tab) {
+  // isKnownTab guards against a hand-edited ?tab= value pointing at a panel that
+  // does not exist — switchTab would otherwise throw on a null content element.
+  function isKnownTab(tab) {
+    if (!tab) return false;
+    return !!document.querySelector('#tabBar .tab[data-tab="' + CSS.escape(tab) + '"]');
+  }
+
+  function switchTab(tab, pushUrl) {
     qsa('.tab').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
     qsa('.tab-content').forEach(c => c.classList.add('hidden'));
     $('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.remove('hidden');
+    if (pushUrl !== false) {
+      history.replaceState(null, '', location.pathname + '?tab=' + encodeURIComponent(tab));
+    }
     if (tab === 'console') openConsole();
     else closeConsole();
     stopTabPolling();
     if (tab === 'apilog') { populateApiLogKeyFilter(); loadApiLog(); startTabPolling(loadApiLog); }
     else if (tab === 'settings') { startTabPolling(refreshApiKeysIfIdle); }
+    else if (tab === 'ipbans') { loadIPBans(); }
+    else if (tab === 'anomaly') { loadAnomalies(); }
+    else if (tab === 'audit') { loadAuditLog(auditActionFilter); }
+  }
+
+  // restoreTabFromUrl activates the tab named in ?tab= on first paint so a deep link
+  // (or a reload) lands the operator back where they were.
+  function restoreTabFromUrl() {
+    const urlTab = new URLSearchParams(location.search).get('tab');
+    if (isKnownTab(urlTab)) switchTab(urlTab, false);
   }
 
   // Event wiring
@@ -4355,6 +4759,7 @@
     bindDetailEvents();
     bindTestEvents();
     bindConsoleEvents();
+    bindSecurityEvents();
   }
 
   // Init

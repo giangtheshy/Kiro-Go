@@ -112,6 +112,12 @@
                 data-i18n="tabs.apilog"></span></button>
             <button type="button" class="tab" data-tab="console"><i class="fa-solid fa-terminal tab-icon"></i><span
                 data-i18n="tabs.console"></span></button>
+            <button type="button" class="tab" data-tab="ipbans"><i class="fa-solid fa-ban tab-icon"></i><span
+                data-i18n="tabs.ipbans"></span></button>
+            <button type="button" class="tab" data-tab="anomaly"><i
+                class="fa-solid fa-triangle-exclamation tab-icon"></i><span data-i18n="tabs.anomaly"></span></button>
+            <button type="button" class="tab" data-tab="audit"><i class="fa-solid fa-book tab-icon"></i><span
+                data-i18n="tabs.audit"></span></button>
           </div>
         </nav>
         <div class="topbar-actions justify-end">
@@ -514,6 +520,26 @@
           </div>
         </div>
 
+        <!-- Maintenance mode -->
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title" data-i18n="maintenance.mode"></span>
+            <span class="api-pill hidden" id="maintenanceBadge" data-i18n="maintenance.active"></span>
+          </div>
+          <div class="form-group">
+            <label data-i18n="maintenance.message"></label>
+            <textarea id="maintenanceMessage" rows="2" autocomplete="off"
+              data-i18n-placeholder="maintenance.messagePlaceholder"></textarea>
+            <small data-i18n="maintenance.hint"></small>
+          </div>
+          <div class="flex items-center gap-2" style="flex-wrap:wrap;">
+            <button class="btn btn-danger btn-sm" id="maintenanceEnableBtn" type="button"
+              data-i18n="maintenance.enable"></button>
+            <button class="btn btn-primary btn-sm" id="maintenanceDisableBtn" type="button"
+              data-i18n="maintenance.disable"></button>
+          </div>
+        </div>
+
         <!-- Statistics reset -->
         <div class="card">
           <div class="card-header"><span class="card-title" data-i18n="settings.statistics"></span></div>
@@ -633,6 +659,7 @@
                   <th data-i18n="apilog.colStatus"></th>
                   <th data-i18n="apilog.colEndpoint"></th>
                   <th data-i18n="apilog.colKey"></th>
+                  <th data-i18n="requestLogs.clientIp"></th>
                   <th data-i18n="apilog.colModel"></th>
                   <th data-i18n="apilog.colAccount"></th>
                   <th class="num" data-i18n="apilog.colInOut"></th>
@@ -685,6 +712,149 @@
             </div>
           </div>
           <div class="console-output" id="consoleOutput" role="log" aria-live="polite"></div>
+        </div>
+      </div>
+
+      <!-- IP bans tab -->
+      <div id="tabIpbans" class="tab-content hidden">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title" data-i18n="ipBans.title"></span>
+            <div class="card-actions">
+              <button class="btn btn-outline btn-sm" id="ipBanRefreshBtn" type="button"><i
+                  class="fa-solid fa-arrows-rotate" aria-hidden="true"></i><span class="btn-text"
+                  data-i18n="apilog.refresh"></span></button>
+              <button class="btn btn-danger btn-sm" id="ipBanClearBtn" type="button"><i class="fa-solid fa-trash"
+                  aria-hidden="true"></i><span class="btn-text" data-i18n="ipBans.clearAll"></span></button>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="flex items-center gap-2">
+              <span class="switch"><input type="checkbox" id="ipBanEnabled" /><span class="slider"></span></span>
+              <span data-i18n="ipBans.enabled"></span>
+            </label>
+          </div>
+          <div class="form-group">
+            <label data-i18n="ipBans.threshold"></label>
+            <div class="input-row">
+              <input type="number" id="ipBanThreshold" class="w-32!" min="1" step="1" value="5" />
+              <button class="btn btn-primary btn-sm" id="ipBanSettingsSaveBtn" type="button"
+                data-i18n="common.save"></button>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label data-i18n="ipBans.addBan"></label>
+            <div class="input-row">
+              <input type="text" id="ipBanAddIp" placeholder="203.0.113.7" autocomplete="off" />
+              <input type="text" id="ipBanAddNote" data-i18n-placeholder="ipBans.notePlaceholder" autocomplete="off" />
+              <button class="btn btn-primary btn-sm" id="ipBanAddBtn" type="button" data-i18n="ipBans.addBan"></button>
+            </div>
+          </div>
+
+          <div class="table-scroll">
+            <table class="data-table" id="ipBanTable">
+              <thead>
+                <tr>
+                  <th data-i18n="ipBans.colIp"></th>
+                  <th data-i18n="ipBans.colReason"></th>
+                  <th class="num" data-i18n="ipBans.colFails"></th>
+                  <th data-i18n="ipBans.colBannedAt"></th>
+                  <th data-i18n="ipBans.colNote"></th>
+                  <th data-i18n="ipBans.colActions"></th>
+                </tr>
+              </thead>
+              <tbody id="ipBanBody"></tbody>
+            </table>
+          </div>
+          <div id="ipBanEmpty" class="muted-text hidden" style="padding:1rem 0;text-align:center;"
+            data-i18n="ipBans.noData"></div>
+
+          <div class="form-group" style="margin-top:1rem;">
+            <label data-i18n="ipBans.nearThreshold"></label>
+            <div id="ipBanNearList" class="apilog-summary"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Anomaly tab -->
+      <div id="tabAnomaly" class="tab-content hidden">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title" data-i18n="anomaly.title"></span>
+            <div class="card-actions">
+              <button class="btn btn-outline btn-sm" id="anomalyRefreshBtn" type="button"><i
+                  class="fa-solid fa-arrows-rotate" aria-hidden="true"></i><span class="btn-text"
+                  data-i18n="apilog.refresh"></span></button>
+            </div>
+          </div>
+          <div class="table-scroll">
+            <table class="data-table" id="anomalyTable">
+              <thead>
+                <tr>
+                  <th data-i18n="apilog.colKey"></th>
+                  <th class="num" data-i18n="anomaly.score"></th>
+                  <th data-i18n="anomaly.reasons"></th>
+                  <th class="num" data-i18n="anomaly.distinctIPs"></th>
+                  <th class="num" data-i18n="anomaly.errorRate"></th>
+                  <th class="num" data-i18n="anomaly.burstRpm"></th>
+                  <th data-i18n="ipBans.colActions"></th>
+                </tr>
+              </thead>
+              <tbody id="anomalyBody"></tbody>
+            </table>
+          </div>
+          <div id="anomalyEmpty" class="muted-text hidden" style="padding:1rem 0;text-align:center;"
+            data-i18n="anomaly.noData"></div>
+        </div>
+      </div>
+
+      <!-- Audit log tab -->
+      <div id="tabAudit" class="tab-content hidden">
+        <div class="card">
+          <div class="card-header logs-header">
+            <span class="card-title" data-i18n="audit.title"></span>
+            <div class="logs-actions">
+              <select id="auditActionFilter" data-i18n-aria-label="audit.filterAll">
+                <option value="" data-i18n="audit.filterAll"></option>
+                <option value="key.create">key.create</option>
+                <option value="key.update">key.update</option>
+                <option value="key.delete">key.delete</option>
+                <option value="key.topup">key.topup</option>
+                <option value="key.extend">key.extend</option>
+                <option value="key.enable">key.enable</option>
+                <option value="key.disable">key.disable</option>
+                <option value="key.reset-usage">key.reset-usage</option>
+                <option value="key.bulk-grant">key.bulk-grant</option>
+                <option value="ip.ban">ip.ban</option>
+                <option value="ip.unban">ip.unban</option>
+                <option value="ip.ban-clear">ip.ban-clear</option>
+                <option value="ip.ban-settings">ip.ban-settings</option>
+                <option value="maintenance.set">maintenance.set</option>
+              </select>
+              <button class="btn btn-outline btn-sm" id="auditRefreshBtn" type="button"><i
+                  class="fa-solid fa-arrows-rotate" aria-hidden="true"></i><span class="btn-text"
+                  data-i18n="apilog.refresh"></span></button>
+            </div>
+          </div>
+          <div class="table-scroll">
+            <table class="data-table" id="auditTable">
+              <thead>
+                <tr>
+                  <th data-i18n="apilog.colTime"></th>
+                  <th data-i18n="audit.colActor"></th>
+                  <th data-i18n="audit.colAction"></th>
+                  <th data-i18n="audit.colTarget"></th>
+                  <th data-i18n="audit.colDetail"></th>
+                  <th data-i18n="requestLogs.clientIp"></th>
+                </tr>
+              </thead>
+              <tbody id="auditBody"></tbody>
+            </table>
+          </div>
+          <div id="auditEmpty" class="muted-text hidden" style="padding:1rem 0;text-align:center;"
+            data-i18n="audit.noData"></div>
         </div>
       </div>
     </div>
@@ -799,6 +969,18 @@
             <span class="switch"><input type="checkbox" id="apiKeyForm_enabled" checked /><span class="slider"></span></span>
             <span data-i18n="apiKeys.formEnabled"></span>
           </label>
+        </div>
+        <div class="form-group">
+          <label data-i18n="apiKeys.ownerRef"></label>
+          <input type="text" id="apiKeyForm_ownerRef" data-i18n-placeholder="apiKeys.ownerRefPlaceholder" />
+        </div>
+        <div class="form-group">
+          <label data-i18n="apiKeys.orderRef"></label>
+          <input type="text" id="apiKeyForm_orderRef" data-i18n-placeholder="apiKeys.orderRefPlaceholder" />
+        </div>
+        <div class="form-group">
+          <label data-i18n="apiKeys.note"></label>
+          <input type="text" id="apiKeyForm_note" data-i18n-placeholder="apiKeys.notePlaceholder" />
         </div>
         <div class="form-group">
           <label data-i18n="apiKeys.model"></label>

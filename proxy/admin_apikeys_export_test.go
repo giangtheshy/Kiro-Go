@@ -33,10 +33,10 @@ func seedExportKeys(t *testing.T) (unlimited, under, overTok, expired string) {
 	}
 
 	// Drive usage counters. under: 500/1000 tokens, 5/10 credits. overtok: 200/100 tokens.
-	if err := config.RecordApiKeyUsage(e2.ID, 500, 5); err != nil {
+	if err := config.RecordApiKeyUsage(e2.ID, 500, 5, "claude-sonnet", false); err != nil {
 		t.Fatalf("usage under: %v", err)
 	}
-	if err := config.RecordApiKeyUsage(e3.ID, 200, 0); err != nil {
+	if err := config.RecordApiKeyUsage(e3.ID, 200, 0, "claude-sonnet", false); err != nil {
 		t.Fatalf("usage overtok: %v", err)
 	}
 	return e1.ID, e2.ID, e3.ID, e4.ID

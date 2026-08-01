@@ -77,8 +77,16 @@ func (h *Handler) authenticate(r *http.Request) (*config.ApiKeyEntry, error) {
 		}
 		entry := config.FindApiKeyByValue(provided)
 		if entry == nil {
+			// A supplied-but-unknown key is a credential guess; enough of them from
+			// one address promotes it to the persistent ban list. A request with NO
+			// key is deliberately not counted — that is a misconfigured client, not
+			// an attacker, and banning it would create support noise.
+			h.registerAuthFailure(r)
 			return nil, newAuthError(http.StatusUnauthorized, "authentication_error", "Invalid or missing API key")
 		}
+		// The key is genuine: forget any earlier misses from this address so a
+		// customer who fixed a typo is not banned by their own stale counter.
+		h.clearAuthFailures(r)
 		if !entry.Enabled {
 			// Valid key, just disabled → friendly notice instead of a 401 that breaks clients.
 			return nil, newNoticeError()
@@ -144,9 +152,34 @@ func (h *Handler) authenticate(r *http.Request) (*config.ApiKeyEntry, error) {
 		return nil, newAuthError(http.StatusUnauthorized, "authentication_error", "API key authentication is required but no keys are configured")
 	}
 	if provided == "" || provided != expected {
+		if provided != "" {
+			h.registerAuthFailure(r)
+		}
 		return nil, newAuthError(http.StatusUnauthorized, "authentication_error", "Invalid or missing API key")
 	}
+	h.clearAuthFailures(r)
 	return nil, nil
+}
+
+// registerAuthFailure records one wrong-credential attempt from the request's
+// client IP against the auto-ban counter.
+func (h *Handler) registerAuthFailure(r *http.Request) {
+	if h.ipBanGate == nil {
+		return
+	}
+	if ip := clientIPFromContext(r.Context()); ip != "" {
+		h.ipBanGate.registerFail(ip)
+	}
+}
+
+// clearAuthFailures resets the auto-ban counter for the request's client IP.
+func (h *Handler) clearAuthFailures(r *http.Request) {
+	if h.ipBanGate == nil {
+		return
+	}
+	if ip := clientIPFromContext(r.Context()); ip != "" {
+		h.ipBanGate.clearFails(ip)
+	}
 }
 
 // withApiKeyContext attaches the matched entry to the request context so downstream

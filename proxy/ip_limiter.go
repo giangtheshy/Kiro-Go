@@ -84,6 +84,44 @@ func (l *ipLimiter) forget(keyID string) {
 	l.mu.Unlock()
 }
 
+// ipSeenEntry is one entry in the snapshot returned by snapshot().
+type ipSeenEntry struct {
+	IP       string `json:"ip"`
+	LastSeen int64  `json:"lastSeen"` // Unix seconds
+}
+
+// snapshot returns the IPs active within ipLimitWindow for a key, sorted by
+// most-recently-seen descending. Used by the anomaly detector to expose the
+// per-key distinct-IP count without having to recount on every request.
+func (l *ipLimiter) snapshot(keyID string) []ipSeenEntry {
+	if keyID == "" {
+		return nil
+	}
+	now := time.Now()
+	l.mu.Lock()
+	set := l.keys[keyID]
+	if set == nil {
+		l.mu.Unlock()
+		return nil
+	}
+	out := make([]ipSeenEntry, 0, len(set))
+	for ip, seen := range set {
+		if now.Sub(seen) <= ipLimitWindow {
+			out = append(out, ipSeenEntry{IP: ip, LastSeen: seen.Unix()})
+		}
+	}
+	l.mu.Unlock()
+	// Sort most-recently-seen first.
+	for i := 0; i < len(out); i++ {
+		for j := i + 1; j < len(out); j++ {
+			if out[j].LastSeen > out[i].LastSeen {
+				out[i], out[j] = out[j], out[i]
+			}
+		}
+	}
+	return out
+}
+
 // ipMatchesAllowlist reports whether ip matches any entry in allowlist. Each entry
 // is either a single IP ("203.0.113.7", "2001:db8::1") or a CIDR block
 // ("203.0.113.0/24"). An empty allowlist returns false (callers treat empty as
