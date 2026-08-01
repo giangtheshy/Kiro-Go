@@ -981,12 +981,16 @@ label:has(> .switch) > span {
 
 /* Header tabs */
 .header-nav {
-  display: inline-flex;
+  display: flex;
   align-items: center;
-  justify-self: center;
+  /* `safe center` keeps the strip centred while it fits, but falls back to
+     start-alignment once it overflows so the first tab stays reachable. */
+  justify-content: center;
+  justify-content: safe center;
   margin-left: 0;
   min-width: 0;
   overflow-x: auto;
+  overscroll-behavior-x: contain;
   scrollbar-width: none;
 }
 .header-nav::-webkit-scrollbar {
@@ -995,6 +999,7 @@ label:has(> .switch) > span {
 .tabs {
   display: flex;
   align-items: center;
+  flex: 0 0 auto;
   gap: 0;
   background: transparent;
   border: 0;
@@ -1287,9 +1292,12 @@ label:has(> .switch) > span {
   padding: 0 2rem;
   height: 4rem;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  /* Brand and actions size to their content; the nav track absorbs whatever is
+     left and scrolls. With a 1fr brand/actions split the tab strip would instead
+     push the right-hand controls out of the header at narrow desktop widths. */
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
-  gap: 1.5rem;
+  gap: 1rem;
 }
 .app-header-inner .topbar-actions {
   justify-self: end;
@@ -3481,10 +3489,12 @@ body:has(#tabApilog:not(.hidden)) #mainPage > .container {
     overflow: visible;
   }
   .tabs {
-    width: min(100%, 23rem);
+    /* Four per row: the current 8 tabs land as two even rows, and the header
+       row above is never overlapped because the nav owns its own grid area. */
+    width: 100%;
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 0.5rem;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0.375rem 0.25rem;
     padding: 0;
     border: 0;
     border-radius: 0;
@@ -3493,6 +3503,7 @@ body:has(#tabApilog:not(.hidden)) #mainPage > .container {
   .tab {
     min-height: 2.75rem;
     height: auto;
+    min-width: 0;
     padding: 0.375rem 0.25rem;
     flex-direction: column;
     gap: 0.25rem;
@@ -3500,6 +3511,12 @@ body:has(#tabApilog:not(.hidden)) #mainPage > .container {
     font-weight: 650;
     line-height: 1;
     background: transparent;
+  }
+  /* Long labels ellipsis inside their cell instead of spilling into the next one. */
+  .tab > span {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .tab-icon {
     display: inline-flex;

@@ -588,6 +588,7 @@
   "apilog.totalTokens": "{0} Token",
   "apilog.totalCredits": "{0} Credit",
   "apilog.totalErrors": "{0} 个错误",
+  "apilog.live": "实时",
   "logs.filter": "筛选状态",
   "logs.filterAll": "全部",
   "logs.filterSuccess": "成功",
@@ -595,7 +596,6 @@
   "logs.search": "搜索...",
   "logs.exportJson": "JSON",
   "logs.exportCsv": "CSV",
-  "logs.autoRefresh": "自动刷新",
   "logs.clear": "清空",
   "logs.clearConfirm": "确定清空内存中的请求日志？",
   "logs.cleared": "请求日志已清空",
@@ -762,5 +762,10 @@
   "maintenance.disable": "关闭",
   "maintenance.active": "已开启",
   "maintenance.enabled": "已开启维护模式",
-  "maintenance.disabled": "已关闭维护模式"
+  "maintenance.disabled": "已关闭维护模式",
+  "portal.rememberKey": "在此设备上记住此 Key",
+  "portal.logout": "退出登录",
+  "portal.liveOn": "实时",
+  "portal.liveConnecting": "连接中…",
+  "portal.liveOff": "已断开连接"
 }

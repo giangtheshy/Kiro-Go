@@ -608,6 +608,7 @@
   "apilog.totalTokens": "{0} tokens",
   "apilog.totalCredits": "{0} credits",
   "apilog.totalErrors": "{0} errors",
+  "apilog.live": "Live",
   "logs.filter": "Filter",
   "logs.filterAll": "All",
   "logs.filterSuccess": "Success",
@@ -615,7 +616,6 @@
   "logs.search": "Search...",
   "logs.exportJson": "JSON",
   "logs.exportCsv": "CSV",
-  "logs.autoRefresh": "Auto",
   "logs.clear": "Clear",
   "logs.clearConfirm": "Clear the in-memory request log?",
   "logs.cleared": "Request log cleared",
@@ -762,5 +762,10 @@
   "maintenance.disable": "Disable",
   "maintenance.active": "Active",
   "maintenance.enabled": "Maintenance mode enabled",
-  "maintenance.disabled": "Maintenance mode disabled"
+  "maintenance.disabled": "Maintenance mode disabled",
+  "portal.rememberKey": "Remember this key on this device",
+  "portal.logout": "Log out",
+  "portal.liveOn": "Live",
+  "portal.liveConnecting": "Connecting…",
+  "portal.liveOff": "Disconnected"
 }

@@ -42,14 +42,19 @@ const requestLogCapacity = 1000
 
 // requestLogBuffer is a fixed-size in-memory ring of recent requests. Oldest entries are
 // overwritten once full. Not persisted: it is a runtime diagnostic feed, gone on restart.
+// It also fans new entries out to any live SSE subscribers (the admin "API Log" view).
 type requestLogBuffer struct {
-	mu   sync.Mutex
-	ring []RequestLogEntry
-	next int
-	full bool
+	mu          sync.Mutex
+	ring        []RequestLogEntry
+	next        int
+	full        bool
+	subscribers map[chan RequestLogEntry]struct{}
 }
 
-var requestLog = &requestLogBuffer{ring: make([]RequestLogEntry, requestLogCapacity)}
+var requestLog = &requestLogBuffer{
+	ring:        make([]RequestLogEntry, requestLogCapacity),
+	subscribers: make(map[chan RequestLogEntry]struct{}),
+}
 
 func (b *requestLogBuffer) add(e RequestLogEntry) {
 	b.mu.Lock()
@@ -58,9 +63,45 @@ func (b *requestLogBuffer) add(e RequestLogEntry) {
 	if b.next == 0 {
 		b.full = true
 	}
+	subs := make([]chan RequestLogEntry, 0, len(b.subscribers))
+	for ch := range b.subscribers {
+		subs = append(subs, ch)
+	}
 	b.mu.Unlock()
+
+	// Fan out outside the lock and non-blocking: a stalled SSE client drops
+	// entries rather than back-pressuring the request path that logged them.
+	for _, ch := range subs {
+		select {
+		case ch <- e:
+		default:
+		}
+	}
 }
 
+// subscribe returns a buffered channel fed by add and a cancel function the
+// subscriber must call on disconnect.
+func (b *requestLogBuffer) subscribe() (<-chan RequestLogEntry, func()) {
+	ch := make(chan RequestLogEntry, 64)
+	b.mu.Lock()
+	b.subscribers[ch] = struct{}{}
+	b.mu.Unlock()
+	var once sync.Once
+	cancel := func() {
+		once.Do(func() {
+			b.mu.Lock()
+			if _, ok := b.subscribers[ch]; ok {
+				delete(b.subscribers, ch)
+				close(ch)
+			}
+			b.mu.Unlock()
+		})
+	}
+	return ch, cancel
+}
+
+// reset drops the retained history. Live subscribers are left connected — they
+// are a feed of new activity, not of the buffer contents.
 func (b *requestLogBuffer) reset() {
 	b.mu.Lock()
 	b.ring = make([]RequestLogEntry, requestLogCapacity)
@@ -130,6 +171,54 @@ func (h *Handler) apiGetRequestLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{"logs": entries})
+}
+
+// apiStreamRequestLogs GET /admin/api/request-logs/stream - live SSE feed of served
+// requests, backing the admin "API Log" view so it no longer has to poll.
+//
+// Unlike the customer stream (/v1/key/logs/stream) this carries the whole
+// RequestLogEntry, ClientIP included: it is admin-only information and the admin
+// view offers a one-click ban on it. History is NOT replayed here — the view does
+// its initial fill with GET /admin/api/request-logs.
+func (h *Handler) apiStreamRequestLogs(w http.ResponseWriter, r *http.Request) {
+	// handleAdminAPI sets application/json for every route; sseHeadersSet
+	// overrides it (and sets X-Accel-Buffering: no).
+	flusher, ok := sseHeadersSet(w)
+	if !ok {
+		return
+	}
+	if _, err := w.Write([]byte(": connected\n\n")); err != nil {
+		return
+	}
+	flusher.Flush()
+
+	ch, cancel := requestLog.subscribe()
+	defer cancel()
+
+	ping := time.NewTicker(keyLogPingInterval)
+	defer ping.Stop()
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case e, open := <-ch:
+			if !open {
+				return
+			}
+			if err := sseWriteEvent(w, flusher, map[string]interface{}{
+				"type": "requestlog",
+				"data": e,
+			}); err != nil {
+				return
+			}
+		case <-ping.C:
+			if err := sseWritePing(w, flusher); err != nil {
+				return
+			}
+		}
+	}
 }
 
 // apiClearRequestLogs DELETE /admin/api/request-logs - drops the in-memory request feed.

@@ -608,6 +608,7 @@
   "apilog.totalTokens": "{0} tokens",
   "apilog.totalCredits": "{0} credits",
   "apilog.totalErrors": "{0} lỗi",
+  "apilog.live": "Trực tiếp",
   "logs.filter": "Lọc trạng thái",
   "logs.filterAll": "Tất cả",
   "logs.filterSuccess": "Thành công",
@@ -615,7 +616,6 @@
   "logs.search": "Tìm kiếm...",
   "logs.exportJson": "JSON",
   "logs.exportCsv": "CSV",
-  "logs.autoRefresh": "Tự động làm mới",
   "logs.clear": "Xóa",
   "logs.clearConfirm": "Xóa toàn bộ nhật ký yêu cầu?",
   "logs.cleared": "Đã xóa nhật ký",
@@ -762,5 +762,10 @@
   "maintenance.disable": "Tắt",
   "maintenance.active": "Đang bật",
   "maintenance.enabled": "Đã bật chế độ bảo trì",
-  "maintenance.disabled": "Đã tắt chế độ bảo trì"
+  "maintenance.disabled": "Đã tắt chế độ bảo trì",
+  "portal.rememberKey": "Ghi nhớ key này trên thiết bị này",
+  "portal.logout": "Đăng xuất",
+  "portal.liveOn": "Trực tiếp",
+  "portal.liveConnecting": "Đang kết nối…",
+  "portal.liveOff": "Mất kết nối"
 }

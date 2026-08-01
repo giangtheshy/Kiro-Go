@@ -2803,6 +2803,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetStats(w, r)
 	case path == "/stats/reset" && r.Method == "POST":
 		h.apiResetStats(w, r)
+	case path == "/request-logs/stream" && r.Method == "GET":
+		h.apiStreamRequestLogs(w, r)
 	case path == "/request-logs" && r.Method == "GET":
 		h.apiGetRequestLogs(w, r)
 	case path == "/request-logs" && r.Method == "DELETE":

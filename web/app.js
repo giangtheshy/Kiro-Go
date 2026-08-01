@@ -3934,7 +3934,10 @@
   let apiLogCache = [];
   let apiLogFilter = 'all';
   let apiLogSearch = '';
-  let apiLogAutoTimer = null;
+  let apiLogSource = null;
+  let apiLogRenderScheduled = false;
+  // Cap the retained rows so a busy proxy cannot grow the table without bound.
+  const APILOG_MAX_ROWS = 500;
 
   async function loadApiLog() {
     const body = $('apiLogBody');
@@ -4097,14 +4100,56 @@
     toast(t('logs.exported'), 'success');
   }
 
-  function toggleApiLogAutoRefresh() {
-    const on = $('logsAutoRefresh').checked;
-    if (apiLogAutoTimer) { clearInterval(apiLogAutoTimer); apiLogAutoTimer = null; }
-    if (on) {
-      apiLogAutoTimer = setInterval(() => {
-        if (!$('tabApilog').classList.contains('hidden')) loadApiLog();
-      }, 5000);
+  // Re-render through renderApiLog (never straight into the DOM) so the status
+  // filter, search box and summary chips stay authoritative. Coalesced on an
+  // animation frame so a burst of requests costs one render, not one per event.
+  function apiLogScheduleRender() {
+    if (apiLogRenderScheduled) return;
+    apiLogRenderScheduled = true;
+    requestAnimationFrame(() => {
+      apiLogRenderScheduled = false;
+      renderApiLog(apiLogCache);
+    });
+  }
+
+  function apiLogPrepend(entry) {
+    // The stream carries every key; the dropdown filters server-side on the REST
+    // feed, so honour it here instead of letting other keys leak into the view.
+    const keySel = $('apiLogKeyFilter');
+    const keyId = keySel ? keySel.value : '';
+    if (keyId && entry.apiKeyId !== keyId) return;
+    apiLogCache.unshift(entry);
+    if (apiLogCache.length > APILOG_MAX_ROWS) apiLogCache.length = APILOG_MAX_ROWS;
+    apiLogScheduleRender();
+  }
+
+  // Live SSE feed replacing the old 5s poll. EventSource authenticates via the
+  // HttpOnly admin_session cookie (sent automatically same-origin; EventSource
+  // cannot set headers).
+  function openApiLogStream() {
+    if (apiLogSource) return;
+    const src = new EventSource('/admin/api/request-logs/stream');
+    apiLogSource = src;
+    src.onmessage = ev => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      if (!msg || msg.type !== 'requestlog' || !msg.data) return;
+      apiLogPrepend(msg.data);
+    };
+    // EventSource reconnects on its own after a drop; nothing to do here.
+  }
+
+  function closeApiLogStream() {
+    if (apiLogSource) {
+      apiLogSource.close();
+      apiLogSource = null;
     }
+  }
+
+  function toggleApiLogLive() {
+    const box = $('logsAutoRefresh');
+    if (box && box.checked) openApiLogStream();
+    else closeApiLogStream();
   }
 
   function populateApiLogKeyFilter() {
@@ -4512,8 +4557,11 @@
     }
     if (tab === 'console') openConsole();
     else closeConsole();
+    if (tab !== 'apilog') closeApiLogStream();
     stopTabPolling();
-    if (tab === 'apilog') { populateApiLogKeyFilter(); loadApiLog(); startTabPolling(loadApiLog); }
+    // The API Log tab is push-driven (SSE) rather than polled: the initial fill
+    // is one REST call, everything after that arrives on the stream.
+    if (tab === 'apilog') { populateApiLogKeyFilter(); loadApiLog(); toggleApiLogLive(); }
     else if (tab === 'settings') { startTabPolling(refreshApiKeysIfIdle); }
     else if (tab === 'ipbans') { loadIPBans(); }
     else if (tab === 'anomaly') { loadAnomalies(); }
@@ -4580,7 +4628,7 @@
     const logsExportCsvBtn = $('logsExportCsvBtn');
     if (logsExportCsvBtn) logsExportCsvBtn.addEventListener('click', () => exportApiLog('csv'));
     const logsAutoRefresh = $('logsAutoRefresh');
-    if (logsAutoRefresh) logsAutoRefresh.addEventListener('change', toggleApiLogAutoRefresh);
+    if (logsAutoRefresh) logsAutoRefresh.addEventListener('change', toggleApiLogLive);
     const logsClearBtn = $('logsClearBtn');
     if (logsClearBtn) logsClearBtn.addEventListener('click', clearApiLog);
     qsa('[data-copy]').forEach(btn => btn.addEventListener('click', async () => {

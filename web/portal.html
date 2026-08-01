@@ -32,6 +32,11 @@
        the hero; the ledger of spends is the signature. Reuses the
        admin design tokens (Geist / Geist Mono, flat, light + dark).
        Self-contained: no dependency on app.js.
+
+       Layout is two-state. Signed out it is a narrow centred column
+       (34rem) — a single field deserves no more. Signed in the shell
+       widens and the dashboard becomes a 3-zone grid: a full-width
+       status strip, then breakdown + ledger side by side.
        ============================================================ */
 
     .portal, .portal *, .portal *::before, .portal *::after { box-sizing: border-box; }
@@ -43,7 +48,19 @@
       --p-crit: var(--destructive);
       max-width: 34rem;
       margin: 0 auto;
-      padding: clamp(1.75rem, 4vw, 3.25rem) 1.25rem 4rem;
+      padding: clamp(1.75rem, 4vw, 3.25rem) 1rem 4rem;
+    }
+    /* Signed in: the ledger and the breakdown need room to breathe. */
+    @media (min-width: 768px) {
+      .portal { padding-left: 1.5rem; padding-right: 1.5rem; }
+      .portal.is-auth { max-width: min(100%, 60rem); }
+    }
+    @media (min-width: 1024px) {
+      .portal.is-auth {
+        max-width: min(100%, 84rem);
+        padding-left: 2rem;
+        padding-right: 2rem;
+      }
     }
 
     /* Masthead — quiet, lets the ledger carry the personality. */
@@ -128,7 +145,8 @@
     .portal[data-theme="light"] .t-light,
     .portal[data-theme="dark"] .t-dark { display: inline-flex; }
 
-    /* Check panel */
+    /* ---- Sign-in panel — stays narrow and centred on every breakpoint ---- */
+    .p-login { max-width: 32rem; margin: 0 auto; }
     .p-check-title {
       font-size: 1.375rem;
       font-weight: 600;
@@ -166,15 +184,48 @@
       font-family: var(--font-mono);
       letter-spacing: 0.02em;
     }
+    .p-remember {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin-top: 0.75rem;
+      font-size: 0.75rem;
+      color: var(--muted-foreground);
+      cursor: pointer;
+      user-select: none;
+    }
+    .p-remember input {
+      width: 0.875rem;
+      height: 0.875rem;
+      margin: 0;
+      accent-color: var(--foreground);
+      cursor: pointer;
+    }
 
-    /* ---- Receipt (result) ---- */
-    .p-receipt {
-      margin-top: 1.5rem;
+    /* ---- Dashboard grid ---- */
+    .p-dash {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      align-items: start;
+      gap: 1.25rem;
+    }
+    /* Wide: status strip spans the full width, breakdown + ledger split below.
+       The ledger gets the wider track because it is the only content that grows. */
+    @media (min-width: 1024px) {
+      .p-dash { grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr); gap: 1.5rem; }
+      .p-zone-top { grid-column: 1 / -1; }
+    }
+    .p-col { display: grid; gap: 1.25rem; align-content: start; }
+    @media (min-width: 1024px) { .p-col { gap: 1.5rem; } }
+
+    .p-card {
       border: 1px solid var(--p-line);
       border-radius: var(--radius-lg);
       background: var(--card);
       overflow: hidden;
     }
+    .p-card-body { padding: 1.25rem; }
+    #resultCard .p-card-body { padding: 1.25rem 1.25rem 1.5rem; }
     /* Perforated top edge — the signature "torn receipt" detail. */
     .p-perf {
       height: 10px;
@@ -183,7 +234,6 @@
       background-size: 12px 10px;
       border-bottom: 1px dashed var(--p-line);
     }
-    .p-receipt-body { padding: 1.25rem 1.25rem 1.5rem; }
 
     .p-status-row {
       display: flex;
@@ -199,6 +249,12 @@
       text-transform: uppercase;
       color: var(--muted-foreground);
       margin: 0;
+    }
+    .p-status-actions {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      flex-wrap: wrap;
     }
     .p-pill {
       display: inline-flex;
@@ -219,10 +275,47 @@
     }
     .p-pill.ok { background: color-mix(in oklab, var(--success) 16%, transparent); color: var(--success); }
     .p-pill.bad { background: color-mix(in oklab, var(--destructive) 16%, transparent); color: var(--destructive); }
+    .p-ghost-btn {
+      font: inherit;
+      font-size: 0.75rem;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.3rem 0.65rem;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      background: transparent;
+      color: var(--muted-foreground);
+      cursor: pointer;
+      transition: background-color 0.15s, color 0.15s, border-color 0.15s;
+    }
+    .p-ghost-btn:hover {
+      background: var(--accent);
+      color: var(--foreground);
+      border-color: color-mix(in oklab, var(--border) 70%, var(--muted-foreground));
+    }
 
-    /* Hero — remaining balance */
+    /* Summary strip: balance | gauges | meta, side by side once there is room. */
+    .p-summary { display: grid; gap: 1.25rem; margin-top: 1.1rem; }
+    @media (min-width: 768px) {
+      .p-summary {
+        grid-template-columns: minmax(9rem, auto) minmax(13rem, 1.25fr) minmax(11rem, 1fr);
+        align-items: center;
+        column-gap: 2rem;
+      }
+      .p-summary > .p-gauges,
+      .p-summary > .p-meta {
+        margin-top: 0;
+        padding-left: 1.75rem;
+        border-left: 1px dotted var(--p-line);
+        align-self: stretch;
+      }
+      .p-summary > .p-gauges { align-content: center; }
+      .p-summary > .p-meta { align-content: center; }
+    }
+
+    /* Hero — remaining balance. Deliberately the loudest thing on the page. */
     .p-hero {
-      margin: 1.1rem 0 0.35rem;
       display: flex;
       align-items: flex-end;
       gap: 0.5rem;
@@ -230,7 +323,7 @@
     }
     .p-hero .p-hero-num {
       font-family: var(--font-mono);
-      font-size: clamp(2rem, 8vw, 2.75rem);
+      font-size: clamp(2rem, 7vw, 3.25rem);
       font-weight: 600;
       letter-spacing: -0.03em;
       line-height: 1;
@@ -247,11 +340,11 @@
       color: var(--muted-foreground);
       letter-spacing: 0.04em;
       text-transform: uppercase;
-      margin-bottom: 0.85rem;
+      margin-top: 0.5rem;
     }
 
     /* Gauges */
-    .p-gauges { display: grid; gap: 1rem; margin-top: 0.5rem; }
+    .p-gauges { display: grid; gap: 1rem; }
     .p-gauge-head {
       display: flex;
       align-items: baseline;
@@ -294,7 +387,7 @@
     }
 
     /* Meta rows — receipt-style dotted leaders */
-    .p-meta { margin-top: 1.25rem; display: grid; gap: 0.45rem; }
+    .p-meta { display: grid; gap: 0.45rem; }
     .p-meta-row {
       display: flex;
       align-items: baseline;
@@ -316,15 +409,13 @@
     }
 
     /* ---- Ledger (usage log) — the signature element ---- */
-    .p-ledger { margin-top: 1.5rem; }
     .p-ledger-head {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 0.5rem;
-      padding-top: 1rem;
-      border-top: 1px dashed var(--p-line);
-      margin-bottom: 0.5rem;
+      flex-wrap: wrap;
+      margin-bottom: 0.65rem;
     }
     .p-ledger-head h3 {
       font-size: 0.75rem;
@@ -333,6 +424,11 @@
       text-transform: uppercase;
       color: var(--muted-foreground);
       margin: 0;
+    }
+    .p-ledger-actions {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.75rem;
     }
     .p-ledger-refresh {
       font: inherit;
@@ -344,15 +440,47 @@
       display: inline-flex;
       align-items: center;
       gap: 0.3rem;
+      padding: 0;
     }
     .p-ledger-refresh:hover { color: var(--foreground); }
+
+    /* Live stream indicator */
+    .p-live {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      font-size: 0.6875rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted-foreground);
+      white-space: nowrap;
+    }
+    .p-live > i {
+      width: 0.4rem;
+      height: 0.4rem;
+      border-radius: 999px;
+      background: currentColor;
+      flex: 0 0 auto;
+    }
+    .p-live[data-state="off"] { display: none; }
+    .p-live[data-state="live"] { color: var(--success); }
+    .p-live[data-state="live"] > i { animation: p-pulse 2s ease-in-out infinite; }
+    .p-live[data-state="connecting"] { color: var(--p-warn); }
+    .p-live[data-state="down"] { color: var(--p-crit); }
+    @keyframes p-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
     .p-ledger-scroll {
       max-height: 20rem;
       overflow-y: auto;
-      margin: 0 -0.25rem;
+      overflow-x: auto;
+    }
+    @media (min-width: 1024px) {
+      .p-card-ledger .p-ledger-scroll { max-height: min(62vh, 42rem); }
     }
     .p-ledger-table {
       width: 100%;
+      min-width: 21rem;
       border-collapse: collapse;
       font-family: var(--font-mono);
       font-size: 0.75rem;
@@ -385,8 +513,13 @@
       text-overflow: ellipsis;
       white-space: nowrap;
     }
+    @media (min-width: 1024px) {
+      .p-card-ledger .p-ledger-table td.model { max-width: 18rem; }
+    }
     .p-ledger-table td.credits { font-weight: 600; }
     .p-ledger-table tbody tr:hover td { background: rgba(127, 127, 127, 0.06); }
+    /* Failed requests still bill nothing but should not read as a normal spend. */
+    .p-ledger-table tbody tr.err td.model { color: var(--p-crit); }
     .p-ledger-empty {
       padding: 1.5rem 0.5rem;
       text-align: center;
@@ -407,11 +540,6 @@
     .p-ledger-foot .v { font-weight: 600; }
 
     /* ---- Connect block — how the customer points their client here ---- */
-    .p-connect {
-      margin-top: 1.5rem;
-      padding-top: 1rem;
-      border-top: 1px dashed var(--p-line);
-    }
     .p-connect-head {
       font-size: 0.75rem;
       font-weight: 600;
@@ -492,6 +620,7 @@
 
     @media (prefers-reduced-motion: reduce) {
       .p-gauge > i { transition: none; }
+      .p-live[data-state="live"] > i { animation: none; }
     }
   </style>
 </head>
@@ -517,7 +646,7 @@
       </div>
     </div>
 
-    <div>
+    <div class="p-login" id="loginBlock">
       <h1 class="p-check-title" data-t="title"></h1>
       <p class="p-check-hint" data-t="hint"></p>
       <div class="p-key-row">
@@ -532,82 +661,143 @@
           <span data-t="check"></span>
         </button>
       </div>
+      <label class="p-remember">
+        <input type="checkbox" id="rememberKey" />
+        <span data-t="rememberKey"></span>
+      </label>
     </div>
 
-    <div class="p-receipt" id="resultCard" style="display:none;">
-      <div class="p-perf"></div>
-      <div class="p-receipt-body">
-        <div class="p-status-row">
-          <h2 data-t="usageTitle"></h2>
-          <span class="p-pill" id="statusPill"></span>
-        </div>
+    <div class="p-dash" id="dashboard" style="display:none;">
 
-        <div class="p-hero">
-          <span class="p-hero-num" id="heroNum">—</span>
-          <span class="p-hero-unit" id="heroUnit"></span>
-        </div>
-        <div class="p-hero-label" id="heroLabel"></div>
-
-        <div class="p-gauges">
-          <div>
-            <div class="p-gauge-head">
-              <span class="lbl" id="tokensLabel"></span>
-              <span class="val" id="tokensVal"></span>
+      <!-- Zone 1 — full-width status strip. -->
+      <section class="p-card p-zone-top" id="resultCard">
+        <div class="p-perf"></div>
+        <div class="p-card-body">
+          <div class="p-status-row">
+            <h2 data-t="usageTitle"></h2>
+            <div class="p-status-actions">
+              <span class="p-pill" id="statusPill"></span>
+              <button class="p-ghost-btn" id="logoutKeyBtn" type="button">
+                <i class="fa-solid fa-right-from-bracket"></i><span data-t="logout"></span>
+              </button>
             </div>
-            <div class="p-gauge" id="tokensGaugeWrap" style="display:none;"><i id="tokensGauge"></i></div>
           </div>
-          <div>
-            <div class="p-gauge-head">
-              <span class="lbl" id="creditsLabel"></span>
-              <span class="val" id="creditsVal"></span>
+
+          <div class="p-summary">
+            <div class="p-summary-hero">
+              <div class="p-hero">
+                <span class="p-hero-num" id="heroNum">—</span>
+                <span class="p-hero-unit" id="heroUnit"></span>
+              </div>
+              <div class="p-hero-label" id="heroLabel"></div>
             </div>
-            <div class="p-gauge" id="creditsGaugeWrap" style="display:none;"><i id="creditsGauge"></i></div>
+
+            <div class="p-gauges">
+              <div>
+                <div class="p-gauge-head">
+                  <span class="lbl" id="tokensLabel"></span>
+                  <span class="val" id="tokensVal"></span>
+                </div>
+                <div class="p-gauge" id="tokensGaugeWrap" style="display:none;"><i id="tokensGauge"></i></div>
+              </div>
+              <div>
+                <div class="p-gauge-head">
+                  <span class="lbl" id="creditsLabel"></span>
+                  <span class="val" id="creditsVal"></span>
+                </div>
+                <div class="p-gauge" id="creditsGaugeWrap" style="display:none;"><i id="creditsGauge"></i></div>
+              </div>
+            </div>
+
+            <div class="p-meta">
+              <div class="p-meta-row">
+                <span class="k" data-t="requests"></span>
+                <span class="dots"></span>
+                <span class="v" id="reqVal"></span>
+              </div>
+              <div class="p-meta-row" id="dailyRow" style="display:none;">
+                <span class="k" data-t="dailyTokens"></span>
+                <span class="dots"></span>
+                <span class="v" id="dailyVal"></span>
+              </div>
+              <div class="p-meta-row" id="expiryRow" style="display:none;">
+                <span class="k" data-t="expiry"></span>
+                <span class="dots"></span>
+                <span class="v" id="expiryVal"></span>
+              </div>
+            </div>
           </div>
         </div>
+      </section>
 
-        <div class="p-meta">
-          <div class="p-meta-row">
-            <span class="k" data-t="requests"></span>
-            <span class="dots"></span>
-            <span class="v" id="reqVal"></span>
+      <!-- Zone 2 left — short, static content. -->
+      <div class="p-col">
+        <section class="p-card" id="byModelBlock" style="display:none;">
+          <div class="p-card-body">
+            <div class="p-ledger-head">
+              <h3 data-t="byModelTitle"></h3>
+            </div>
+            <div class="p-ledger-scroll">
+              <table class="p-ledger-table">
+                <thead>
+                  <tr>
+                    <th data-t="colModel"></th>
+                    <th class="num" data-t="colReqs"></th>
+                    <th class="num" data-t="colIn"></th>
+                    <th class="num" data-t="colOut"></th>
+                  </tr>
+                </thead>
+                <tbody id="byModelBody"></tbody>
+              </table>
+            </div>
           </div>
-          <div class="p-meta-row" id="dailyRow" style="display:none;">
-            <span class="k" data-t="dailyTokens"></span>
-            <span class="dots"></span>
-            <span class="v" id="dailyVal"></span>
-          </div>
-          <div class="p-meta-row" id="expiryRow" style="display:none;">
-            <span class="k" data-t="expiry"></span>
-            <span class="dots"></span>
-            <span class="v" id="expiryVal"></span>
-          </div>
-        </div>
+        </section>
 
-        <div class="p-ledger" id="byModelBlock" style="display:none;">
-          <div class="p-ledger-head">
-            <h3 data-t="byModelTitle"></h3>
+        <section class="p-card" id="connectBlock" style="display:none;">
+          <div class="p-card-body">
+            <h3 class="p-connect-head" data-t="connectTitle"></h3>
+            <div class="p-conn-row">
+              <span class="k" data-t="connBaseUrl"></span>
+              <span class="v" id="connBaseUrl"></span>
+              <button class="p-copy" type="button" data-copy-target="connBaseUrl" aria-label="copy">
+                <i class="fa-regular fa-copy"></i>
+              </button>
+            </div>
+            <div class="p-conn-row">
+              <span class="k" data-t="connClaude"></span>
+              <span class="v" id="connClaudeUrl"></span>
+              <button class="p-copy" type="button" data-copy-target="connClaudeUrl" aria-label="copy">
+                <i class="fa-regular fa-copy"></i>
+              </button>
+            </div>
+            <div class="p-conn-row">
+              <span class="k" data-t="connOpenai"></span>
+              <span class="v" id="connOpenaiUrl"></span>
+              <button class="p-copy" type="button" data-copy-target="connOpenaiUrl" aria-label="copy">
+                <i class="fa-regular fa-copy"></i>
+              </button>
+            </div>
+            <div class="p-snippet">
+              <pre id="connSnippet"></pre>
+              <button class="p-copy" type="button" data-copy-target="connSnippet" aria-label="copy">
+                <i class="fa-regular fa-copy"></i>
+              </button>
+            </div>
           </div>
-          <div class="p-ledger-scroll">
-            <table class="p-ledger-table">
-              <thead>
-                <tr>
-                  <th data-t="colModel"></th>
-                  <th class="num" data-t="colReqs"></th>
-                  <th class="num" data-t="colIn"></th>
-                  <th class="num" data-t="colOut"></th>
-                </tr>
-              </thead>
-              <tbody id="byModelBody"></tbody>
-            </table>
-          </div>
-        </div>
+        </section>
+      </div>
 
-        <div class="p-ledger">
+      <!-- Zone 2 right — the ledger, the only content that grows. -->
+      <section class="p-card p-card-ledger">
+        <div class="p-card-body">
           <div class="p-ledger-head">
             <h3 data-t="ledgerTitle"></h3>
-            <button class="p-ledger-refresh" id="ledgerRefresh" type="button">
-              <i class="fa-solid fa-rotate"></i><span data-t="refresh"></span>
-            </button>
+            <div class="p-ledger-actions">
+              <span class="p-live" id="liveInd" data-state="off"><i></i><span id="liveText"></span></span>
+              <button class="p-ledger-refresh" id="ledgerRefresh" type="button">
+                <i class="fa-solid fa-rotate"></i><span data-t="refresh"></span>
+              </button>
+            </div>
           </div>
           <div class="p-ledger-scroll">
             <table class="p-ledger-table">
@@ -629,38 +819,7 @@
             <span class="v" id="ledgerFootVal"></span>
           </div>
         </div>
-
-        <div class="p-connect" id="connectBlock" style="display:none;">
-          <h3 class="p-connect-head" data-t="connectTitle"></h3>
-          <div class="p-conn-row">
-            <span class="k" data-t="connBaseUrl"></span>
-            <span class="v" id="connBaseUrl"></span>
-            <button class="p-copy" type="button" data-copy-target="connBaseUrl" aria-label="copy">
-              <i class="fa-regular fa-copy"></i>
-            </button>
-          </div>
-          <div class="p-conn-row">
-            <span class="k" data-t="connClaude"></span>
-            <span class="v" id="connClaudeUrl"></span>
-            <button class="p-copy" type="button" data-copy-target="connClaudeUrl" aria-label="copy">
-              <i class="fa-regular fa-copy"></i>
-            </button>
-          </div>
-          <div class="p-conn-row">
-            <span class="k" data-t="connOpenai"></span>
-            <span class="v" id="connOpenaiUrl"></span>
-            <button class="p-copy" type="button" data-copy-target="connOpenaiUrl" aria-label="copy">
-              <i class="fa-regular fa-copy"></i>
-            </button>
-          </div>
-          <div class="p-snippet">
-            <pre id="connSnippet"></pre>
-            <button class="p-copy" type="button" data-copy-target="connSnippet" aria-label="copy">
-              <i class="fa-regular fa-copy"></i>
-            </button>
-          </div>
-        </div>
-      </div>
+      </section>
     </div>
 
     <div class="p-foot" data-t="footerNote"></div>
@@ -675,6 +834,8 @@
           hint: 'Nhập API key của bạn để xem số dư còn lại và nhật ký sử dụng. Trang này không cần mật khẩu quản trị.',
           keyPlaceholder: 'sk-...',
           check: 'Kiểm tra',
+          rememberKey: 'Ghi nhớ key này trên thiết bị này',
+          logout: 'Đăng xuất',
           usageTitle: 'Tình trạng sử dụng',
           tokens: 'Tokens',
           credits: 'Credits',
@@ -698,6 +859,9 @@
           overLimit: 'Vượt hạn mức',
           ledgerTitle: 'Nhật ký sử dụng',
           refresh: 'Làm mới',
+          liveOn: 'Trực tiếp',
+          liveConnecting: 'Đang kết nối…',
+          liveOff: 'Mất kết nối',
           colTime: 'Thời gian',
           colModel: 'Model',
           colTokens: 'Tokens',
@@ -720,6 +884,8 @@
           hint: 'Enter your API key to see your remaining balance and usage ledger. No admin password needed.',
           keyPlaceholder: 'sk-...',
           check: 'Check',
+          rememberKey: 'Remember this key on this device',
+          logout: 'Log out',
           usageTitle: 'Usage status',
           tokens: 'Tokens',
           credits: 'Credits',
@@ -743,6 +909,9 @@
           overLimit: 'Over limit',
           ledgerTitle: 'Usage ledger',
           refresh: 'Refresh',
+          liveOn: 'Live',
+          liveConnecting: 'Connecting…',
+          liveOff: 'Disconnected',
           colTime: 'Time',
           colModel: 'Model',
           colTokens: 'Tokens',
@@ -764,6 +933,14 @@
       var $ = function (id) { return document.getElementById(id); };
       var portal = $('portal');
 
+      // Storage slot for the customer's key. sessionStorage is always written so a
+      // refresh (F5) keeps the dashboard up; localStorage is written ONLY when the
+      // customer ticks "remember" — the key is stored in plaintext there, so it is
+      // an explicit opt-in for personal devices. Same idiom as web/usage.js.
+      var SAVED_KEY = 'kiro_portal_key';
+      // Ledger rows kept in the DOM. The backend ring is the same size.
+      var LEDGER_CAP = 200;
+
       var lang = (localStorage.getItem('kiro_lang') === 'en') ? 'en' : 'vi';
       function t(k) { return (I18N[lang] && I18N[lang][k]) || I18N.vi[k] || k; }
 
@@ -778,6 +955,7 @@
         document.querySelectorAll('#langBtns button').forEach(function (b) {
           b.classList.toggle('active', b.dataset.lang === lang);
         });
+        setLive($('liveInd').dataset.state);
         if (lastData) renderResult(lastData);
         if (lastLogs) renderLedger(lastLogs);
       }
@@ -844,10 +1022,9 @@
         fill.style.background = gaugeColor(ratio);
       }
 
-      function renderResult(d) {
-        lastData = d;
-        $('resultCard').style.display = '';
-
+      // renderSummary paints the status strip only. Split out from renderResult so
+      // the live stream can bump the numbers without re-rendering the whole card.
+      function renderSummary(d) {
         var pill = $('statusPill');
         if (d.valid) {
           pill.className = 'p-pill ok';
@@ -890,15 +1067,19 @@
           $('expiryRow').style.display = 'none';
         }
 
-        // Daily tokens + per-model breakdown (in-memory, resets on server restart).
+        // Daily tokens (in-memory, resets on server restart).
         if (d.dailyTokens != null) {
           $('dailyRow').style.display = '';
           $('dailyVal').textContent = fmtNum(d.dailyTokens || 0);
         } else {
           $('dailyRow').style.display = 'none';
         }
-        renderByModel(d.byModel);
+      }
 
+      function renderResult(d) {
+        lastData = d;
+        renderSummary(d);
+        renderByModel(d.byModel);
         renderConnect(d);
       }
 
@@ -909,7 +1090,7 @@
         var base = (d.baseURL || '').replace(/\/+$/, '');
         if (!d.valid || !base) { block.style.display = 'none'; return; }
         block.style.display = '';
-        $('connectBlock').querySelector('.p-connect-head').textContent = t('connectTitle');
+        block.querySelector('.p-connect-head').textContent = t('connectTitle');
         $('connBaseUrl').textContent = base;
         $('connClaudeUrl').textContent = base + '/v1/messages';
         $('connOpenaiUrl').textContent = base + '/v1/chat/completions';
@@ -940,32 +1121,37 @@
         }).join('');
       }
 
+      function ledgerCells(e) {
+        return '<td class="time">' + fmtTime(e.time) + '</td>' +
+          '<td class="model" title="' + escapeAttr(e.model || '') + '">' + escapeHtml(e.model || '—') + '</td>' +
+          '<td class="num">' + fmtNum(e.totalTokens || 0) + '</td>' +
+          '<td class="num credits">' + fmtNum(e.credits || 0) + '</td>';
+      }
+
       function renderLedger(logs) {
+        logs = Array.isArray(logs) ? logs.slice(0, LEDGER_CAP) : [];
         lastLogs = logs;
         var body = $('ledgerBody');
         var empty = $('ledgerEmpty');
-        var foot = $('ledgerFoot');
-        if (!logs || !logs.length) {
+        if (!logs.length) {
           body.innerHTML = '';
           empty.textContent = t('ledgerEmpty');
           empty.style.display = '';
-          foot.style.display = 'none';
+          $('ledgerFoot').style.display = 'none';
           return;
         }
         empty.style.display = 'none';
-        var totalCredits = 0;
-        var rows = logs.map(function (e) {
-          totalCredits += (e.credits || 0);
-          return '<tr>' +
-            '<td class="time">' + fmtTime(e.time) + '</td>' +
-            '<td class="model" title="' + escapeAttr(e.model || '') + '">' + escapeHtml(e.model || '—') + '</td>' +
-            '<td class="num">' + fmtNum(e.totalTokens || 0) + '</td>' +
-            '<td class="num credits">' + fmtNum(e.credits || 0) + '</td>' +
-            '</tr>';
+        body.innerHTML = logs.map(function (e) {
+          return '<tr' + (e.status === 'error' ? ' class="err"' : '') + '>' + ledgerCells(e) + '</tr>';
         }).join('');
-        body.innerHTML = rows;
-        foot.style.display = '';
-        $('ledgerFootVal').textContent = fmtNum(totalCredits);
+        updateLedgerFoot();
+      }
+
+      function updateLedgerFoot() {
+        var total = 0;
+        for (var i = 0; i < lastLogs.length; i++) total += (lastLogs[i].credits || 0);
+        $('ledgerFoot').style.display = '';
+        $('ledgerFootVal').textContent = fmtNum(total);
       }
 
       function escapeHtml(s) {
@@ -991,11 +1177,186 @@
 
       function currentKey() { return $('keyInput').value.trim(); }
 
+      // ---- Key persistence ----
+      // Read order is localStorage (survives closing the browser, opt-in) then
+      // sessionStorage (survives F5 and tab restore, always written).
+      function readSavedKey() {
+        try {
+          var v = localStorage.getItem(SAVED_KEY);
+          if (v) return { key: v, remembered: true };
+        } catch (e) { /* storage disabled */ }
+        try {
+          var s = sessionStorage.getItem(SAVED_KEY);
+          if (s) return { key: s, remembered: false };
+        } catch (e) { /* storage disabled */ }
+        return null;
+      }
+      function persistKey(key) {
+        try { sessionStorage.setItem(SAVED_KEY, key); } catch (e) { /* storage disabled */ }
+        try {
+          if ($('rememberKey').checked) localStorage.setItem(SAVED_KEY, key);
+          else localStorage.removeItem(SAVED_KEY);
+        } catch (e) { /* storage disabled */ }
+      }
+      function forgetKey() {
+        try { sessionStorage.removeItem(SAVED_KEY); } catch (e) { /* storage disabled */ }
+        try { localStorage.removeItem(SAVED_KEY); } catch (e) { /* storage disabled */ }
+      }
+
+      function setAuthed(on) {
+        portal.classList.toggle('is-auth', on);
+        $('loginBlock').style.display = on ? 'none' : '';
+        $('dashboard').style.display = on ? '' : 'none';
+      }
+
+      function logout() {
+        closeStream();
+        forgetKey();
+        lastData = null;
+        $('keyInput').value = '';
+        $('rememberKey').checked = false;
+        renderLedger([]);
+        setAuthed(false);
+      }
+
+      // ---- Live ledger stream (SSE) ----
+      // EventSource cannot send headers, so the key is exchanged for a single-use
+      // 30s ticket that goes in the URL. Because the ticket burns on use, the
+      // browser's own auto-retry would 401 forever — so on any error we close the
+      // socket ourselves and re-issue a ticket on a backoff.
+      var BACKOFF_MS = [2000, 5000, 15000];
+      var es = null;         // active EventSource
+      var esTimer = null;    // pending reconnect timer
+      var esAttempt = 0;     // consecutive failures, indexes BACKOFF_MS
+      var esGen = 0;         // guards against two openStream() calls racing
+
+      function setLive(state) {
+        var el = $('liveInd');
+        el.dataset.state = state;
+        $('liveText').textContent =
+          state === 'live' ? t('liveOn') :
+            state === 'connecting' ? t('liveConnecting') :
+              state === 'down' ? t('liveOff') : '';
+      }
+
+      function dropSocket() {
+        if (!es) return;
+        es.onopen = null;
+        es.onmessage = null;
+        es.onerror = null;
+        es.close();
+        es = null;
+      }
+
+      function closeStream() {
+        esGen++;
+        if (esTimer) { clearTimeout(esTimer); esTimer = null; }
+        dropSocket();
+        setLive('off');
+      }
+
+      function scheduleReconnect() {
+        dropSocket();
+        if (esTimer) return;
+        setLive('down');
+        var delay = BACKOFF_MS[Math.min(esAttempt, BACKOFF_MS.length - 1)];
+        esAttempt++;
+        esTimer = setTimeout(function () { esTimer = null; openStream(); }, delay);
+      }
+
+      async function openStream() {
+        var gen = ++esGen;
+        if (esTimer) { clearTimeout(esTimer); esTimer = null; }
+        dropSocket();
+        var key = currentKey();
+        if (!key) return;
+        setLive('connecting');
+
+        var ticket = '';
+        try {
+          var res = await fetch('/v1/key/stream-ticket', {
+            method: 'POST',
+            headers: { 'Authorization': 'Bearer ' + key }
+          });
+          if (res.ok) {
+            var j = await res.json();
+            if (j && j.ticket) ticket = j.ticket;
+          }
+        } catch (e) { /* offline or blocked */ }
+        if (gen !== esGen) return; // a newer openStream/closeStream took over
+        if (!ticket) { scheduleReconnect(); return; }
+
+        var src;
+        try {
+          src = new EventSource('/v1/key/logs/stream?ticket=' + encodeURIComponent(ticket));
+        } catch (e) {
+          scheduleReconnect();
+          return;
+        }
+        es = src;
+        src.onopen = function () {
+          if (es !== src) return;
+          esAttempt = 0;
+          setLive('live');
+        };
+        src.onmessage = function (ev) {
+          if (es !== src) return;
+          var msg;
+          try { msg = JSON.parse(ev.data); } catch (e) { return; }
+          if (!msg || msg.type !== 'keylog' || !msg.data) return;
+          pushEntry(msg.data);
+        };
+        src.onerror = function () {
+          if (es !== src) return;
+          scheduleReconnect();
+        };
+      }
+
+      // pushEntry folds one streamed record into the ledger and the summary.
+      // The stream sends inputTokens/outputTokens; /v1/key/logs sends totalTokens
+      // too, so normalise here and keep one row shape everywhere.
+      function pushEntry(raw) {
+        var inTok = raw.inputTokens || 0;
+        var outTok = raw.outputTokens || 0;
+        var e = {
+          time: raw.time || Math.floor(Date.now() / 1000),
+          model: raw.model || '',
+          inputTokens: inTok,
+          outputTokens: outTok,
+          totalTokens: inTok + outTok,
+          credits: raw.credits || 0,
+          status: raw.status || ''
+        };
+
+        if (!Array.isArray(lastLogs)) lastLogs = [];
+        lastLogs.unshift(e);
+        if (lastLogs.length > LEDGER_CAP) lastLogs.length = LEDGER_CAP;
+
+        var body = $('ledgerBody');
+        $('ledgerEmpty').style.display = 'none';
+        var tr = document.createElement('tr');
+        if (e.status === 'error') tr.className = 'err';
+        tr.innerHTML = ledgerCells(e);
+        body.insertBefore(tr, body.firstChild);
+        while (body.rows.length > LEDGER_CAP) body.deleteRow(body.rows.length - 1);
+        updateLedgerFoot();
+
+        // Increment the summary from the streamed values rather than refetching.
+        if (lastData) {
+          lastData.requestsCount = (lastData.requestsCount || 0) + 1;
+          lastData.tokensUsed = (lastData.tokensUsed || 0) + e.totalTokens;
+          lastData.creditsUsed = (lastData.creditsUsed || 0) + e.credits;
+          if (lastData.dailyTokens != null) lastData.dailyTokens += e.totalTokens;
+          renderSummary(lastData);
+        }
+      }
+
+      // ---- Fetches ----
       async function fetchLedger() {
         var key = currentKey();
         if (!key) return;
         try {
-          var res = await fetch('/v1/key/logs?limit=100', {
+          var res = await fetch('/v1/key/logs?limit=' + LEDGER_CAP, {
             method: 'GET',
             headers: { 'Authorization': 'Bearer ' + key }
           });
@@ -1007,7 +1368,9 @@
         }
       }
 
-      async function check() {
+      // check authenticates the key and paints the dashboard.
+      // restore=true means the key came from storage, so a 401 should drop it.
+      async function check(restore) {
         var key = currentKey();
         if (!key) { flash(t('keyRequired')); return; }
         var btn = $('checkBtn');
@@ -1017,11 +1380,18 @@
             method: 'GET',
             headers: { 'Authorization': 'Bearer ' + key }
           });
-          if (res.status === 401) { flash(t('notFound')); return; }
+          if (res.status === 401) {
+            if (restore) { forgetKey(); $('keyInput').value = ''; }
+            flash(t('notFound'));
+            return;
+          }
           if (!res.ok) { flash(t('failed')); return; }
           var d = await res.json();
+          persistKey(key);
+          setAuthed(true);
           renderResult(d);
           fetchLedger();
+          openStream();
         } catch (e) {
           flash(t('failed'));
         } finally {
@@ -1029,10 +1399,35 @@
         }
       }
 
+      // Manual fallback: re-pull both endpoints and revive the stream if it died.
+      async function refreshAll() {
+        var key = currentKey();
+        if (!key) return;
+        try {
+          var res = await fetch('/v1/key/info', {
+            method: 'GET',
+            headers: { 'Authorization': 'Bearer ' + key }
+          });
+          if (res.ok) renderResult(await res.json());
+        } catch (e) { /* keep the last good render */ }
+        await fetchLedger();
+        if (!es) openStream();
+      }
+
       // ---- Wiring ----
-      $('checkBtn').addEventListener('click', check);
-      $('keyInput').addEventListener('keypress', function (e) { if (e.key === 'Enter') check(); });
-      $('ledgerRefresh').addEventListener('click', fetchLedger);
+      $('checkBtn').addEventListener('click', function () { check(false); });
+      $('keyInput').addEventListener('keypress', function (e) { if (e.key === 'Enter') check(false); });
+      $('ledgerRefresh').addEventListener('click', refreshAll);
+      $('logoutKeyBtn').addEventListener('click', logout);
+      // Unticking the box forgets an already-remembered key immediately.
+      $('rememberKey').addEventListener('change', function () {
+        if (this.checked) {
+          var k = currentKey();
+          if (k) { try { localStorage.setItem(SAVED_KEY, k); } catch (e) { /* storage disabled */ } }
+        } else {
+          try { localStorage.removeItem(SAVED_KEY); } catch (e) { /* storage disabled */ }
+        }
+      });
       $('toggleKeyBtn').addEventListener('click', function () {
         var f = $('keyInput');
         var show = f.type === 'password';
@@ -1046,6 +1441,7 @@
         localStorage.setItem('kiro_lang', lang);
         applyLang();
       });
+      window.addEventListener('beforeunload', function () { dropSocket(); });
 
       // Copy buttons (connect block): copy the target element's text, flash confirmation.
       document.addEventListener('click', function (e) {
@@ -1073,6 +1469,14 @@
 
       applyTheme(getThemePref());
       applyLang();
+
+      // Restore a saved key so a refresh does not force a re-entry.
+      var saved = readSavedKey();
+      if (saved) {
+        $('keyInput').value = saved.key;
+        $('rememberKey').checked = saved.remembered;
+        check(true);
+      }
     })();
   </script>
 </body>
