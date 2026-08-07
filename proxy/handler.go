@@ -894,6 +894,11 @@ func (h *Handler) refreshModelsCache() {
 		modelIDs := make([]string, 0, len(models))
 		for _, m := range models {
 			modelIDs = append(modelIDs, m.ModelId)
+			// Record Kiro's authoritative input window so getContextWindowSize
+			// stops guessing from the model name.
+			if m.TokenLimits != nil {
+				registerModelWindow(m.ModelId, m.TokenLimits.MaxInputTokens)
+			}
 		}
 		h.pool.SetModelList(account.ID, modelIDs)
 		aggregated = mergeUniqueModels(aggregated, models)
@@ -921,6 +926,9 @@ func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
 	modelIDs := make([]string, 0, len(models))
 	for _, m := range models {
 		modelIDs = append(modelIDs, m.ModelId)
+		if m.TokenLimits != nil {
+			registerModelWindow(m.ModelId, m.TokenLimits.MaxInputTokens)
+		}
 	}
 	h.pool.SetModelList(account.ID, modelIDs)
 
@@ -1206,6 +1214,24 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
 	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
 
+	// Native web_search must be dispatched BEFORE the payload is converted: Kiro
+	// does not execute server tools, so these requests never reach its chat
+	// endpoint in the shape ClaudeToKiro would produce.
+	//
+	// The two cases are mutually exclusive. Only web_search → answer straight
+	// from MCP. Mixed with the client's own tools → the agentic loop, which
+	// consumes web_search internally and returns the client's tools untouched.
+	if hasWebSearchTool(&req) || hasWebSearchAmongTools(&req) {
+		searchStartedAt := time.Now()
+		searchClientIP := h.resolveClientIP(r)
+		if hasWebSearchTool(&req) {
+			h.handleWebSearchRequest(w, &req, estimatedInputTokens, apiKeyID, searchStartedAt, searchClientIP)
+		} else {
+			h.runWebSearchLoop(w, &req, thinking, estimatedInputTokens, apiKeyID, searchStartedAt, searchClientIP)
+		}
+		return
+	}
+
 	// 转换请求
 	kiroPayload := ClaudeToKiro(&req, thinking)
 
@@ -1340,6 +1366,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		var credits float64
 		var realInputTokens int
 		var toolUses []KiroToolUse
+		var truncated bool
 		var nextContentIndex int
 		var rawContentBuilder strings.Builder
 		var rawThinkingBuilder strings.Builder
@@ -1649,6 +1676,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnTruncated: func() {
+				truncated = true
+			},
 		}
 
 		err := CallKiroAPI(account, payload, callback)
@@ -1694,12 +1724,35 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		h.promptCache.Update(account.ID, cacheProfile)
 		logSuspiciousReq("claude", model, inputTokens, outputTokens, len(toolUses) > 0)
 
+		ensureMessageStart()
+
+		// The upstream cut the turn short. An Anthropic client decides whether a
+		// response finished from message_delta.stop_reason, so report usage but
+		// WITHHOLD stop_reason and send no message_stop: the text already
+		// delivered stands, and the client can see the turn never completed.
+		// Emitting "end_turn" here is what makes truncation invisible.
+		if truncated {
+			logger.Warnf("[Stream] claude turn truncated mid-generation: model=%s account=%s", model, accountEmailForLog(account))
+			stream.sendEvent("message_delta", map[string]interface{}{
+				"type":  "message_delta",
+				"delta": map[string]interface{}{},
+				"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
+			})
+			stream.sendEvent("error", map[string]interface{}{
+				"type": "error",
+				"error": map[string]string{
+					"type":    "api_error",
+					"message": "upstream ended the stream before the turn completed",
+				},
+			})
+			return
+		}
+
 		stopReason := claudeStopReason(toolUses, outputTokens, payloadMaxTokens(payload))
 		if stopReason == "max_tokens" {
 			logger.Debugf("[Stream] claude turn truncated at max_tokens: model=%s output=%d max=%d", model, outputTokens, payloadMaxTokens(payload))
 		}
 
-		ensureMessageStart()
 		stream.sendEvent("message_delta", map[string]interface{}{
 			"type": "message_delta",
 			"delta": map[string]interface{}{
@@ -2025,6 +2078,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var truncated bool
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -2047,6 +2101,9 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnTruncated: func() {
+				truncated = true
+			},
 		}
 
 		err := CallKiroAPI(account, payload, callback)
@@ -2054,6 +2111,17 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
+			continue
+		}
+
+		// Nothing has been written yet on the non-streaming path, so a truncated
+		// turn can still be surfaced as a real HTTP error rather than shipping a
+		// half answer labelled complete. Rotate to another account and retry: the
+		// client has seen nothing, so there is no partial output to duplicate.
+		if truncated {
+			lastErr = fmt.Errorf("upstream ended the stream before the turn completed")
+			logger.Warnf("[Claude] turn truncated mid-generation on %s, rotating account", accountEmailForLog(account))
+			excluded[account.ID] = true
 			continue
 		}
 
@@ -2307,6 +2375,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var truncated bool
 		var rawContentBuilder strings.Builder
 		var rawReasoningBuilder strings.Builder
 		var textBuffer string
@@ -2581,6 +2650,9 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnTruncated: func() {
+				truncated = true
+			},
 		}
 
 		err := CallKiroAPI(account, payload, callback)
@@ -2625,7 +2697,15 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		logSuspiciousReq("openai", model, inputTokens, outputTokens, len(toolCalls) > 0)
 
 		finishReason := "stop"
-		if len(toolCalls) > 0 {
+		if truncated {
+			// The upstream died mid-turn. OpenAI's protocol has no way to withhold
+			// finish_reason the way Anthropic does — omitting it entirely trips
+			// strict clients — so report "length", the only value that means "this
+			// output was cut off". Anything else tells the client a partial answer
+			// finished cleanly.
+			logger.Warnf("[Stream] openai turn truncated mid-generation: model=%s account=%s", model, accountEmailForLog(account))
+			finishReason = "length"
+		} else if len(toolCalls) > 0 {
 			finishReason = "tool_calls"
 		} else if hitMaxTokens(outputTokens, payloadMaxTokens(payload)) {
 			// Mirror the Claude path: a truncated response must not report "stop",
@@ -2706,6 +2786,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var truncated bool
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -2715,9 +2796,10 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 					content += text
 				}
 			},
-			OnToolUse:  func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
-			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
-			OnCredits:  func(c float64) { credits = c },
+			OnToolUse:   func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
+			OnComplete:  func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
+			OnCredits:   func(c float64) { credits = c },
+			OnTruncated: func() { truncated = true },
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
@@ -2728,6 +2810,15 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
+			continue
+		}
+
+		// Nothing written yet — rotate and retry rather than return a half answer
+		// that the response envelope would label as finished.
+		if truncated {
+			lastErr = fmt.Errorf("upstream ended the stream before the turn completed")
+			logger.Warnf("[OpenAI] turn truncated mid-generation on %s, rotating account", accountEmailForLog(account))
+			excluded[account.ID] = true
 			continue
 		}
 
@@ -4540,7 +4631,6 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 		OnText:         func(text string, isThinking bool) { content += text },
 		OnToolUse:      func(tu KiroToolUse) {},
 		OnComplete:     func(inTok, outTok int) {},
-		OnError:        func(err error) {},
 		OnCredits:      func(c float64) {},
 		OnContextUsage: func(pct float64) {},
 	}
@@ -4772,6 +4862,9 @@ func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id
 	modelIDs := make([]string, 0, len(models))
 	for _, m := range models {
 		modelIDs = append(modelIDs, m.ModelId)
+		if m.TokenLimits != nil {
+			registerModelWindow(m.ModelId, m.TokenLimits.MaxInputTokens)
+		}
 	}
 	h.pool.SetModelList(id, modelIDs)
 	h.modelsCacheMu.Lock()

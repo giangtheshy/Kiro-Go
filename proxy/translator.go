@@ -222,9 +222,15 @@ type ImageSource struct {
 }
 
 type ClaudeTool struct {
+	// Type is present only on Anthropic server tools, e.g. "web_search_20250305".
+	// A client-defined tool has no type, which is what tells the two apart when
+	// they share a name.
+	Type        string      `json:"type,omitempty"`
 	Name        string      `json:"name"`
 	Description string      `json:"description"`
 	InputSchema interface{} `json:"input_schema"`
+	// MaxUses caps how many searches a native web_search tool may perform.
+	MaxUses int `json:"max_uses,omitempty"`
 }
 
 type ClaudeResponse struct {
@@ -370,8 +376,8 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	payload.ToolNameMap = toolNameMap
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.AgentTaskType = "vibe"
-	payload.ConversationState.AgentContinuationId = uuid.New().String()
 	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstClaudeConversationAnchor(req.Messages))
+	payload.ConversationState.AgentContinuationId = buildContinuationID(payload.ConversationState.ConversationID)
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
 		ModelID: modelID,
@@ -881,6 +887,13 @@ func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]strin
 	result := make([]KiroToolWrapper, 0, len(tools))
 	nameMap := make(map[string]string)
 	for _, tool := range tools {
+		// Never forward Anthropic's native web_search to Kiro. Kiro would emit a
+		// client-side tool_use for it, but the client treats web_search as a
+		// SERVER tool and never executes it — so both sides wait and the
+		// conversation hangs. The proxy runs the search itself instead.
+		if isNativeWebSearchTool(tool) {
+			continue
+		}
 		desc := tool.Description
 		if len(desc) > maxToolDescLen {
 			desc = desc[:maxToolDescLen] + "..."
@@ -895,7 +908,39 @@ func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]strin
 		w.ToolSpecification.InputSchema = InputSchema{JSON: ensureObjectSchema(tool.InputSchema)}
 		result = append(result, w)
 	}
+
+	// The model still needs to know searching is possible, so inject an ordinary
+	// function schema in place of the server tool; the agentic loop executes the
+	// calls it produces. All three conditions matter: only when the client really
+	// declared the native tool, only when other tools survived the filter (a
+	// web_search-only request takes the fast path and never gets here), and never
+	// when the client already defined its own tool by that name.
+	if hasNativeWebSearchInTools(tools) && len(result) > 0 && !hasKiroWebSearchTool(result) {
+		w := KiroToolWrapper{}
+		w.ToolSpecification.Name = webSearchToolName
+		w.ToolSpecification.Description = "Search the web for up-to-date information."
+		w.ToolSpecification.InputSchema = InputSchema{JSON: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"query": map[string]interface{}{
+					"type":        "string",
+					"description": "Search query.",
+				},
+			},
+			"required": []interface{}{"query"},
+		}}
+		result = append(result, w)
+	}
 	return result, nameMap
+}
+
+func hasKiroWebSearchTool(tools []KiroToolWrapper) bool {
+	for _, t := range tools {
+		if t.ToolSpecification.Name == webSearchToolName {
+			return true
+		}
+	}
+	return false
 }
 
 // ensureObjectSchema 确保工具 schema 顶层是 object，并清理 Kiro 不接受的字段。
@@ -2059,6 +2104,17 @@ func buildConversationID(modelID, systemPrompt, anchor string) string {
 	}
 	seed := strings.Join([]string{modelID, strings.TrimSpace(systemPrompt), anchor}, "\n")
 	return uuid.NewSHA1(uuid.NameSpaceURL, []byte(seed)).String()
+}
+
+// buildContinuationID derives a stable per-conversation agent continuation ID.
+// The real Kiro IDE keeps ONE continuation ID for the whole agent task, so a
+// fresh uuid per request made every turn look like a brand-new agent task —
+// both an obvious automation signature and a reason for the upstream to drop
+// accumulated agent-task state mid-conversation. Deriving it from the
+// conversation ID keeps it stable across turns of the same conversation while
+// staying distinct from ConversationID itself (different UUID namespace).
+func buildContinuationID(conversationID string) string {
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(conversationID)).String()
 }
 
 func isSyntheticConversationAnchor(anchor string) bool {

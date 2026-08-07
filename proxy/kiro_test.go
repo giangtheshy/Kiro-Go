@@ -114,7 +114,7 @@ func TestParseEventStreamNilCallbackFieldsAreNoOp(t *testing.T) {
 
 func TestHandleToolUseEventGeneratesMissingToolUseID(t *testing.T) {
 	var toolUses []KiroToolUse
-	current := handleToolUseEvent(map[string]interface{}{
+	current, _, err := handleToolUseEvent(map[string]interface{}{
 		"name":  "mcpIdaProMcpStatus",
 		"input": `{"server":"ida-pro-mcp"}`,
 		"stop":  true,
@@ -123,6 +123,9 @@ func TestHandleToolUseEventGeneratesMissingToolUseID(t *testing.T) {
 			toolUses = append(toolUses, toolUse)
 		},
 	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if current != nil {
 		t.Fatalf("expected stopped tool use to clear current state")
@@ -146,16 +149,22 @@ func TestHandleToolUseEventReplacesGeneratedIDWhenRealIDArrives(t *testing.T) {
 		},
 	}
 
-	current := handleToolUseEvent(map[string]interface{}{
+	current, _, err := handleToolUseEvent(map[string]interface{}{
 		"name":  "mcpIdaProMcpStatus",
 		"input": `{"server":`,
 	}, nil, callback)
-	current = handleToolUseEvent(map[string]interface{}{
+	if err != nil {
+		t.Fatalf("unexpected error on first frame: %v", err)
+	}
+	current, _, err = handleToolUseEvent(map[string]interface{}{
 		"toolUseId": "toolu_real",
 		"name":      "mcpIdaProMcpStatus",
 		"input":     `"ida-pro-mcp"}`,
 		"stop":      true,
 	}, current, callback)
+	if err != nil {
+		t.Fatalf("unexpected error on second frame: %v", err)
+	}
 
 	if current != nil {
 		t.Fatalf("expected stopped tool use to clear current state")

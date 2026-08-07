@@ -272,6 +272,7 @@ func TestResponsesContinuationKeepsNewInstructions(t *testing.T) {
 		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
 			"content": "second reply",
 		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "meteringEvent", map[string]interface{}{"usage": 1.0}))
 	}))
 	defer server.Close()
 	defer swapKiroEndpointsForTest(t, server)()
@@ -350,6 +351,7 @@ func TestResponsesNonStreamRoundTrip(t *testing.T) {
 		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
 			"content": "responses non-stream OK",
 		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "meteringEvent", map[string]interface{}{"usage": 1.0}))
 	}))
 	defer server.Close()
 	defer swapKiroEndpointsForTest(t, server)()
@@ -403,6 +405,7 @@ func TestResponsesStreamSSE(t *testing.T) {
 		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
 			"content": "stream chunk",
 		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "meteringEvent", map[string]interface{}{"usage": 1.0}))
 	}))
 	defer server.Close()
 	defer swapKiroEndpointsForTest(t, server)()

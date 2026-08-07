@@ -55,10 +55,16 @@ func (h *Handler) serveViaProvider(
 ) (handled bool, err error) {
 	p := step.Provider
 
+	// The detail stays server-side. A provider failure carries the upstream URL,
+	// its HTTP status and a slice of its response body — enough to identify which
+	// vendor sits behind this proxy and to expose their error text (which can
+	// include account or billing wording). Callers put the returned error straight
+	// into the client response, so everything here collapses to one opaque
+	// message: a failing provider is indistinguishable from an exhausted pool.
 	fail := func(e error) (bool, error) {
 		logger.Warnf("[Provider] %s: %v", p.Name, e)
 		config.RecordProviderUsage(p.ID, 0, 0, true)
-		return false, e
+		return false, errNoUpstreamAvailable
 	}
 
 	body, err := bridgeRequestBody(step, pc)

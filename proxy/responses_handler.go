@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"kiro-go/config"
+	"kiro-go/logger"
 	"net/http"
 	"strings"
 	"time"
@@ -188,6 +189,7 @@ func (h *Handler) handleResponsesNonStream(
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var truncated bool
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -197,9 +199,10 @@ func (h *Handler) handleResponsesNonStream(
 					content += text
 				}
 			},
-			OnToolUse:  func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
-			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
-			OnCredits:  func(c float64) { credits = c },
+			OnToolUse:   func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
+			OnComplete:  func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
+			OnCredits:   func(c float64) { credits = c },
+			OnTruncated: func() { truncated = true },
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
@@ -210,6 +213,15 @@ func (h *Handler) handleResponsesNonStream(
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
+			continue
+		}
+
+		// Nothing written yet — rotate rather than persist and return a partial
+		// response whose envelope would claim Status "completed".
+		if truncated {
+			lastErr = fmt.Errorf("upstream ended the stream before the turn completed")
+			logger.Warnf("[Responses] turn truncated mid-generation on %s, rotating account", accountEmailForLog(account))
+			excluded[account.ID] = true
 			continue
 		}
 
@@ -496,6 +508,7 @@ func (h *Handler) handleResponsesStream(
 			outputTokens    int
 			credits         float64
 			realInputTokens int
+			truncated       bool
 		)
 
 		messageItemID := generateOutputItemID("msg")
@@ -617,8 +630,9 @@ func (h *Handler) handleResponsesStream(
 				outputIndex++
 				responseStarted = true
 			},
-			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
-			OnCredits:  func(c float64) { credits = c },
+			OnComplete:  func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
+			OnCredits:   func(c float64) { credits = c },
+			OnTruncated: func() { truncated = true },
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
@@ -645,6 +659,15 @@ func (h *Handler) handleResponsesStream(
 			})
 			h.recordFailureForApiKey(apiKeyID, "openai", model, 0, err.Error(), startedAt, "")
 			return
+		}
+
+		// Upstream cut the turn short. Nothing has gone out yet, so rotate and
+		// retry on another account rather than emitting a partial response.
+		if truncated && !responseStarted {
+			lastErr = fmt.Errorf("upstream ended the stream before the turn completed")
+			logger.Warnf("[Responses] turn truncated before any output on %s, rotating account", accountEmailForLog(account))
+			excluded[account.ID] = true
+			continue
 		}
 
 		finalContent, _ := extractThinkingFromContent(fullText.String())
@@ -686,6 +709,30 @@ func (h *Handler) handleResponsesStream(
 			inputTokens = estimatedInputTokens
 		}
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoning, toolUses)
+
+		// Content already went out but the turn never completed. The open items
+		// above have been closed so the client is not left mid-item, but the
+		// terminal event must be response.failed — sending response.completed
+		// would assert a partial answer is the whole answer. The response is not
+		// persisted either: a stored "completed" record would replay the same lie.
+		if truncated {
+			logger.Warnf("[Responses] turn truncated mid-generation: model=%s account=%s", model, accountEmailForLog(account))
+			send("response.failed", map[string]interface{}{
+				"type": "response.failed",
+				"response": map[string]interface{}{
+					"id":     respID,
+					"status": "failed",
+					"error": map[string]string{
+						"type":    "server_error",
+						"message": "upstream ended the stream before the turn completed",
+					},
+				},
+			})
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			h.recordFailureForApiKey(apiKeyID, "openai", model, 0, "stream truncated before completion", startedAt, "")
+			return
+		}
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model, account, "openai", startedAt, "")
 		h.pool.RecordSuccess(account.ID)

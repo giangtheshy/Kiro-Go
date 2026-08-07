@@ -68,6 +68,10 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
 			"content": "retried successfully",
 		}))
+		// A complete turn is billed at the end. Without a meteringEvent the
+		// stream is indistinguishable from one the upstream cut short, and the
+		// handler correctly refuses to report it as finished.
+		_, _ = w.Write(awsEventStreamFrame(t, "meteringEvent", map[string]interface{}{"usage": 1.0}))
 	}))
 	defer server.Close()
 

@@ -407,7 +407,6 @@ func (h *Handler) testAccountThroughProxy(account *config.Account) error {
 		OnText:         func(string, bool) {},
 		OnToolUse:      func(KiroToolUse) {},
 		OnComplete:     func(int, int) {},
-		OnError:        func(error) {},
 		OnCredits:      func(float64) {},
 		OnContextUsage: func(float64) {},
 	}

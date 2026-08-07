@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"errors"
 	"kiro-go/config"
 	"kiro-go/logger"
 	"net/http"
@@ -10,14 +11,48 @@ import (
 
 const maxAccountRetryAttempts = 3
 
+// noUpstreamAvailableMessage is the single message every upstream-exhaustion
+// path reports. It is deliberately identical whether the Kiro pool ran out or an
+// external provider failed, so the client cannot tell which upstreams exist
+// behind this proxy or why one of them broke.
+const noUpstreamAvailableMessage = "No available accounts"
+
+// errNoUpstreamAvailable is the sanitized error a failing external provider
+// returns in place of the real one. The real cause — upstream URL, status code,
+// and response body — is logged server-side and never travels to the client.
+var errNoUpstreamAvailable = errors.New(noUpstreamAvailableMessage)
+
 func isQuotaErrorMessage(msg string) bool {
 	msg = strings.ToLower(msg)
 	return strings.Contains(msg, "429") || strings.Contains(msg, "quota") || strings.Contains(msg, "throttl")
 }
 
+// isOverageErrorMessage matches Kiro's overage-limit rejection.
+//
+// Match on the upstream's own reason codes, NOT on a status code: the real
+// rejection arrives as HTTP *400* carrying
+// {"__type":"...ServiceQuotaExceededException","reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}.
+// Keying off "402" therefore never fired, and the error fell through to
+// isQuotaErrorMessage — classified as a plain quota problem, so the overage
+// refresh path never ran.
 func isOverageErrorMessage(msg string) bool {
 	msg = strings.ToLower(msg)
-	return strings.Contains(msg, "402") && strings.Contains(msg, "overage")
+	return strings.Contains(msg, "overage_request_limit_exceeded") ||
+		strings.Contains(msg, "limit for overages") ||
+		(strings.Contains(msg, "402") && strings.Contains(msg, "overage"))
+}
+
+// isRefusalErrorMessage matches a content-filter refusal. These must never be
+// charged to the account: the same payload is refused identically by every
+// account, so treating a refusal as an account error would walk the entire pool
+// into cooldown over one filtered conversation.
+func isRefusalErrorMessage(msg string) bool {
+	msg = strings.ToLower(msg)
+	return strings.Contains(msg, "content filter") ||
+		strings.Contains(msg, "contentfilter") ||
+		strings.Contains(msg, "content_filter") ||
+		strings.Contains(msg, "guardrail") ||
+		strings.Contains(msg, "blocked by content policy")
 }
 
 func isSuspensionErrorMessage(msg string) bool {
@@ -70,12 +105,21 @@ func statusForUpstreamError(err error) int {
 	if err == nil {
 		return http.StatusInternalServerError
 	}
+	// A sanitized provider failure carries no upstream detail to classify, and
+	// it means the same thing as an exhausted pool.
+	if errors.Is(err, errNoUpstreamAvailable) {
+		return http.StatusServiceUnavailable
+	}
+
 	msg := err.Error()
 	switch {
-	case isQuotaErrorMessage(msg):
-		return http.StatusTooManyRequests
+	// Overage is checked BEFORE quota: the upstream reports it as
+	// ServiceQuotaExceededException, which contains "quota", so the quota case
+	// would otherwise swallow every overage error and answer 429 instead of 402.
 	case isOverageErrorMessage(msg):
 		return http.StatusPaymentRequired
+	case isQuotaErrorMessage(msg):
+		return http.StatusTooManyRequests
 	case isAuthErrorMessage(msg):
 		return http.StatusUnauthorized
 	default:
@@ -168,6 +212,15 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 	}
 
 	errMsg := err.Error()
+
+	// A content-filter refusal is a property of the payload, not the account.
+	// Every account returns the same verdict, so recording it as an account
+	// error would cool down the whole pool over one filtered conversation.
+	if isRefusalErrorMessage(errMsg) {
+		logger.Warnf("[AccountFailover] Content refusal for %s (not counted against the account): %v", account.Email, err)
+		return
+	}
+
 	switch {
 	case isProxyErrorMessage(errMsg):
 		// Proxy/dial failure — cool down and rotate; never disable the account
