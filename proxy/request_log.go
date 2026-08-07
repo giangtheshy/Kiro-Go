@@ -13,27 +13,41 @@ import (
 // RequestLogEntry is a single served API request, captured for the admin "API Log" view.
 // It records which API key was used, the model, token/credit cost and the serving account.
 type RequestLogEntry struct {
-	Time         int64   `json:"time"` // Unix seconds
-	Status       string  `json:"status"` // "ok" or "error"
-	Endpoint     string  `json:"endpoint,omitempty"` // "claude" or "openai"
-	APIKeyID     string  `json:"apiKeyId,omitempty"`
-	APIKeyName   string  `json:"apiKeyName,omitempty"`
-	APIKeyMasked string  `json:"apiKeyMasked,omitempty"`
-	Model        string  `json:"model,omitempty"`
-	AccountID    string  `json:"accountId,omitempty"`
-	AccountEmail string  `json:"accountEmail,omitempty"`
-	InputTokens  int     `json:"inputTokens"`
-	OutputTokens int     `json:"outputTokens"`
-	TotalTokens  int     `json:"totalTokens"`
-	Credits      float64 `json:"credits"`
-	DurationMs   int64   `json:"durationMs"`
-	StatusCode   int     `json:"statusCode,omitempty"` // upstream/HTTP status on error
-	Error        string  `json:"error,omitempty"`      // error detail on failure
+	Time             int64   `json:"time"`               // Unix seconds
+	Status           string  `json:"status"`             // "ok" or "error"
+	Endpoint         string  `json:"endpoint,omitempty"` // "claude" or "openai"
+	APIKeyID         string  `json:"apiKeyId,omitempty"`
+	APIKeyName       string  `json:"apiKeyName,omitempty"`
+	APIKeyMasked     string  `json:"apiKeyMasked,omitempty"`
+	Model            string  `json:"model,omitempty"`
+	AccountID        string  `json:"accountId,omitempty"`
+	AccountEmail     string  `json:"accountEmail,omitempty"`
+	InputTokens      int     `json:"inputTokens"`
+	OutputTokens     int     `json:"outputTokens"`
+	CacheReadTokens  int     `json:"cacheReadTokens,omitempty"`  // prompt-cache read tokens
+	CacheWriteTokens int     `json:"cacheWriteTokens,omitempty"` // prompt-cache write tokens
+	TotalTokens      int     `json:"totalTokens"`
+	Credits          float64 `json:"credits"`
+	DurationMs       int64   `json:"durationMs"`
+	StatusCode       int     `json:"statusCode,omitempty"` // upstream/HTTP status on error
+	Error            string  `json:"error,omitempty"`      // error detail on failure
 	// ClientIP is the resolved real client IP address. Populated only when
 	// KIRO_TRUST_PROXY is enabled and the IP could be determined. The per-key
 	// self-service log endpoint strips this field before returning entries to
 	// the key owner: it is admin-only information.
 	ClientIP string `json:"clientIp,omitempty"`
+}
+
+// requestUsage bundles the token/credit/cache/ip attribution for a single
+// successful upstream round. Using a struct avoids a 10+ parameter function
+// signature and makes call sites self-documenting.
+type requestUsage struct {
+	Input      int
+	Output     int
+	CacheRead  int // prompt-cache read tokens (Anthropic) or cached prompt tokens (OpenAI)
+	CacheWrite int // prompt-cache creation tokens (Anthropic)
+	Credits    float64
+	ClientIP   string
 }
 
 // requestLogCapacity is the number of recent request entries retained in memory.
@@ -316,22 +330,22 @@ func (h *Handler) apiGetUsageSummary(w http.ResponseWriter, r *http.Request) {
 // key ID, name, masked value and internal flags — a customer checking their own
 // key only needs quota/usage/expiry, not admin metadata.
 type apiKeySelfInfo struct {
-	Enabled       bool    `json:"enabled"`
-	TokenLimit    int64   `json:"tokenLimit"`
-	CreditLimit   float64 `json:"creditLimit"`
-	TokensUsed    int64   `json:"tokensUsed"`
-	CreditsUsed   float64 `json:"creditsUsed"`
-	RequestsCount int64   `json:"requestsCount"`
-	TokensRemain  int64   `json:"tokensRemain"`  // -1 = unlimited
-	CreditsRemain float64 `json:"creditsRemain"` // -1 = unlimited
-	OverToken     bool    `json:"overToken"`
-	OverCredit    bool    `json:"overCredit"`
-	Expired       bool    `json:"expired"`
-	ExpiresAt     int64   `json:"expiresAt,omitempty"`
-	Valid         bool    `json:"valid"` // false when the key is disabled/expired/over-limit
-	BaseURL       string  `json:"baseURL,omitempty"` // externally reachable API base, so the customer knows where to point their client
-	DailyTokens   int64           `json:"dailyTokens"` // input+output tokens since local midnight (in-memory, resets on restart)
-	ByModel       []modelStatView `json:"byModel"`     // per-model breakdown (in-memory, resets on restart)
+	Enabled       bool            `json:"enabled"`
+	TokenLimit    int64           `json:"tokenLimit"`
+	CreditLimit   float64         `json:"creditLimit"`
+	TokensUsed    int64           `json:"tokensUsed"`
+	CreditsUsed   float64         `json:"creditsUsed"`
+	RequestsCount int64           `json:"requestsCount"`
+	TokensRemain  int64           `json:"tokensRemain"`  // -1 = unlimited
+	CreditsRemain float64         `json:"creditsRemain"` // -1 = unlimited
+	OverToken     bool            `json:"overToken"`
+	OverCredit    bool            `json:"overCredit"`
+	Expired       bool            `json:"expired"`
+	ExpiresAt     int64           `json:"expiresAt,omitempty"`
+	Valid         bool            `json:"valid"`             // false when the key is disabled/expired/over-limit
+	BaseURL       string          `json:"baseURL,omitempty"` // externally reachable API base, so the customer knows where to point their client
+	DailyTokens   int64           `json:"dailyTokens"`       // input+output tokens since local midnight (in-memory, resets on restart)
+	ByModel       []modelStatView `json:"byModel"`           // per-model breakdown (in-memory, resets on restart)
 }
 
 // apiKeySelfLogEntry is one row of a customer's own usage history. Deliberately

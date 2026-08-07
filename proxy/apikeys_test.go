@@ -258,7 +258,8 @@ func TestRecordSuccessForApiKeyUpdatesEntry(t *testing.T) {
 	}
 
 	h := &Handler{}
-	h.recordSuccessForApiKey(created.ID, 25, 30, 0.75, "claude-test", nil, "claude", time.Time{}, "")
+	h.recordSuccessForApiKey(created.ID, requestUsage{Input: 25, Output: 30, Credits: 0.75},
+		"claude-test", nil, "claude", time.Time{})
 
 	got := config.GetApiKeyEntry(created.ID)
 	if got == nil {
@@ -283,7 +284,8 @@ func TestRecordSuccessForApiKeyEmptyIDIsNoop(t *testing.T) {
 	}
 
 	h := &Handler{}
-	h.recordSuccessForApiKey("", 100, 100, 1, "claude-test", nil, "claude", time.Time{}, "")
+	h.recordSuccessForApiKey("", requestUsage{Input: 100, Output: 100, Credits: 1},
+		"claude-test", nil, "claude", time.Time{})
 	got := config.GetApiKeyEntry(created.ID)
 	if got == nil {
 		t.Fatalf("entry missing")

@@ -200,7 +200,11 @@ func (h *Handler) handleWebSearchRequest(w http.ResponseWriter, req *ClaudeReque
 
 	// This path never calls Kiro chat, so it costs no credits — but the search
 	// itself is still recorded so it is not invisible in usage.
-	h.recordSuccessForApiKey(apiKeyID, estimatedInputTokens, outputTokens, 0, req.Model, account, "claude", startedAt, clientIP)
+	h.recordSuccessForApiKey(apiKeyID, requestUsage{
+		Input:    estimatedInputTokens,
+		Output:   outputTokens,
+		ClientIP: clientIP,
+	}, req.Model, account, "claude", startedAt)
 
 	if req.Stream {
 		h.streamWebSearchResponse(w, req.Model, query, toolUseID, results, blocks, estimatedInputTokens, outputTokens)

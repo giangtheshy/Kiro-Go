@@ -1,0 +1,1 @@
+Go test: 4 passed in 1 packages

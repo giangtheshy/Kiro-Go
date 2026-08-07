@@ -4040,6 +4040,14 @@
         : dash;
       const durationCell = e.durationMs ? escapeHtml(formatNumber(e.durationMs)) + 'ms' : dash;
       const numOrDash = v => (isError && !v) ? dash : escapeHtml(formatNumber(v || 0));
+      // Prompt-cache traffic. Only the Claude paths track it, so a request with
+      // no cache activity shows a dash rather than a misleading "0 / 0".
+      const cacheCell = (e.cacheReadTokens || e.cacheWriteTokens)
+        ? '<span style="color:#38bdf8;" title="' + escapeAttr(t('apilog.cacheRead')) + '">&#8635; ' +
+            escapeHtml(formatNumber(e.cacheReadTokens || 0)) + '</span> / ' +
+          '<span style="color:#a78bfa;" title="' + escapeAttr(t('apilog.cacheWrite')) + '">&#43; ' +
+            escapeHtml(formatNumber(e.cacheWriteTokens || 0)) + '</span>'
+        : dash;
       // Client IP cell doubles as a one-click ban entry point for abusive callers.
       const ipCell = e.clientIp
         ? '<span class="text-xs font-mono">' + escapeHtml(e.clientIp) + '</span>' +
@@ -4055,6 +4063,7 @@
         '<td class="text-xs">' + escapeHtml(e.model || '') + '</td>' +
         '<td>' + (isError ? dash : accountLabel) + '</td>' +
         '<td class="num text-xs"><span style="color:#22c55e;">&#9660; ' + numOrDash(e.inputTokens) + '</span> / <span style="color:#f59e0b;">&#9650; ' + numOrDash(e.outputTokens) + '</span></td>' +
+        '<td class="num text-xs">' + cacheCell + '</td>' +
         '<td class="num">' + numOrDash(e.totalTokens) + '</td>' +
         '<td class="num">' + numOrDash(e.credits) + '</td>' +
         '<td class="num text-xs">' + durationCell + '</td>' +
@@ -4090,7 +4099,7 @@
     if (!entries.length) { toast(t('logs.exportFailed'), 'error'); return; }
     let blob;
     if (format === 'csv') {
-      const cols = ['time', 'status', 'endpoint', 'apiKeyName', 'apiKeyMasked', 'clientIp', 'model', 'accountEmail', 'inputTokens', 'outputTokens', 'totalTokens', 'credits', 'durationMs', 'statusCode', 'error'];
+      const cols = ['time', 'status', 'endpoint', 'apiKeyName', 'apiKeyMasked', 'clientIp', 'model', 'accountEmail', 'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'totalTokens', 'credits', 'durationMs', 'statusCode', 'error'];
       const esc = v => {
         const s = String(v == null ? '' : v);
         return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;

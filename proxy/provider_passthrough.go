@@ -15,14 +15,25 @@ import (
 	"kiro-go/logger"
 )
 
-// passthroughCtx carries what an external provider needs that the Kiro payload
-// has already thrown away: the client's original, untranslated request body and
-// the headers that came with it.
+// passthroughCtx carries request-scoped metadata that the Kiro payload has
+// already thrown away: the client's original body and headers (for provider
+// passthrough), plus attribution data used by recordSuccessForApiKey.
 type passthroughCtx struct {
 	Raw      []byte      // exact body the client sent
 	Header   http.Header // original client headers (for anthropic-beta passthrough)
 	Stream   bool
 	Endpoint string // one of the config.ProviderEndpoint* constants
+	ClientIP string // resolved real client IP; forwarded to request log entries
+}
+
+// clientIP returns the resolved client IP, tolerating a nil receiver: several
+// handlers are reachable from tests and from the limit-notice paths without a
+// passthrough context.
+func (pc *passthroughCtx) clientIP() string {
+	if pc == nil {
+		return ""
+	}
+	return pc.ClientIP
 }
 
 // providerStreamScanBuffer bounds one SSE line. Upstream payloads (large tool
@@ -122,7 +133,16 @@ func (h *Handler) serveViaProvider(
 	}
 
 	inTok, outTok, credits := providerBilling(p.Protocol, usage, step.Pricing, fallbackInputTokens)
-	h.recordSuccessForApiKey(apiKeyID, inTok, outTok, credits, model, providerAsAccount(p), providerLogEndpoint(pc.Endpoint), startedAt, "")
+	// inTok already includes the cache traffic, so the cache counts are reported
+	// alongside it as a breakdown rather than as an additional charge.
+	h.recordSuccessForApiKey(apiKeyID, requestUsage{
+		Input:      inTok,
+		Output:     outTok,
+		CacheRead:  usage.CacheRead,
+		CacheWrite: usage.CacheWrite,
+		Credits:    credits,
+		ClientIP:   pc.clientIP(),
+	}, model, providerAsAccount(p), providerLogEndpoint(pc.Endpoint), startedAt)
 	config.RecordProviderUsage(p.ID, int64(inTok+outTok), credits, false)
 	return true, nil
 }

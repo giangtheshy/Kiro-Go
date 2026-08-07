@@ -140,6 +140,7 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 		Header:   r.Header,
 		Stream:   req.Stream,
 		Endpoint: config.ProviderEndpointResponses,
+		ClientIP: h.resolveClientIP(r),
 	}
 
 	if req.Stream {
@@ -237,7 +238,12 @@ func (h *Handler) handleResponsesNonStream(
 		}
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model, account, "openai", startedAt, "")
+		h.recordSuccessForApiKey(apiKeyID, requestUsage{
+			Input:    inputTokens,
+			Output:   outputTokens,
+			Credits:  credits,
+			ClientIP: pc.clientIP(),
+		}, model, account, "openai", startedAt)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 
@@ -258,13 +264,13 @@ func (h *Handler) handleResponsesNonStream(
 	}
 
 	if lastErr == nil {
-		h.recordFailureForApiKey(apiKeyID, "openai", model, 503, "No available accounts", startedAt, "")
+		h.recordFailureForApiKey(apiKeyID, "openai", model, 503, "No available accounts", startedAt, pc.clientIP())
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
 	status := statusForUpstreamError(lastErr)
 	applyRetryAfterHeader(w, lastErr)
-	h.recordFailureForApiKey(apiKeyID, "openai", model, status, lastErr.Error(), startedAt, "")
+	h.recordFailureForApiKey(apiKeyID, "openai", model, status, lastErr.Error(), startedAt, pc.clientIP())
 	h.sendOpenAIError(w, status, errorTypeForOpenAIStatus(status), lastErr.Error())
 }
 
@@ -657,7 +663,7 @@ func (h *Handler) handleResponsesStream(
 					},
 				},
 			})
-			h.recordFailureForApiKey(apiKeyID, "openai", model, 0, err.Error(), startedAt, "")
+			h.recordFailureForApiKey(apiKeyID, "openai", model, 0, err.Error(), startedAt, pc.clientIP())
 			return
 		}
 
@@ -730,11 +736,16 @@ func (h *Handler) handleResponsesStream(
 			})
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			flusher.Flush()
-			h.recordFailureForApiKey(apiKeyID, "openai", model, 0, "stream truncated before completion", startedAt, "")
+			h.recordFailureForApiKey(apiKeyID, "openai", model, 0, "stream truncated before completion", startedAt, pc.clientIP())
 			return
 		}
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model, account, "openai", startedAt, "")
+		h.recordSuccessForApiKey(apiKeyID, requestUsage{
+			Input:    inputTokens,
+			Output:   outputTokens,
+			Credits:  credits,
+			ClientIP: pc.clientIP(),
+		}, model, account, "openai", startedAt)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 
@@ -760,7 +771,7 @@ func (h *Handler) handleResponsesStream(
 	}
 
 	if lastErr == nil {
-		h.recordFailureForApiKey(apiKeyID, "openai", model, 503, "No available accounts", startedAt, "")
+		h.recordFailureForApiKey(apiKeyID, "openai", model, 503, "No available accounts", startedAt, pc.clientIP())
 		ensureCreated()
 		send("response.failed", map[string]interface{}{
 			"type": "response.failed",
@@ -776,7 +787,7 @@ func (h *Handler) handleResponsesStream(
 		return
 	}
 	status := statusForUpstreamError(lastErr)
-	h.recordFailureForApiKey(apiKeyID, "openai", model, status, lastErr.Error(), startedAt, "")
+	h.recordFailureForApiKey(apiKeyID, "openai", model, status, lastErr.Error(), startedAt, pc.clientIP())
 	ensureCreated()
 	send("response.failed", map[string]interface{}{
 		"type": "response.failed",

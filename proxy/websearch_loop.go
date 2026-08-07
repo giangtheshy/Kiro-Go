@@ -315,7 +315,12 @@ func (h *Handler) flushWebSearchLoop(
 		// turn did not complete.
 		h.recordFailureForApiKey(apiKeyID, "claude", req.Model, 0, "stream truncated before completion", startedAt, clientIP)
 	} else {
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, req.Model, account, "claude", startedAt, clientIP)
+		h.recordSuccessForApiKey(apiKeyID, requestUsage{
+			Input:    inputTokens,
+			Output:   outputTokens,
+			Credits:  credits,
+			ClientIP: clientIP,
+		}, req.Model, account, "claude", startedAt)
 		if account != nil {
 			h.pool.RecordSuccess(account.ID)
 			h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)

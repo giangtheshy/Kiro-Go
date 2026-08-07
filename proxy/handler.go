@@ -1240,6 +1240,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	pc := &passthroughCtx{
 		Raw:      body,
 		Header:   r.Header,
+		ClientIP: h.resolveClientIP(r),
 		Stream:   req.Stream,
 		Endpoint: config.ProviderEndpointMessages,
 	}
@@ -1689,7 +1690,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			if !messageStarted {
 				continue
 			}
-			h.recordFailureForApiKey(apiKeyID, "claude", model, 0, err.Error(), startedAt, "")
+			h.recordFailureForApiKey(apiKeyID, "claude", model, 0, err.Error(), startedAt, pc.clientIP())
 			stream.sendEvent("error", map[string]interface{}{
 				"type":  "error",
 				"error": map[string]string{"type": "api_error", "message": err.Error()},
@@ -1718,7 +1719,14 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 		outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model, account, "claude", startedAt, "")
+		h.recordSuccessForApiKey(apiKeyID, requestUsage{
+			Input:      inputTokens,
+			Output:     outputTokens,
+			CacheRead:  cacheUsage.CacheReadInputTokens,
+			CacheWrite: cacheUsage.CacheCreationInputTokens,
+			Credits:    credits,
+			ClientIP:   pc.clientIP(),
+		}, model, account, "claude", startedAt)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
@@ -1768,7 +1776,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	if lastErr == nil {
-		h.recordFailureForApiKey(apiKeyID, "claude", model, 503, "No available accounts", startedAt, "")
+		h.recordFailureForApiKey(apiKeyID, "claude", model, 503, "No available accounts", startedAt, pc.clientIP())
 		// Use stream.committedNow() to decide how to surface errors: if the
 		// heartbeat or a previous SSE event already committed the response, we
 		// cannot change the HTTP status, so the error goes in-band via SSE.
@@ -1785,7 +1793,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 	status := statusForUpstreamError(lastErr)
 	applyRetryAfterHeader(w, lastErr)
-	h.recordFailureForApiKey(apiKeyID, "claude", model, status, lastErr.Error(), startedAt, "")
+	h.recordFailureForApiKey(apiKeyID, "claude", model, status, lastErr.Error(), startedAt, pc.clientIP())
 	if stream.committedNow() {
 		stream.sendEvent("error", map[string]interface{}{
 			"type":  "error",
@@ -1933,28 +1941,28 @@ func (h *Handler) recordSuccess(inputTokens, outputTokens int, credits float64) 
 // When apiKeyID is empty (legacy single-key path or unauthenticated path), only the
 // global counters are updated. Persistence errors are logged but do not propagate.
 // model is recorded in the per-request log for the admin API Log view.
-// clientIP is the resolved real client IP (may be empty if KIRO_TRUST_PROXY is off
-// and RemoteAddr could not be parsed); stored in the request log for admin use only.
-func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTokens int, credits float64, model string, account *config.Account, endpoint string, startedAt time.Time, clientIP string) {
-	h.recordSuccess(inputTokens, outputTokens, credits)
+// u.ClientIP is the resolved real client IP (may be empty if KIRO_TRUST_PROXY is off);
+// u.CacheRead/CacheWrite are prompt-cache tokens (non-zero only on Claude paths).
+func (h *Handler) recordSuccessForApiKey(apiKeyID string, u requestUsage, model string, account *config.Account, endpoint string, startedAt time.Time) {
+	h.recordSuccess(u.Input, u.Output, u.Credits)
 
 	keyName, keyMasked := apiKeyLabels(apiKeyID)
 	if apiKeyID != "" {
-		if err := config.RecordApiKeyUsage(apiKeyID, int64(inputTokens+outputTokens), credits, model, false); err != nil {
+		if err := config.RecordApiKeyUsage(apiKeyID, int64(u.Input+u.Output), u.Credits, model, false); err != nil {
 			logger.Warnf("[ApiKey] failed to record usage for key %s: %v", apiKeyID, err)
 		}
 		if h.usage != nil {
-			h.usage.recordSuccess(apiKeyID, model, int64(inputTokens), 0, int64(outputTokens))
+			h.usage.recordSuccess(apiKeyID, model, int64(u.Input), 0, int64(u.Output))
 		}
 		if h.keyLogHub != nil {
 			h.keyLogHub.publish(apiKeyID, keyLogEntry{
 				Status:     "ok",
 				Model:      model,
-				InTokens:   inputTokens,
-				OutTokens:  outputTokens,
-				Credits:    credits,
+				InTokens:   u.Input,
+				OutTokens:  u.Output,
+				Credits:    u.Credits,
 				DurationMs: durationMs(startedAt),
-				ClientIP:   clientIP,
+				ClientIP:   u.ClientIP,
 			})
 		}
 	}
@@ -1967,19 +1975,21 @@ func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTok
 	}
 
 	logRequest(RequestLogEntry{
-		Status:       "ok",
-		Endpoint:     endpoint,
-		APIKeyID:     apiKeyID,
-		APIKeyName:   keyName,
-		APIKeyMasked: keyMasked,
-		Model:        model,
-		AccountID:    accountID,
-		AccountEmail: accountEmail,
-		InputTokens:  inputTokens,
-		OutputTokens: outputTokens,
-		Credits:      credits,
-		DurationMs:   durationMs(startedAt),
-		ClientIP:     clientIP,
+		Status:           "ok",
+		Endpoint:         endpoint,
+		APIKeyID:         apiKeyID,
+		APIKeyName:       keyName,
+		APIKeyMasked:     keyMasked,
+		Model:            model,
+		AccountID:        accountID,
+		AccountEmail:     accountEmail,
+		InputTokens:      u.Input,
+		OutputTokens:     u.Output,
+		CacheReadTokens:  u.CacheRead,
+		CacheWriteTokens: u.CacheWrite,
+		Credits:          u.Credits,
+		DurationMs:       durationMs(startedAt),
+		ClientIP:         u.ClientIP,
 	})
 }
 
@@ -2142,7 +2152,14 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model, account, "claude", startedAt, "")
+		h.recordSuccessForApiKey(apiKeyID, requestUsage{
+			Input:      inputTokens,
+			Output:     outputTokens,
+			CacheRead:  cacheUsage.CacheReadInputTokens,
+			CacheWrite: cacheUsage.CacheCreationInputTokens,
+			Credits:    credits,
+			ClientIP:   pc.clientIP(),
+		}, model, account, "claude", startedAt)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
@@ -2187,14 +2204,14 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 	}
 
 	if lastErr == nil {
-		h.recordFailureForApiKey(apiKeyID, "claude", model, 503, "No available accounts", startedAt, "")
+		h.recordFailureForApiKey(apiKeyID, "claude", model, 503, "No available accounts", startedAt, pc.clientIP())
 		h.sendClaudeError(w, 503, "api_error", "No available accounts")
 		return
 	}
 
 	status := statusForUpstreamError(lastErr)
 	applyRetryAfterHeader(w, lastErr)
-	h.recordFailureForApiKey(apiKeyID, "claude", model, status, lastErr.Error(), startedAt, "")
+	h.recordFailureForApiKey(apiKeyID, "claude", model, status, lastErr.Error(), startedAt, pc.clientIP())
 	h.sendClaudeError(w, status, "api_error", lastErr.Error())
 }
 
@@ -2319,6 +2336,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		Header:   r.Header,
 		Stream:   req.Stream,
 		Endpoint: config.ProviderEndpointChatCompletions,
+		ClientIP: h.resolveClientIP(r),
 	}
 
 	if req.Stream {
@@ -2663,7 +2681,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			if !responseStarted {
 				continue
 			}
-			h.recordFailureForApiKey(apiKeyID, "openai", model, 0, err.Error(), startedAt, "")
+			h.recordFailureForApiKey(apiKeyID, "openai", model, 0, err.Error(), startedAt, pc.clientIP())
 			return
 		}
 
@@ -2691,7 +2709,12 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			outputTokens += estimateApproxTokens(tc.Function.Arguments)
 		}
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model, account, "openai", startedAt, "")
+		h.recordSuccessForApiKey(apiKeyID, requestUsage{
+			Input:    inputTokens,
+			Output:   outputTokens,
+			Credits:  credits,
+			ClientIP: pc.clientIP(),
+		}, model, account, "openai", startedAt)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		logSuspiciousReq("openai", model, inputTokens, outputTokens, len(toolCalls) > 0)
@@ -2737,7 +2760,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	if lastErr == nil {
-		h.recordFailureForApiKey(apiKeyID, "openai", model, 503, "No available accounts", startedAt, "")
+		h.recordFailureForApiKey(apiKeyID, "openai", model, 503, "No available accounts", startedAt, pc.clientIP())
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
@@ -2748,7 +2771,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	// handler (Claude stream/non-stream, OpenAI non-stream, /v1/responses) logs here.
 	status := statusForUpstreamError(lastErr)
 	applyRetryAfterHeader(w, lastErr)
-	h.recordFailureForApiKey(apiKeyID, "openai", model, status, lastErr.Error(), startedAt, "")
+	h.recordFailureForApiKey(apiKeyID, "openai", model, status, lastErr.Error(), startedAt, pc.clientIP())
 	h.sendOpenAIError(w, status, errorTypeForOpenAIStatus(status), lastErr.Error())
 }
 
@@ -2836,7 +2859,12 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model, account, "openai", startedAt, "")
+		h.recordSuccessForApiKey(apiKeyID, requestUsage{
+			Input:    inputTokens,
+			Output:   outputTokens,
+			Credits:  credits,
+			ClientIP: pc.clientIP(),
+		}, model, account, "openai", startedAt)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		logSuspiciousReq("openai", model, inputTokens, outputTokens, len(toolUses) > 0)
@@ -2855,14 +2883,14 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 	}
 
 	if lastErr == nil {
-		h.recordFailureForApiKey(apiKeyID, "openai", model, 503, "No available accounts", startedAt, "")
+		h.recordFailureForApiKey(apiKeyID, "openai", model, 503, "No available accounts", startedAt, pc.clientIP())
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
 
 	status := statusForUpstreamError(lastErr)
 	applyRetryAfterHeader(w, lastErr)
-	h.recordFailureForApiKey(apiKeyID, "openai", model, status, lastErr.Error(), startedAt, "")
+	h.recordFailureForApiKey(apiKeyID, "openai", model, status, lastErr.Error(), startedAt, pc.clientIP())
 	h.sendOpenAIError(w, status, errorTypeForOpenAIStatus(status), lastErr.Error())
 }
 
@@ -4418,16 +4446,16 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"apiKey":          config.GetApiKey(),
-		"requireApiKey":   config.IsApiKeyRequired(),
-		"port":            config.GetPort(),
-		"host":            config.GetHost(),
-		"allowOverUsage":  config.GetAllowOverUsage(),
-		"maxPayloadBytes": config.GetMaxPayloadBytes(),
-		"publicBaseURL":   config.GetPublicBaseURL(),
+		"apiKey":             config.GetApiKey(),
+		"requireApiKey":      config.IsApiKeyRequired(),
+		"port":               config.GetPort(),
+		"host":               config.GetHost(),
+		"allowOverUsage":     config.GetAllowOverUsage(),
+		"maxPayloadBytes":    config.GetMaxPayloadBytes(),
+		"publicBaseURL":      config.GetPublicBaseURL(),
 		"limitNoticeMessage": config.GetLimitNoticeMessage(),
-		"forceModel":      config.GetForceModel(),
-		"identityModel":   config.GetIdentityModel(),
+		"forceModel":         config.GetForceModel(),
+		"identityModel":      config.GetIdentityModel(),
 	})
 }
 
@@ -4476,15 +4504,15 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 
 func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ApiKey          *string `json:"apiKey,omitempty"`
-		RequireApiKey   *bool   `json:"requireApiKey,omitempty"`
-		Password        string  `json:"password,omitempty"`
-		AllowOverUsage  *bool   `json:"allowOverUsage,omitempty"`
-		MaxPayloadBytes *int    `json:"maxPayloadBytes,omitempty"`
-		PublicBaseURL   *string `json:"publicBaseURL,omitempty"`
+		ApiKey             *string `json:"apiKey,omitempty"`
+		RequireApiKey      *bool   `json:"requireApiKey,omitempty"`
+		Password           string  `json:"password,omitempty"`
+		AllowOverUsage     *bool   `json:"allowOverUsage,omitempty"`
+		MaxPayloadBytes    *int    `json:"maxPayloadBytes,omitempty"`
+		PublicBaseURL      *string `json:"publicBaseURL,omitempty"`
 		LimitNoticeMessage *string `json:"limitNoticeMessage,omitempty"`
-		ForceModel      *string `json:"forceModel,omitempty"`
-		IdentityModel   *string `json:"identityModel,omitempty"`
+		ForceModel         *string `json:"forceModel,omitempty"`
+		IdentityModel      *string `json:"identityModel,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)

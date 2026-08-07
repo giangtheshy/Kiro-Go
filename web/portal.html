@@ -517,6 +517,12 @@
       .p-card-ledger .p-ledger-table td.model { max-width: 18rem; }
     }
     .p-ledger-table td.credits { font-weight: 600; }
+    /* In/out split: the arrows carry the direction so the column stays narrow. */
+    .p-ledger-table td.inout { font-size: 0.75rem; white-space: nowrap; }
+    /* Same in/out colours as the admin API Log so the two views read alike. */
+    .p-ledger-table td.inout .in { color: #22c55e; }
+    .p-ledger-table td.inout .out { color: #f59e0b; }
+    .p-ledger-table td.inout .sep { color: var(--muted-foreground); }
     .p-ledger-table tbody tr:hover td { background: rgba(127, 127, 127, 0.06); }
     /* Failed requests still bill nothing but should not read as a normal spend. */
     .p-ledger-table tbody tr.err td.model { color: var(--p-crit); }
@@ -805,6 +811,7 @@
                 <tr>
                   <th data-t="colTime"></th>
                   <th data-t="colModel"></th>
+                  <th class="num" data-t="colInOut"></th>
                   <th class="num" data-t="colTokens"></th>
                   <th class="num" data-t="colCredits"></th>
                 </tr>
@@ -864,7 +871,8 @@
           liveOff: 'Mất kết nối',
           colTime: 'Thời gian',
           colModel: 'Model',
-          colTokens: 'Tokens',
+          colInOut: 'Vào / Ra',
+          colTokens: 'Tổng',
           colCredits: 'Credits',
           ledgerTotal: 'Tổng credit đã dùng',
           ledgerEmpty: 'Chưa có yêu cầu nào được ghi lại',
@@ -914,7 +922,8 @@
           liveOff: 'Disconnected',
           colTime: 'Time',
           colModel: 'Model',
-          colTokens: 'Tokens',
+          colInOut: 'In / Out',
+          colTokens: 'Total',
           colCredits: 'Credits',
           ledgerTotal: 'Total credits spent',
           ledgerEmpty: 'No requests recorded yet',
@@ -1124,6 +1133,8 @@
       function ledgerCells(e) {
         return '<td class="time">' + fmtTime(e.time) + '</td>' +
           '<td class="model" title="' + escapeAttr(e.model || '') + '">' + escapeHtml(e.model || '—') + '</td>' +
+          '<td class="num inout"><span class="in">&#9660; ' + fmtNum(e.inputTokens || 0) + '</span>' +
+          ' / <span class="out">&#9650; ' + fmtNum(e.outputTokens || 0) + '</span></td>' +
           '<td class="num">' + fmtNum(e.totalTokens || 0) + '</td>' +
           '<td class="num credits">' + fmtNum(e.credits || 0) + '</td>';
       }
