@@ -156,14 +156,26 @@ Claude 请求里带顶层 `thinking` 配置（如 `{"type":"enabled","budget_tok
 
 **供应商** 标签页可登记 OpenAI / Anthropic 兼容的上游，与 Kiro 账号池并行服务请求，在所有账号额度耗尽或处于冷却时继续提供服务。
 
-请求**原样转发**——只重写模型名——因此每个供应商只服务与自身协议一致的端点：
+供应商的**原生**端点由其协议决定。原生请求**原样转发**，只重写模型名，不丢失任何信息：
 
-| 供应商协议 | 服务端点 |
+| 供应商协议 | 原生服务端点 |
 |---|---|
 | `anthropic` | `/v1/messages` |
-| `openai` | `/v1/chat/completions`，开启 *同时服务 /v1/responses* 后还包括 `/v1/responses` |
+| `openai` | `/v1/chat/completions`，开启 *原生服务 /v1/responses* 后还包括 `/v1/responses` |
 
-端点不匹配时会跳过该供应商，转而尝试下一个上游。**如果你的客户使用 Claude Code（走 `/v1/messages`），兜底供应商必须是 Anthropic 兼容端点** —— OpenAI 兼容的供应商永远不会被选中处理这类流量。
+开启 **启用协议桥接** 后，供应商还能服务它本不支持的端点，方式是翻译请求与响应：
+
+| 客户端调用 | anthropic 供应商 | openai 供应商 |
+|---|---|---|
+| `/v1/messages` | 原样转发 | 翻译 |
+| `/v1/chat/completions` | 翻译 | 原样转发 |
+| `/v1/responses` | 翻译 | 开启 *原生服务* 则原样转发，否则翻译 |
+
+桥接默认关闭，因为原样转发无损，而翻译只能尽力而为。它存在的实际理由：Claude Code 只调用 `/v1/messages`，而多数廉价的 OpenAI 兼容上游只实现 `/v1/chat/completions`——没有桥接，两者永远无法对接。同理，当前 OpenAI SDK 与 Codex 默认走 `/v1/responses`，而几乎没有廉价上游实现该接口。
+
+翻译无法承载的部分：服务端会话状态（`previous_response_id` / `store`）、跨轮次重放的带签名推理内容，以及 OpenAI 的服务端内置工具（`web_search`、`code_interpreter` 等）。处理器在路由前已把历史展平进请求，因此行为规范的客户端不会丢失影响答案的内容。
+
+仍然无法服务的端点会跳过该供应商，转而尝试下一个上游。
 
 路由顺序由**层级（Tier）**字段决定，该字段与 Kiro 账号共用（账号详情 → 路由优先级）。层级按升序尝试，同一层级内账号优先于供应商，因此 `acc1 = 0`、`provider = 1`、`acc2 = 2` 会得到完全对应的调用链。全部保持默认的 `0` 则维持原有行为：先跑完整个 Kiro 池，供应商仅作兜底。
 

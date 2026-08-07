@@ -38,9 +38,22 @@ var modelAliases = []modelMapping{
 // (claude-sonnet-4-20250514) are not accidentally rewritten.
 var claudeVersionPattern = regexp.MustCompile(`claude-(opus|sonnet|haiku)-(\d+)-(\d{1,2})\b`)
 
-// Thinking 模式提示
-const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
-<max_thinking_length>200000</max_thinking_length>`
+// defaultThinkingBudget is the fallback max_thinking_length when the client
+// does not supply a budget_tokens value. 200 000 matches Anthropic's own
+// recommended default for claude-opus-class models.
+const defaultThinkingBudget = 200_000
+
+// buildThinkingModePrompt constructs the XML priming that enables extended
+// thinking in the Kiro backend. budgetTokens is threaded from the client's
+// thinking.budget_tokens field so the model receives the operator's actual
+// intent rather than an arbitrary constant. When budgetTokens is zero or
+// negative the defaultThinkingBudget is used.
+func buildThinkingModePrompt(budgetTokens int) string {
+	if budgetTokens <= 0 {
+		budgetTokens = defaultThinkingBudget
+	}
+	return fmt.Sprintf("<thinking_mode>enabled</thinking_mode>\n<max_thinking_length>%d</max_thinking_length>", budgetTokens)
+}
 
 const minimalFallbackUserContent = "."
 const toolResultsContinuationPrefix = "Tool results:"
@@ -246,8 +259,14 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
 
+	// Extract thinking budget so the XML prompt reflects the client's actual intent.
+	budgetTokens := 0
+	if req.Thinking != nil {
+		budgetTokens = req.Thinking.BudgetTokens
+	}
+
 	// 提取系统提示
-	systemPrompt := buildClaudeSystemPrompt(req.System, thinking)
+	systemPrompt := buildClaudeSystemPrompt(req.System, thinking, budgetTokens)
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
@@ -390,16 +409,17 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	return payload
 }
 
-func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
+func buildClaudeSystemPrompt(system interface{}, thinking bool, budgetTokens int) string {
 	systemPrompt := extractSystemPrompt(system)
 	systemPrompt = applyPromptFilters(systemPrompt)
 	if !thinking {
 		return systemPrompt
 	}
+	thinkingPrompt := buildThinkingModePrompt(budgetTokens)
 	if systemPrompt == "" {
-		return ThinkingModePrompt
+		return thinkingPrompt
 	}
-	return ThinkingModePrompt + "\n\n" + systemPrompt
+	return thinkingPrompt + "\n\n" + systemPrompt
 }
 
 // applyPromptFilters applies all enabled prompt filter rules to the system prompt.
@@ -616,7 +636,7 @@ func cloneClaudeRequestForThinking(req *ClaudeRequest, thinking bool) *ClaudeReq
 }
 
 func prependThinkingSystem(system interface{}) interface{} {
-	thinkingText := ThinkingModePrompt
+	thinkingText := buildThinkingModePrompt(0) // use default budget for OpenAI→Anthropic bridge
 	if hasClaudeSystemContent(system) {
 		thinkingText += "\n"
 	}
@@ -1183,10 +1203,11 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 
 	// 如果启用 thinking 模式，注入 thinking 提示
 	if thinking {
+		thinkingPrompt := buildThinkingModePrompt(0) // OpenAI path: no budget_tokens available
 		if systemPrompt == "" {
-			systemPrompt = ThinkingModePrompt
+			systemPrompt = thinkingPrompt
 		} else {
-			systemPrompt = ThinkingModePrompt + "\n\n" + systemPrompt
+			systemPrompt = thinkingPrompt + "\n\n" + systemPrompt
 		}
 	}
 

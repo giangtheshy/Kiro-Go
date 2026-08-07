@@ -117,14 +117,24 @@ Append a suffix (default `-thinking`) to the model name, e.g. `claude-sonnet-4.5
 
 The **Providers** tab registers OpenAI- or Anthropic-compatible upstreams that serve requests alongside the Kiro pool, so traffic keeps flowing when every account is out of quota or cooling down.
 
-Requests are **passed through unchanged** — only the model name is rewritten — so a provider only serves the endpoints that speak its own protocol:
+On its **native** endpoint a provider is a pure passthrough: only the model name is rewritten, so nothing is lost.
 
-| Provider protocol | Serves |
+| Provider protocol | Native endpoint (passthrough) |
 |---|---|
 | `anthropic` | `/v1/messages` |
-| `openai` | `/v1/chat/completions`, plus `/v1/responses` when *Also serve /v1/responses* is on |
+| `openai` | `/v1/chat/completions`, plus `/v1/responses` when *Serve /v1/responses natively* is on |
 
-A mismatched endpoint skips the provider and falls through to the next upstream. **If your customers use Claude Code (which calls `/v1/messages`), the fallback provider must be an Anthropic-compatible endpoint** — an OpenAI-compatible one will never be selected for that traffic.
+Turning on **Enable protocol bridge** lets a provider serve the endpoints it does not natively speak, by translating the request and the response:
+
+| Client calls | `anthropic` provider | `openai` provider |
+|---|---|---|
+| `/v1/messages` | passthrough | bridged → `/v1/chat/completions` |
+| `/v1/chat/completions` | bridged → `/v1/messages` | passthrough |
+| `/v1/responses` | bridged → `/v1/messages` | bridged → `/v1/chat/completions` |
+
+This is what makes an OpenAI-compatible provider (DeepSeek, Moonshot, z.ai, OpenRouter) usable as fallback for **Claude Code**, which only ever calls `/v1/messages`, and for the **OpenAI SDK / Codex**, which default to `/v1/responses` that almost no cheap upstream implements.
+
+The bridge is off by default because it is best-effort rather than lossless. What it cannot carry: signed Anthropic thinking blocks replayed across turns (they come back as plain text), server-side Responses state (`previous_response_id` / `store` — the handler flattens history into the request first, so a well-behaved client is unaffected), and vendor built-in tools (`web_search`, `code_interpreter`, `computer_use`, …), which are dropped rather than forwarded to an upstream that would reject them. A provider that can serve neither natively nor by bridge is skipped, and routing falls through to the next upstream.
 
 Routing order comes from the **Tier** field, which Kiro accounts share (account detail → Routing Priority). Tiers are tried in ascending order, and within a tier accounts go before providers, so `acc1 = 0`, `provider = 1`, `acc2 = 2` yields exactly that chain. Leaving everything at the default `0` preserves the previous behaviour: the whole Kiro pool is tried first and providers act as pure fallback.
 

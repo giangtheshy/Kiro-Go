@@ -4,6 +4,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -56,6 +57,15 @@ var kiroEndpoints = []kiroEndpoint{
 		Origin:    "AI_EDITOR",
 		AmzTarget: "",
 		Name:      "Kiro IDE",
+	},
+	{
+		// Kiro's blessed edge host. Used as a 403 fallback: when the primary
+		// q.amazonaws.com endpoint rejects the token, the runtime edge often
+		// still accepts it, buying the request time before account rotation.
+		URL:       "https://runtime.us-east-1.kiro.dev/generateAssistantResponse",
+		Origin:    "AI_EDITOR",
+		AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+		Name:      "Kiro Runtime",
 	},
 	{
 		URL:       "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
@@ -342,6 +352,11 @@ type KiroPayload struct {
 	// in tool_use responses so the client can match them to its tool registry.
 	// Not serialized to the Kiro API request body.
 	ToolNameMap map[string]string `json:"-"`
+
+	// RequestContext, when non-nil, is propagated into the upstream HTTP
+	// request so that a client disconnect cancels the Kiro API call
+	// immediately rather than letting it run to completion and waste credits.
+	RequestContext context.Context `json:"-"`
 }
 
 type KiroUserInputMessage struct {
@@ -600,7 +615,14 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			// Target the account's region; endpoint URLs are declared for us-east-1.
 			epURL := regionalizeURL(ep.URL, account)
 			reqBody, _ := json.Marshal(payload)
-			req, err := http.NewRequest("POST", epURL, bytes.NewReader(reqBody))
+
+			// Propagate the client's request context so a client disconnect
+			// cancels the upstream Kiro call immediately and frees the account.
+			reqCtx := context.Background()
+			if payload != nil && payload.RequestContext != nil {
+				reqCtx = payload.RequestContext
+			}
+			req, err := http.NewRequestWithContext(reqCtx, "POST", epURL, bytes.NewReader(reqBody))
 			if err != nil {
 				lastErr = err
 				continue
@@ -647,8 +669,13 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 				errBody, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
 				lastErr = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
-				// Authentication errors and payment errors are not retried across endpoints.
-				if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
+				// Authentication and payment errors are not retried across
+				// endpoints — they signal an account-level problem, not an
+				// endpoint-level one. 403 is intentionally NOT in this list:
+				// the primary q.amazonaws.com sometimes returns 403 for a
+				// token that runtime.kiro.dev still accepts, so 403 is allowed
+				// to fall through and try the next endpoint.
+				if resp.StatusCode == 401 || resp.StatusCode == 402 {
 					return lastErr
 				}
 				logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, lastErr)

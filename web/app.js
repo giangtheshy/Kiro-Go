@@ -4692,6 +4692,11 @@
         '<span class="switch"><input type="checkbox" id="pfSupportsResponses"' + (p.supportsResponses ? ' checked' : '') +
           ' /><span class="slider"></span></span>' +
         '<span>' + escapeHtml(t('providers.fieldSupportsResponses')) + '</span></label></div>' +
+      '<div class="form-group"><label class="flex items-center gap-2">' +
+        '<span class="switch"><input type="checkbox" id="pfAllowBridge"' + (p.allowProtocolBridge ? ' checked' : '') +
+          ' /><span class="slider"></span></span>' +
+        '<span>' + escapeHtml(t('providers.fieldAllowBridge')) + '</span></label>' +
+        '<span class="muted-text" style="display:block;margin-top:4px">' + escapeHtml(t('providers.allowBridgeHint')) + '</span></div>' +
       '<div class="form-group"><label>' + escapeHtml(t('providers.fieldBaseUrl')) + '</label>' +
         '<input type="text" id="pfBaseUrl" value="' + escapeAttr(p.baseUrl || '') +
           '" placeholder="https://api.example.com/anthropic" autocomplete="off" /></div>' +
@@ -4722,12 +4727,13 @@
       '</div>';
 
     const protoSel = $('pfProtocol');
-    const syncResponsesRow = () => {
+    const syncConditionalRows = () => {
+      const isOpenAI = protoSel.value === 'openai';
       const row = $('pfResponsesRow');
-      if (row) row.classList.toggle('hidden', protoSel.value !== 'openai');
+      if (row) row.classList.toggle('hidden', !isOpenAI);
     };
-    protoSel.addEventListener('change', syncResponsesRow);
-    syncResponsesRow();
+    protoSel.addEventListener('change', syncConditionalRows);
+    syncConditionalRows();
 
     $('pfSaveBtn').addEventListener('click', saveProvider);
     openDialog('providerModal');
@@ -4796,6 +4802,7 @@
       priority: Math.max(0, Math.round(numVal('pfPriority'))),
       weight: Math.max(1, Math.round(numVal('pfWeight'))),
       supportsResponses: $('pfSupportsResponses').checked,
+      allowProtocolBridge: !!$('pfAllowBridge') && $('pfAllowBridge').checked,
       models: parseProviderModels($('pfModels').value),
       headers: parseProviderHeaders($('pfHeaders').value),
       pricing: {

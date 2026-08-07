@@ -151,6 +151,9 @@ func (h *Handler) apiTestProvider(w http.ResponseWriter, r *http.Request, id str
 		return
 	}
 
+	// The test endpoint exercises the provider's native protocol, not a client's
+	// endpoint. It always goes to the protocol the provider actually speaks so
+	// the operator can confirm the key and base URL before relying on a bridge.
 	endpoint := config.ProviderEndpointChatCompletions
 	if p.Protocol == config.ProviderProtocolAnthropic {
 		endpoint = config.ProviderEndpointMessages

@@ -799,8 +799,8 @@
   "providers.statusDisabled": "Disabled",
   "providers.fieldName": "Name",
   "providers.fieldProtocol": "Protocol",
-  "providers.protocolHint": "Passthrough only: an anthropic provider serves /v1/messages, an openai provider serves /v1/chat/completions. Mismatched endpoints skip this provider.",
-  "providers.fieldSupportsResponses": "Also serve /v1/responses",
+  "providers.protocolHint": "Protocol determines the native endpoint. With the bridge on, the provider also serves the other protocol's endpoint and /v1/responses via translation.",
+  "providers.fieldSupportsResponses": "Serve /v1/responses natively (passthrough)",
   "providers.fieldBaseUrl": "Base URL",
   "providers.fieldApiKey": "API Key",
   "providers.apiKeyKeep": "Leave empty to keep the stored key",
@@ -816,5 +816,7 @@
   "providers.priorityHint": "Tier is tried in ascending order and is shared with Kiro accounts. Weight splits traffic between providers in the same tier.",
   "providers.fieldProxy": "Proxy URL",
   "providers.fieldHeaders": "Extra headers",
-  "providers.fieldEnabled": "Enabled"
+  "providers.fieldEnabled": "Enabled",
+  "providers.fieldAllowBridge": "Enable protocol bridge",
+  "providers.allowBridgeHint": "Let this provider serve endpoints it does not natively speak, by translating requests and responses. An anthropic provider also serves /v1/chat/completions and /v1/responses; an openai provider also serves /v1/messages and /v1/responses. Off by default: passthrough is lossless, translation is best-effort."
 }

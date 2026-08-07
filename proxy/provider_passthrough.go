@@ -61,9 +61,9 @@ func (h *Handler) serveViaProvider(
 		return false, e
 	}
 
-	body, err := rewriteModelField(pc.Raw, step.UpstreamModel, pc.Stream && pc.Endpoint == config.ProviderEndpointChatCompletions)
+	body, err := bridgeRequestBody(step, pc)
 	if err != nil {
-		return fail(fmt.Errorf("cannot rewrite request body: %w", err))
+		return fail(fmt.Errorf("cannot build request body: %w", err))
 	}
 
 	proxyURL, poolKey, err := SelectProxyForAccount(&config.Account{ProxyURL: p.ProxyURL})
@@ -71,7 +71,13 @@ func (h *Handler) serveViaProvider(
 		return fail(err)
 	}
 
-	url := p.BaseURL + pc.Endpoint
+	// The upstream path is the provider's own protocol, which is not the client's
+	// path when this step is bridged.
+	upstreamEndpoint := step.UpstreamEndpoint
+	if upstreamEndpoint == "" {
+		upstreamEndpoint = pc.Endpoint
+	}
+	url := p.BaseURL + upstreamEndpoint
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return fail(fmt.Errorf("build request failed: %w", err))
@@ -97,13 +103,16 @@ func (h *Handler) serveViaProvider(
 
 	var usage providerUsage
 	if pc.Stream {
-		if !h.relayProviderStream(w, resp, p, &usage) {
+		if !h.relayProviderStream(w, resp, p, step, model, fallbackInputTokens, &usage) {
 			// The ResponseWriter cannot stream, so nothing was written; let the
 			// caller fall through to the next upstream.
 			return fail(errors.New("streaming not supported by response writer"))
 		}
-	} else {
-		h.relayProviderJSON(w, resp, &usage)
+	} else if err := h.relayProviderJSON(w, resp, step, model, fallbackInputTokens, &usage); err != nil {
+		// A bridged body that cannot be translated is detected before anything is
+		// written, so this is still a clean "nothing sent" failure and the caller
+		// may try the next upstream.
+		return fail(err)
 	}
 
 	inTok, outTok, credits := providerBilling(p.Protocol, usage, step.Pricing, fallbackInputTokens)
@@ -112,10 +121,22 @@ func (h *Handler) serveViaProvider(
 	return true, nil
 }
 
-// relayProviderStream copies the upstream SSE stream through to the client line
-// by line, sniffing usage as it goes without altering a single byte.
-// Returns false only when the ResponseWriter cannot stream at all.
-func (h *Handler) relayProviderStream(w http.ResponseWriter, resp *http.Response, p *config.Provider, usage *providerUsage) bool {
+// relayProviderStream streams the upstream response to the client, sniffing usage
+// as it goes. For a passthrough step the bytes are copied verbatim; for a bridged
+// step each upstream line is fed through a translator that emits client-shaped SSE
+// frames instead.
+//
+// Returns false only when the ResponseWriter cannot stream at all, which is the
+// one case where nothing has been written and the caller may retry elsewhere.
+func (h *Handler) relayProviderStream(
+	w http.ResponseWriter,
+	resp *http.Response,
+	p *config.Provider,
+	step *upstreamStep,
+	clientModel string,
+	fallbackInputTokens int,
+	usage *providerUsage,
+) bool {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		return false
@@ -124,32 +145,78 @@ func (h *Handler) relayProviderStream(w http.ResponseWriter, resp *http.Response
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
+	translator := newBridgeStreamTranslator(step.Bridge, clientModel, fallbackInputTokens)
+
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), providerStreamScanBuffer)
 	for scanner.Scan() {
 		line := scanner.Bytes()
+		// Usage is sniffed off the UPSTREAM line, in the upstream's own protocol,
+		// before any translation. That keeps billing independent of the bridge.
 		observeProviderUsage(p.Protocol, line, usage)
-		if _, err := w.Write(append(bytes.Clone(line), '\n')); err != nil {
-			// Client hung up. The bytes we already sent are gone; nothing to retry.
-			return true
+
+		if translator == nil {
+			if _, err := w.Write(append(bytes.Clone(line), '\n')); err != nil {
+				// Client hung up. The bytes we already sent are gone; nothing to retry.
+				return true
+			}
+			flusher.Flush()
+			continue
+		}
+
+		for _, frame := range translator.translate(line) {
+			if _, err := w.Write(frame); err != nil {
+				return true
+			}
 		}
 		flusher.Flush()
 	}
 	if err := scanner.Err(); err != nil {
 		logger.Warnf("[Provider] %s: stream read error: %v", p.Name, err)
 	}
+
+	// Close the translated document even when the upstream stream died early: an
+	// Anthropic client rejects a message whose content blocks were never closed,
+	// so a truncated upstream must still produce a well-formed tail.
+	if translator != nil {
+		for _, frame := range translator.finish() {
+			if _, err := w.Write(frame); err != nil {
+				return true
+			}
+		}
+		flusher.Flush()
+	}
 	return true
 }
 
-// relayProviderJSON copies a non-streaming response through unchanged.
-func (h *Handler) relayProviderJSON(w http.ResponseWriter, resp *http.Response, usage *providerUsage) {
+// relayProviderJSON writes a non-streaming response, translating it first when the
+// step is bridged. An error means nothing was written.
+func (h *Handler) relayProviderJSON(
+	w http.ResponseWriter,
+	resp *http.Response,
+	step *upstreamStep,
+	clientModel string,
+	fallbackInputTokens int,
+	usage *providerUsage,
+) error {
 	payload, err := io.ReadAll(resp.Body)
 	if err != nil {
 		logger.Warnf("[Provider] response read error: %v", err)
 	}
 	observeProviderJSONUsage(payload, usage)
+
+	out := payload
+	if step.Bridge != config.BridgeNone {
+		translated, err := bridgeJSONResponse(step.Bridge, payload, clientModel, fallbackInputTokens)
+		if err != nil {
+			return fmt.Errorf("cannot translate %s response: %w", step.Bridge, err)
+		}
+		out = translated
+	}
+
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Write(payload)
+	w.Write(out)
+	return nil
 }
 
 // applyProviderHeaders sets auth and protocol headers, then lets the provider's

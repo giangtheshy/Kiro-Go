@@ -799,8 +799,8 @@
   "providers.statusDisabled": "已禁用",
   "providers.fieldName": "名称",
   "providers.fieldProtocol": "协议",
-  "providers.protocolHint": "仅原样转发：anthropic 供应商服务 /v1/messages，openai 供应商服务 /v1/chat/completions。端点不匹配时会跳过该供应商。",
-  "providers.fieldSupportsResponses": "同时服务 /v1/responses",
+  "providers.protocolHint": "协议决定原生端点。启用桥接后，供应商还会通过翻译服务另一协议的端点以及 /v1/responses。",
+  "providers.fieldSupportsResponses": "原生服务 /v1/responses（直通）",
   "providers.fieldBaseUrl": "Base URL",
   "providers.fieldApiKey": "API Key",
   "providers.apiKeyKeep": "留空则保留已保存的密钥",
@@ -816,5 +816,7 @@
   "providers.priorityHint": "层级按升序尝试，并与 Kiro 账号共用。权重用于在同一层级的供应商之间分配流量。",
   "providers.fieldProxy": "代理地址",
   "providers.fieldHeaders": "额外请求头",
-  "providers.fieldEnabled": "已启用"
+  "providers.fieldEnabled": "已启用",
+  "providers.fieldAllowBridge": "启用协议桥接",
+  "providers.allowBridgeHint": "让供应商通过翻译请求和响应来服务其原生不支持的端点。anthropic 供应商还会服务 /v1/chat/completions 和 /v1/responses；openai 供应商还会服务 /v1/messages 和 /v1/responses。默认关闭：直通无损，翻译只是尽力而为。"
 }

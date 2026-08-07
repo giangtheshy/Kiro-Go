@@ -799,8 +799,8 @@
   "providers.statusDisabled": "Đã tắt",
   "providers.fieldName": "Tên",
   "providers.fieldProtocol": "Giao thức",
-  "providers.protocolHint": "Chỉ chuyển tiếp nguyên văn: nhà cung cấp anthropic phục vụ /v1/messages, nhà cung cấp openai phục vụ /v1/chat/completions. Endpoint không khớp sẽ bỏ qua nhà cung cấp này.",
-  "providers.fieldSupportsResponses": "Phục vụ cả /v1/responses",
+  "providers.protocolHint": "Protocol xác định endpoint gốc. Khi bật cầu nối, provider cũng phục vụ endpoint của giao thức còn lại và /v1/responses thông qua bản dịch.",
+  "providers.fieldSupportsResponses": "Phục vụ /v1/responses trực tiếp (passthrough)",
   "providers.fieldBaseUrl": "Base URL",
   "providers.fieldApiKey": "API Key",
   "providers.apiKeyKeep": "Để trống để giữ key đã lưu",
@@ -816,5 +816,7 @@
   "providers.priorityHint": "Bậc được thử theo thứ tự tăng dần và dùng chung với account Kiro. Trọng số chia lưu lượng giữa các nhà cung cấp cùng bậc.",
   "providers.fieldProxy": "Proxy URL",
   "providers.fieldHeaders": "Header bổ sung",
-  "providers.fieldEnabled": "Đang bật"
+  "providers.fieldEnabled": "Đang bật",
+  "providers.fieldAllowBridge": "Bật cầu nối giao thức",
+  "providers.allowBridgeHint": "Cho phép provider phục vụ những endpoint mà nó không hỗ trợ sẵn, bằng cách dịch request/response. Provider anthropic sẽ phục vụ thêm /v1/chat/completions và /v1/responses; provider openai sẽ phục vụ thêm /v1/messages và /v1/responses. Mặc định tắt: passthrough không mất mát, còn bản dịch chỉ là gần đúng."
 }

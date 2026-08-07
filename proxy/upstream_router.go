@@ -19,6 +19,13 @@ type upstreamStep struct {
 	// field of the forwarded body.
 	UpstreamModel string
 	Pricing       config.ProviderPricing
+
+	// UpstreamEndpoint is the path to call on the provider. It differs from the
+	// client's endpoint when Bridge is set, because a bridged request is sent in
+	// the provider's own protocol.
+	UpstreamEndpoint string
+	// Bridge is config.BridgeNone for passthrough, or the translation to apply.
+	Bridge string
 }
 
 // nextUpstream picks the next upstream to try for a request.
@@ -56,7 +63,7 @@ func (h *Handler) nextUpstream(apiKeyID, model, endpoint string, excluded map[st
 				return &upstreamStep{Account: acc}
 			}
 		}
-		if step := h.pickProvider(providers[tier], model); step != nil {
+		if step := h.pickProvider(providers[tier], model, endpoint); step != nil {
 			return step
 		}
 	}
@@ -71,7 +78,10 @@ func (h *Handler) nextUpstream(apiKeyID, model, endpoint string, excluded map[st
 }
 
 // pickProvider chooses one provider from a tier using weighted round-robin.
-func (h *Handler) pickProvider(tier []config.Provider, model string) *upstreamStep {
+//
+// clientEndpoint is the endpoint the CLIENT called; the returned step carries the
+// endpoint to call upstream, which differs when the provider needs a bridge.
+func (h *Handler) pickProvider(tier []config.Provider, model, clientEndpoint string) *upstreamStep {
 	if len(tier) == 0 {
 		return nil
 	}
@@ -95,7 +105,19 @@ func (h *Handler) pickProvider(tier []config.Provider, model string) *upstreamSt
 	if !ok {
 		return nil
 	}
-	return &upstreamStep{Provider: &p, UpstreamModel: name, Pricing: pricing}
+	upstreamEndpoint, bridge, ok := p.ResolveEndpoint(clientEndpoint)
+	if !ok {
+		// eligibleProviders already filtered on this, so reaching here would mean the
+		// two disagreed. Skip rather than send a request to the wrong protocol.
+		return nil
+	}
+	return &upstreamStep{
+		Provider:         &p,
+		UpstreamModel:    name,
+		Pricing:          pricing,
+		UpstreamEndpoint: upstreamEndpoint,
+		Bridge:           bridge,
+	}
 }
 
 // eligibleProviders groups the providers that can serve this request by tier.

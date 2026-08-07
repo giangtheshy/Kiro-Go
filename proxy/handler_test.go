@@ -273,7 +273,7 @@ func TestCloneClaudeRequestForThinkingInjectsPromptWithoutMutatingOriginal(t *te
 		t.Fatalf("expected 2 system blocks after prepend, got %d", len(blocks))
 	}
 	gotPrompt := extractSystemPrompt(cloned.System)
-	expected := ThinkingModePrompt + "\n\nFollow the user instructions."
+	expected := buildThinkingModePrompt(0) + "\n\nFollow the user instructions."
 	if gotPrompt != expected {
 		t.Fatalf("expected injected system prompt %q, got %q", expected, gotPrompt)
 	}
@@ -306,7 +306,7 @@ func TestCloneClaudeRequestForThinkingPreservesStructuredSystemBlocks(t *testing
 		t.Fatalf("expected 2 system blocks after prepend, got %d", len(blocks))
 	}
 	first, ok := blocks[0].(map[string]interface{})
-	if !ok || first["text"] != ThinkingModePrompt+"\n" {
+	if !ok || first["text"] != buildThinkingModePrompt(0)+"\n" {
 		t.Fatalf("expected first block to be thinking prompt, got %#v", blocks[0])
 	}
 	second, ok := blocks[1].(map[string]interface{})

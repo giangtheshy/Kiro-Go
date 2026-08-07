@@ -158,14 +158,16 @@ Thứ tự ưu tiên: Force Model toàn cục > Model theo Key > model client g�
 
 Tab **Providers** cho phép khai báo các upstream tương thích OpenAI hoặc Anthropic để phục vụ request song song với pool Kiro, giữ dịch vụ chạy tiếp khi mọi account đã hết quota hoặc đang cooldown.
 
-Request được **chuyển tiếp nguyên văn** — chỉ tên model bị ghi đè — nên mỗi nhà cung cấp chỉ phục vụ đúng endpoint theo giao thức của nó:
+Mặc định request được **chuyển tiếp nguyên văn** (passthrough) — chỉ tên model bị ghi đè — nên nhà cung cấp chỉ phục vụ endpoint đúng giao thức của nó. Bật **Cầu nối giao thức** thì nó phục vụ thêm các endpoint còn lại bằng cách dịch request và response:
 
-| Giao thức | Phục vụ |
-|---|---|
-| `anthropic` | `/v1/messages` |
-| `openai` | `/v1/chat/completions`, thêm `/v1/responses` khi bật *Phục vụ cả /v1/responses* |
+| Giao thức | Passthrough | Thêm khi bật cầu nối |
+|---|---|---|
+| `anthropic` | `/v1/messages` | `/v1/chat/completions`, `/v1/responses` |
+| `openai` | `/v1/chat/completions`, thêm `/v1/responses` khi bật *Phục vụ cả /v1/responses* | `/v1/messages`, `/v1/responses` |
 
-Endpoint không khớp sẽ bỏ qua nhà cung cấp đó và rơi xuống upstream kế tiếp. **Nếu khách của bạn dùng Claude Code (gọi vào `/v1/messages`) thì nhà cung cấp dự phòng bắt buộc phải là endpoint tương thích Anthropic** — loại tương thích OpenAI sẽ không bao giờ được chọn cho luồng đó.
+Endpoint không phục vụ được sẽ bỏ qua nhà cung cấp đó và rơi xuống upstream kế tiếp. Nhờ có cầu nối, một provider tương thích OpenAI (DeepSeek, Moonshot, z.ai, OpenRouter…) vẫn phục vụ được Claude Code — vốn chỉ gọi `/v1/messages`.
+
+Cầu nối mặc định tắt vì passthrough không mất mát trong khi bản dịch chỉ là tái tạo gần đúng. Những thứ bản dịch không mang theo được: trạng thái hội thoại phía server của Responses API (`previous_response_id` / `store`), khối reasoning có chữ ký replay giữa các lượt, tool tích hợp sẵn phía server của OpenAI, và signature của thinking block Anthropic. Lịch sử hội thoại đã được handler làm phẳng vào request trước khi định tuyến nên client hoạt động bình thường không mất gì ảnh hưởng đến câu trả lời.
 
 Thứ tự định tuyến lấy từ trường **Bậc (Tier)**, dùng chung với account Kiro (chi tiết account → Thứ tự ưu tiên định tuyến). Bậc được thử theo thứ tự tăng dần, trong cùng một bậc thì account đi trước nhà cung cấp; nên `acc1 = 0`, `provider = 1`, `acc2 = 2` sẽ cho đúng chuỗi đó. Để mặc định `0` cho tất cả thì hành vi giữ nguyên như trước: thử hết pool Kiro rồi mới tới nhà cung cấp.
 

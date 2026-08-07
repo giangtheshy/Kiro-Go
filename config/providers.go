@@ -8,11 +8,33 @@ import (
 	"time"
 )
 
-// Provider protocols. A provider only serves the client endpoints that speak its
-// own protocol — requests are forwarded verbatim (passthrough), never translated.
+// Provider protocols. A provider natively serves the client endpoints that speak
+// its own protocol, where the request is forwarded verbatim (passthrough). With
+// AllowProtocolBridge it also serves the other protocol's endpoint by translating
+// the request and the response.
 const (
 	ProviderProtocolAnthropic = "anthropic"
 	ProviderProtocolOpenAI    = "openai"
+)
+
+// Bridge modes describe the translation a provider needs to serve a client
+// endpoint. BridgeNone is the passthrough case.
+const (
+	BridgeNone = ""
+	// BridgeOpenAIToAnthropic: the client spoke /v1/chat/completions, the provider
+	// speaks /v1/messages.
+	BridgeOpenAIToAnthropic = "openai->anthropic"
+	// BridgeAnthropicToOpenAI: the client spoke /v1/messages, the provider speaks
+	// /v1/chat/completions. This is the case that matters for Claude Code, which
+	// only ever calls /v1/messages.
+	BridgeAnthropicToOpenAI = "anthropic->openai"
+	// BridgeResponsesToAnthropic: the client spoke /v1/responses, the provider
+	// speaks /v1/messages.
+	BridgeResponsesToAnthropic = "responses->anthropic"
+	// BridgeResponsesToOpenAI: the client spoke /v1/responses, the provider only
+	// implements /v1/chat/completions. This is the common case — most cheap
+	// OpenAI-compatible upstreams never implement the Responses API.
+	BridgeResponsesToOpenAI = "responses->chat"
 )
 
 // ProviderPricing is the credit price per 1M tokens for one traffic class.
@@ -68,6 +90,20 @@ type Provider struct {
 	// /v1/chat/completions.
 	SupportsResponses bool `json:"supportsResponses,omitempty"`
 
+	// AllowProtocolBridge lets this provider serve the OTHER protocol's endpoint by
+	// translating the request and response instead of passing them through.
+	//
+	// Off by default: passthrough is lossless, whereas a bridge is a best-effort
+	// re-shaping that cannot carry everything (see the per-direction notes in
+	// proxy/provider_bridge.go). Turning it on is the operator saying "an
+	// approximate answer from this provider beats no answer at all", which is
+	// exactly the trade a fallback tier exists to make.
+	//
+	// The practical reason it exists: Claude Code only ever calls /v1/messages, so
+	// without a bridge an OpenAI-only provider can never serve Claude Code traffic
+	// no matter how it is priced or prioritised.
+	AllowProtocolBridge bool `json:"allowProtocolBridge,omitempty"`
+
 	Models  []ProviderModel `json:"models"`
 	Pricing ProviderPricing `json:"pricing"`
 
@@ -105,19 +141,60 @@ func (p *Provider) ResolveModel(alias string) (name string, pricing ProviderPric
 	return "", ProviderPricing{}, false
 }
 
-// ServesEndpoint reports whether this provider can serve the given client endpoint.
-// Passthrough only: the protocols must match exactly, and /v1/responses additionally
-// requires the provider to advertise support for it.
-func (p *Provider) ServesEndpoint(endpoint string) bool {
-	switch endpoint {
+// ResolveEndpoint decides how this provider can serve a client endpoint.
+//
+// upstreamEndpoint is the path to call on the provider, which is NOT always the
+// path the client used: a bridged request is sent to the provider's own protocol.
+// bridge is BridgeNone for passthrough, or the translation to apply.
+//
+// ok is false when the provider cannot serve the endpoint at all, which is how the
+// router decides to skip it and try the next upstream.
+func (p *Provider) ResolveEndpoint(clientEndpoint string) (upstreamEndpoint, bridge string, ok bool) {
+	switch clientEndpoint {
 	case ProviderEndpointMessages:
-		return p.Protocol == ProviderProtocolAnthropic
+		if p.Protocol == ProviderProtocolAnthropic {
+			return ProviderEndpointMessages, BridgeNone, true
+		}
+		if p.AllowProtocolBridge {
+			return ProviderEndpointChatCompletions, BridgeAnthropicToOpenAI, true
+		}
 	case ProviderEndpointChatCompletions:
-		return p.Protocol == ProviderProtocolOpenAI
+		if p.Protocol == ProviderProtocolOpenAI {
+			return ProviderEndpointChatCompletions, BridgeNone, true
+		}
+		if p.AllowProtocolBridge {
+			return ProviderEndpointMessages, BridgeOpenAIToAnthropic, true
+		}
 	case ProviderEndpointResponses:
-		return p.Protocol == ProviderProtocolOpenAI && p.SupportsResponses
+		// Passthrough first: a provider that really implements the Responses API
+		// serves it losslessly, including the parts a bridge cannot carry.
+		if p.Protocol == ProviderProtocolOpenAI && p.SupportsResponses {
+			return ProviderEndpointResponses, BridgeNone, true
+		}
+		if p.AllowProtocolBridge {
+			// Almost no cheap OpenAI-compatible upstream implements /v1/responses,
+			// so without this a Responses client (the current OpenAI SDK default,
+			// and Codex) could never reach an external provider at all.
+			//
+			// What the bridge cannot carry, in either direction: server-side
+			// conversation state (previous_response_id / store), signed reasoning
+			// items replayed across turns, and OpenAI's server-side built-in tools.
+			// The handler flattens history into the request before routing, so a
+			// well-behaved client loses nothing that affects the answer.
+			if p.Protocol == ProviderProtocolOpenAI {
+				return ProviderEndpointChatCompletions, BridgeResponsesToOpenAI, true
+			}
+			return ProviderEndpointMessages, BridgeResponsesToAnthropic, true
+		}
 	}
-	return false
+	return "", BridgeNone, false
+}
+
+// ServesEndpoint reports whether this provider can serve the given client
+// endpoint, by passthrough or by bridging.
+func (p *Provider) ServesEndpoint(endpoint string) bool {
+	_, _, ok := p.ResolveEndpoint(endpoint)
+	return ok
 }
 
 // Client endpoints a provider may be routed to. The values double as the upstream
