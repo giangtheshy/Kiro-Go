@@ -304,6 +304,12 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 // token, quota). Returns nil when no bound account is currently usable, so the caller
 // can decide whether to fall back to the shared pool. An empty allowed set also
 // returns nil (a bound key with no live bound account is not silently widened).
+//
+// Like GetNextForModelExcluding, it carries a "shortest remaining cooldown" fallback:
+// if every eligible bound account is on a temporary cooldown the one closest to
+// recovery is returned rather than nil. This mirrors the pre-provider behaviour and
+// prevents a short cooldown from immediately routing traffic to a higher-tier provider
+// that the operator chose only as a genuine last resort.
 func (p *AccountPool) GetNextForModelBoundExcluding(model string, allowed, excluded map[string]bool) *config.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -349,7 +355,36 @@ func (p *AccountPool) GetNextForModelBoundExcluding(model string, allowed, exclu
 		}
 		return copyAccount(acc)
 	}
-	return nil
+
+	// fallback: pick the bound account with the shortest remaining cooldown so a
+	// temporary throttle does not immediately escalate traffic to a higher-tier
+	// provider.
+	var best *config.Account
+	var earliest time.Time
+	for i := range p.accounts {
+		acc := &p.accounts[i]
+		if !allowed[acc.ID] {
+			continue
+		}
+		if excluded != nil && excluded[acc.ID] {
+			continue
+		}
+		if !p.accountHasModel(acc.ID, model) {
+			continue
+		}
+		if isQuotaBlocked(*acc, allowOverUsage) {
+			continue
+		}
+		if cooldown, ok := p.cooldowns[acc.ID]; ok {
+			if best == nil || cooldown.Before(earliest) {
+				best = acc
+				earliest = cooldown
+			}
+		} else {
+			return copyAccount(acc)
+		}
+	}
+	return copyAccount(best)
 }
 
 // GetByID 根据 ID 获取账号

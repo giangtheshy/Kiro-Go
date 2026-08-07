@@ -805,7 +805,7 @@
   "providers.fieldApiKey": "API Key",
   "providers.apiKeyKeep": "Để trống để giữ key đã lưu",
   "providers.fieldModels": "Ánh xạ model",
-  "providers.modelsHint": "Mỗi dòng một mục: model-client = model-nhà-cung-cấp. Bỏ dấu bằng nếu hai bên trùng tên.",
+  "providers.modelsHint": "Mỗi dòng một mục: model-client = model-nhà-cung-cấp. Thêm @ input/output/cacheWrite/cacheRead để đặt giá riêng cho model đó (credits trên 1M token). Ví dụ: claude-opus-4.8 = glm-4.6 @ 8/80/10/8",
   "providers.fieldPricing": "Giá (credits trên 1M token)",
   "providers.priceInput": "Input",
   "providers.priceOutput": "Output",

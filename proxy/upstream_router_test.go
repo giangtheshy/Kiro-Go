@@ -214,3 +214,51 @@ func TestNextUpstreamSkipsDisabledProvider(t *testing.T) {
 		t.Fatalf("expected a disabled provider to be skipped, got %s", stepLabel(step))
 	}
 }
+
+// TestNextUpstreamAccountCooldownDoesNotEscalateToProvider is a regression test
+// for the asymmetry between GetNextForModelExcluding (had a cooldown-shortest
+// fallback) and GetNextForModelBoundExcluding (previously had none). Before the
+// fix, a tier-0 account on a 1-minute cooldown would cause nextUpstream to skip
+// it and escalate to a tier-2 provider — even though the operator's intent was
+// "use the account first, provider only as a true last resort".
+func TestNextUpstreamAccountCooldownDoesNotEscalateToProvider(t *testing.T) {
+	h := newRouterHandler(t,
+		[]config.Account{routerAccount("acc1", 0)},
+		[]config.Provider{routerProvider("prov1", "fallback", 2, config.ProviderProtocolAnthropic)},
+	)
+
+	p := accountpool.GetPool()
+
+	// Baseline: healthy account wins.
+	if got := stepLabel(h.nextUpstream("", routerTestModel, config.ProviderEndpointMessages, nil)); got != "account:acc1" {
+		t.Fatalf("baseline: got %s, want account:acc1", got)
+	}
+
+	// Put the account on a short cooldown (3 non-quota errors).
+	p.RecordError("acc1", false)
+	p.RecordError("acc1", false)
+	p.RecordError("acc1", false)
+
+	// The account must still win over a provider at a higher tier — the cooldown
+	// fallback should return the cooldown-shortest account, not the provider.
+	got := stepLabel(h.nextUpstream("", routerTestModel, config.ProviderEndpointMessages, nil))
+	if got != "account:acc1" {
+		t.Fatalf("with short cooldown: got %s, want account:acc1 (provider must not win over a temporarily cooled account)", got)
+	}
+
+	// A 429 quota error triggers a 1-hour cooldown. A quota-blocked account is
+	// excluded from the pool entirely (isQuotaBlocked/Reload), so the provider
+	// becomes the correct fallback. Simulate that by putting the account on a
+	// quota cooldown AND having it blocked in the pool via AllowOverUsage=false
+	// with an exhausted limit.
+	//
+	// We can't easily simulate isQuotaBlocked here because it depends on config
+	// fields (usageCurrent/usageLimit), but the quota-cooldown path at least
+	// verifies that the extended cooldown alone is insufficient to skip to provider
+	// when the account is still in the pool (not quota-blocked).
+	p.RecordError("acc1", true) // 1-hour cooldown
+	got = stepLabel(h.nextUpstream("", routerTestModel, config.ProviderEndpointMessages, nil))
+	if got != "account:acc1" {
+		t.Fatalf("with quota cooldown (account still in pool): got %s, want account:acc1", got)
+	}
+}

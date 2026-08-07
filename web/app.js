@@ -4666,8 +4666,16 @@
     };
 
     $('providerModalTitle').textContent = t(editing ? 'providers.editTitle' : 'providers.addTitle');
-    const modelRows = (p.models || []).map(m =>
-      (m.alias || '') + ' = ' + (m.name || '')).join('\n');
+    const modelRows = (p.models || []).map(m => {
+      const alias = m.alias || '';
+      const name = (m.name && m.name !== alias) ? m.name : alias;
+      const base = name ? (alias + ' = ' + name) : alias;
+      if (m.pricing) {
+        const pr = m.pricing;
+        return base + ' @ ' + [pr.input || 0, pr.output || 0, pr.cacheWrite || 0, pr.cacheRead || 0].join('/');
+      }
+      return base;
+    }).join('\n');
     const headerRows = Object.keys(p.headers || {}).map(k => k + ': ' + p.headers[k]).join('\n');
 
     $('providerModalBody').innerHTML =
@@ -4728,11 +4736,35 @@
   // parseProviderModels reads the "alias = upstream-name" textarea. A line with no
   // "=" maps the alias onto itself, which is the common case when the provider
   // already uses the same model ID.
+  // parseProviderModelPricing reads the optional "@ in/out/cacheWrite/cacheRead"
+  // suffix. Returns null when the suffix is absent, which tells the backend to bill
+  // this model at the provider-level default instead.
+  function parseProviderModelPricing(raw) {
+    const parts = (raw || '').split('/').map(s => s.trim());
+    if (!parts.length || parts.every(s => s === '')) return null;
+    const num = i => {
+      const n = parseFloat(parts[i]);
+      return isNaN(n) ? 0 : Math.max(0, n);
+    };
+    return { input: num(0), output: num(1), cacheWrite: num(2), cacheRead: num(3) };
+  }
+
   function parseProviderModels(raw) {
     return (raw || '').split('\n').map(line => line.trim()).filter(Boolean).map(line => {
+      // Split the pricing suffix off first: "@" cannot appear in a model ID, while
+      // "=" must still be found within the name half only.
+      let pricing = null;
+      const at = line.lastIndexOf('@');
+      if (at >= 0) {
+        pricing = parseProviderModelPricing(line.slice(at + 1));
+        line = line.slice(0, at).trim();
+      }
       const idx = line.indexOf('=');
-      if (idx < 0) return { alias: line, name: line };
-      return { alias: line.slice(0, idx).trim(), name: line.slice(idx + 1).trim() };
+      const alias = idx < 0 ? line : line.slice(0, idx).trim();
+      const name = idx < 0 ? line : line.slice(idx + 1).trim();
+      const out = { alias, name };
+      if (pricing) out.pricing = pricing;
+      return out;
     });
   }
 

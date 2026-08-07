@@ -805,7 +805,7 @@
   "providers.fieldApiKey": "API Key",
   "providers.apiKeyKeep": "Leave empty to keep the stored key",
   "providers.fieldModels": "Model mapping",
-  "providers.modelsHint": "One per line: client-model = provider-model. Omit the equals sign to use the same name on both sides.",
+  "providers.modelsHint": "One per line: client-model = provider-model. Append @ input/output/cacheWrite/cacheRead to override the pricing for that model (credits per 1M tokens). Example: claude-opus-4.8 = glm-4.6 @ 8/80/10/8",
   "providers.fieldPricing": "Price (credits per 1M tokens)",
   "providers.priceInput": "Input",
   "providers.priceOutput": "Output",
