@@ -33,6 +33,10 @@ const (
 	AuditIPBanClear    = "ip.ban-clear"
 	AuditIPBanSettings = "ip.ban-settings"
 	AuditMaintenance   = "maintenance.set"
+
+	AuditProviderCreate = "provider.create"
+	AuditProviderUpdate = "provider.update"
+	AuditProviderDelete = "provider.delete"
 )
 
 // AuditEntry is one recorded administrative action. Detail is free-form text for

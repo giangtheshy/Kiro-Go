@@ -113,6 +113,23 @@ When any API key is enabled, requests must carry a valid key (`Authorization: Be
 
 Append a suffix (default `-thinking`) to the model name, e.g. `claude-sonnet-4.5-thinking`. Claude requests with a top-level `thinking` config (`{"type":"enabled","budget_tokens":2048}` or `{"type":"adaptive"}`) also enable it. Output format is configurable in Settings → Thinking Mode.
 
+### External providers (fallback capacity)
+
+The **Providers** tab registers OpenAI- or Anthropic-compatible upstreams that serve requests alongside the Kiro pool, so traffic keeps flowing when every account is out of quota or cooling down.
+
+Requests are **passed through unchanged** — only the model name is rewritten — so a provider only serves the endpoints that speak its own protocol:
+
+| Provider protocol | Serves |
+|---|---|
+| `anthropic` | `/v1/messages` |
+| `openai` | `/v1/chat/completions`, plus `/v1/responses` when *Also serve /v1/responses* is on |
+
+A mismatched endpoint skips the provider and falls through to the next upstream. **If your customers use Claude Code (which calls `/v1/messages`), the fallback provider must be an Anthropic-compatible endpoint** — an OpenAI-compatible one will never be selected for that traffic.
+
+Routing order comes from the **Tier** field, which Kiro accounts share (account detail → Routing Priority). Tiers are tried in ascending order, and within a tier accounts go before providers, so `acc1 = 0`, `provider = 1`, `acc2 = 2` yields exactly that chain. Leaving everything at the default `0` preserves the previous behaviour: the whole Kiro pool is tried first and providers act as pure fallback.
+
+Each provider carries its own price table in **credits per 1M tokens** (input / output / cache write / cache read), billed against the same credit balance customers buy. Token counts are read from the provider's own usage report; for OpenAI-protocol streaming this requires `stream_options.include_usage`, which is injected automatically when the client did not set it (the upstream then emits one extra final chunk carrying only usage).
+
 ### Outbound proxy
 
 Configure in Settings → Outbound Proxy. Supports SOCKS5 and HTTP. This fork adds a **shared proxy pool** with health tracking and failover, and a **Require-proxy** toggle that blocks outbound Kiro requests if no proxy is available (prevents leaking the server's real IP). Changes take effect immediately without a restart.

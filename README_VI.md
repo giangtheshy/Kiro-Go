@@ -154,6 +154,23 @@ Nếu client gửi lên một tên model không tồn tại ở thượng nguồ
 
 Thứ tự ưu tiên: Force Model toàn cục > Model theo Key > model client gửi lên.
 
+### Nhà cung cấp ngoài (dung lượng dự phòng)
+
+Tab **Providers** cho phép khai báo các upstream tương thích OpenAI hoặc Anthropic để phục vụ request song song với pool Kiro, giữ dịch vụ chạy tiếp khi mọi account đã hết quota hoặc đang cooldown.
+
+Request được **chuyển tiếp nguyên văn** — chỉ tên model bị ghi đè — nên mỗi nhà cung cấp chỉ phục vụ đúng endpoint theo giao thức của nó:
+
+| Giao thức | Phục vụ |
+|---|---|
+| `anthropic` | `/v1/messages` |
+| `openai` | `/v1/chat/completions`, thêm `/v1/responses` khi bật *Phục vụ cả /v1/responses* |
+
+Endpoint không khớp sẽ bỏ qua nhà cung cấp đó và rơi xuống upstream kế tiếp. **Nếu khách của bạn dùng Claude Code (gọi vào `/v1/messages`) thì nhà cung cấp dự phòng bắt buộc phải là endpoint tương thích Anthropic** — loại tương thích OpenAI sẽ không bao giờ được chọn cho luồng đó.
+
+Thứ tự định tuyến lấy từ trường **Bậc (Tier)**, dùng chung với account Kiro (chi tiết account → Thứ tự ưu tiên định tuyến). Bậc được thử theo thứ tự tăng dần, trong cùng một bậc thì account đi trước nhà cung cấp; nên `acc1 = 0`, `provider = 1`, `acc2 = 2` sẽ cho đúng chuỗi đó. Để mặc định `0` cho tất cả thì hành vi giữ nguyên như trước: thử hết pool Kiro rồi mới tới nhà cung cấp.
+
+Mỗi nhà cung cấp có bảng giá riêng tính bằng **credits trên 1M token** (input / output / cache write / cache read), trừ vào đúng số credits khách đã mua. Số token đọc từ báo cáo usage của chính nhà cung cấp; riêng luồng streaming giao thức OpenAI cần `stream_options.include_usage`, hệ thống sẽ tự thêm khi client không đặt (khi đó upstream trả thêm một chunk cuối chỉ chứa usage).
+
 ### Proxy outbound & pool proxy
 
 - Proxy outbound đơn: **Settings - Outbound Proxy**, hỗ trợ SOCKS5 / HTTP, có hiệu lực ngay không cần restart.

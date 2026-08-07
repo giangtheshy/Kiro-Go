@@ -73,6 +73,13 @@ type Account struct {
 	// Priority weight for load balancing (higher = more requests)
 	Weight int `json:"weight,omitempty"` // 0 or 1 = normal, 2+ = higher priority
 
+	// Priority is the routing tier this account sits in. Upstreams are tried in
+	// ascending tier order and external Providers carry the same field, so an
+	// operator can interleave them (e.g. acc1=0, provider=1, acc2=2). The default 0
+	// puts every account in one tier, which is the historical behaviour: the whole
+	// weighted-round-robin pool is tried before any external provider.
+	Priority int `json:"priority,omitempty"`
+
 	// Upstream Overages state (mirrored from AWS Q `setUserPreference` / `getUsageLimits`).
 	// OverageStatus is the only switch that decides whether to keep dispatching once UsageLimit is reached.
 	// Allowed values: "ENABLED", "DISABLED", "UNKNOWN" (or empty when not yet fetched).
@@ -284,6 +291,10 @@ type Config struct {
 	NodeVersion   string        `json:"nodeVersion,omitempty"`
 	Accounts      []Account     `json:"accounts"` // Registered Kiro accounts
 
+	// Providers are external OpenAI-/Anthropic-compatible upstreams that serve
+	// requests alongside the Kiro pool. See config/providers.go.
+	Providers []Provider `json:"providers,omitempty"`
+
 	// Thinking mode configuration for extended reasoning output
 	ThinkingSuffix       string `json:"thinkingSuffix,omitempty"`       // Model suffix to trigger thinking mode (default: "-thinking")
 	OpenAIThinkingFormat string `json:"openaiThinkingFormat,omitempty"` // OpenAI output format: "reasoning_content", "thinking", or "think"
@@ -456,7 +467,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.2.8"
+const Version = "1.2.9"
 
 var (
 	cfg     *Config

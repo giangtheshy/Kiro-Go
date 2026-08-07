@@ -132,30 +132,50 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// The original body is kept so an external OpenAI-compatible provider that
+	// advertises /v1/responses support can be handed the request verbatim.
+	pc := &passthroughCtx{
+		Raw:      body,
+		Header:   r.Header,
+		Stream:   req.Stream,
+		Endpoint: config.ProviderEndpointResponses,
+	}
+
 	if req.Stream {
 		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
-			apiKeyID, respID, &req, storedInputCopy, storeResponse)
+			apiKeyID, respID, &req, storedInputCopy, storeResponse, pc)
 		return
 	}
 
 	h.handleResponsesNonStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
-		apiKeyID, respID, &req, storedInputCopy, storeResponse)
+		apiKeyID, respID, &req, storedInputCopy, storeResponse, pc)
 }
 
 func (h *Handler) handleResponsesNonStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
 	estimatedInputTokens int, apiKeyID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
+	pc *passthroughCtx,
 ) {
 	startedAt := time.Now()
 	excluded := make(map[string]bool)
 	var lastErr error
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.nextAccountForKey(apiKeyID, model, excluded)
-		if account == nil {
+		step := h.nextUpstream(apiKeyID, model, pc.Endpoint, excluded)
+		if step == nil {
 			break
 		}
+		if step.Provider != nil {
+			handled, err := h.serveViaProvider(w, step, pc, model, apiKeyID, startedAt, estimatedInputTokens)
+			if handled {
+				return
+			}
+			lastErr = err
+			excluded[step.Provider.ID] = true
+			continue
+		}
+		account := step.Account
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -387,6 +407,7 @@ func (h *Handler) handleResponsesStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
 	estimatedInputTokens int, apiKeyID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
+	pc *passthroughCtx,
 ) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -420,20 +441,40 @@ func (h *Handler) handleResponsesStream(
 		PreviousResponseID: req.PreviousResponseID,
 		Metadata:           req.Metadata,
 	}
-	send("response.created", map[string]interface{}{
-		"type":     "response.created",
-		"response": initial,
-	})
+	// response.created is emitted lazily: an external provider serves the whole
+	// stream itself (including its own response.created), so we must not have
+	// written anything before deciding which upstream takes the request.
+	createdSent := false
+	ensureCreated := func() {
+		if createdSent {
+			return
+		}
+		send("response.created", map[string]interface{}{
+			"type":     "response.created",
+			"response": initial,
+		})
+		createdSent = true
+	}
 
 	excluded := make(map[string]bool)
 	var lastErr error
 	responseStarted := false
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.nextAccountForKey(apiKeyID, model, excluded)
-		if account == nil {
+		step := h.nextUpstream(apiKeyID, model, pc.Endpoint, excluded)
+		if step == nil {
 			break
 		}
+		if step.Provider != nil {
+			handled, err := h.serveViaProvider(w, step, pc, model, apiKeyID, startedAt, estimatedInputTokens)
+			if handled {
+				return
+			}
+			lastErr = err
+			excluded[step.Provider.ID] = true
+			continue
+		}
+		account := step.Account
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -441,6 +482,7 @@ func (h *Handler) handleResponsesStream(
 			continue
 		}
 
+		ensureCreated()
 		send("response.in_progress", map[string]interface{}{
 			"type":     "response.in_progress",
 			"response": initial,
@@ -672,6 +714,7 @@ func (h *Handler) handleResponsesStream(
 
 	if lastErr == nil {
 		h.recordFailureForApiKey(apiKeyID, "openai", model, 503, "No available accounts", startedAt, "")
+		ensureCreated()
 		send("response.failed", map[string]interface{}{
 			"type": "response.failed",
 			"response": map[string]interface{}{
@@ -687,6 +730,7 @@ func (h *Handler) handleResponsesStream(
 	}
 	status := statusForUpstreamError(lastErr)
 	h.recordFailureForApiKey(apiKeyID, "openai", model, status, lastErr.Error(), startedAt, "")
+	ensureCreated()
 	send("response.failed", map[string]interface{}{
 		"type": "response.failed",
 		"response": map[string]interface{}{

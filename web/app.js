@@ -1137,6 +1137,14 @@
       '<button class="btn btn-sm btn-primary" data-detail-action="saveWeight" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
       '</div>' +
 
+      '<div class="detail-section"><h4>' + escapeHtml(t('detail.priority')) + '</h4>' +
+      '<div class="form-group">' +
+      '<input type="number" id="priorityInput" value="' + (a.priority || 0) + '" min="0" max="99" />' +
+      '<small>' + escapeHtml(t('detail.priorityHint')) + '</small>' +
+      '</div>' +
+      '<button class="btn btn-sm btn-primary" data-detail-action="savePriority" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
+      '</div>' +
+
       '<div class="detail-section">' +
       '<h4>' + escapeHtml(t('detail.overage')) +
       ' <button class="btn btn-sm btn-outline" data-detail-action="refreshOverage" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.overageRefresh')) + '</button>' +
@@ -1241,6 +1249,10 @@
   async function saveWeight(id) {
     const weight = parseInt($('weightInput').value, 10) || 0;
     await putAccount(id, { weight }, t('detail.saved'));
+  }
+  async function savePriority(id) {
+    const priority = Math.max(0, parseInt($('priorityInput').value, 10) || 0);
+    await putAccount(id, { priority }, t('detail.saved'));
   }
   function renderOverageBadge(a) {
     const status = (a.overageStatus || '').toUpperCase();
@@ -4541,6 +4553,302 @@
     loadApiKeys();
   }
 
+  // ---------------------------------------------------------------------------
+  // External providers (OpenAI-/Anthropic-compatible fallback upstreams)
+  // ---------------------------------------------------------------------------
+
+  let providersData = [];
+
+  async function loadProviders() {
+    try {
+      const res = await api('/providers');
+      const d = await res.json().catch(() => ({}));
+      providersData = Array.isArray(d.providers) ? d.providers : [];
+    } catch (e) {
+      providersData = [];
+    }
+    renderProviders();
+  }
+
+  function renderProviders() {
+    const body = $('providerBody');
+    const empty = $('providerEmpty');
+    if (!body) return;
+
+    if (!providersData.length) {
+      body.innerHTML = '';
+      if (empty) empty.classList.remove('hidden');
+    } else {
+      if (empty) empty.classList.add('hidden');
+      const sorted = providersData.slice().sort((a, b) => (a.priority || 0) - (b.priority || 0));
+      body.innerHTML = sorted.map(p => {
+        const id = escapeAttr(p.id || '');
+        const models = (p.models || []).map(m => m.alias).join(', ');
+        const statusKey = p.enabled ? 'providers.statusEnabled' : 'providers.statusDisabled';
+        const statusCls = p.enabled ? 'badge-success' : 'badge-muted';
+        return '<tr>' +
+          '<td class="num">' + escapeHtml(String(p.priority || 0)) + '</td>' +
+          '<td>' + escapeHtml(p.name || '') + '</td>' +
+          '<td class="text-xs font-mono">' + escapeHtml(p.protocol || '') +
+            (p.supportsResponses ? ' <span class="muted-text">+responses</span>' : '') + '</td>' +
+          '<td class="text-xs font-mono">' + escapeHtml(p.baseUrl || '') + '</td>' +
+          '<td class="text-xs">' + escapeHtml(models) + '</td>' +
+          '<td class="num">' + escapeHtml(formatNumber(p.requestCount || 0)) + '</td>' +
+          '<td class="num">' + escapeHtml(formatNumber(p.totalCredits || 0)) + '</td>' +
+          '<td><span class="badge ' + statusCls + '">' + escapeHtml(t(statusKey)) + '</span></td>' +
+          '<td>' +
+            '<button class="btn btn-outline btn-sm" type="button" data-provider-action="test" data-id="' + id + '">' +
+              escapeHtml(t('providers.test')) + '</button> ' +
+            '<button class="btn btn-outline btn-sm" type="button" data-provider-action="edit" data-id="' + id + '">' +
+              escapeHtml(t('providers.edit')) + '</button> ' +
+            '<button class="btn btn-danger btn-sm" type="button" data-provider-action="delete" data-id="' + id + '">' +
+              escapeHtml(t('common.remove')) + '</button>' +
+          '</td>' +
+          '</tr>';
+      }).join('');
+    }
+
+    renderProviderChain();
+  }
+
+  // renderProviderChain shows the effective routing order so an operator can see
+  // at a glance what "priority" actually produced, instead of inferring it from
+  // two separate tables.
+  function renderProviderChain() {
+    const el = $('providerChain');
+    if (!el) return;
+
+    const steps = [];
+    (accountsData || []).filter(a => a.enabled).forEach(a => {
+      steps.push({ tier: a.priority || 0, kind: 'account', label: a.nickname || a.email || a.id });
+    });
+    providersData.filter(p => p.enabled).forEach(p => {
+      steps.push({ tier: p.priority || 0, kind: 'provider', label: p.name });
+    });
+
+    if (!steps.length) {
+      el.innerHTML = '<span class="muted-text">' + escapeHtml(t('providers.chainEmpty')) + '</span>';
+      return;
+    }
+
+    // Within a tier accounts are tried before providers, matching nextUpstream.
+    steps.sort((a, b) => (a.tier - b.tier) || (a.kind === b.kind ? 0 : a.kind === 'account' ? -1 : 1));
+    el.innerHTML = steps.map(s => {
+      const icon = s.kind === 'provider' ? 'fa-cloud-arrow-up' : 'fa-user';
+      return '<span class="badge">' + escapeHtml(String(s.tier)) + ' · ' +
+        '<i class="fa-solid ' + icon + '"></i> ' + escapeHtml(s.label) + '</span>';
+    }).join(' <span class="muted-text">&rarr;</span> ');
+  }
+
+  function providerPricingRow(prefix, pricing, labelKey) {
+    const p = pricing || {};
+    return '<div class="form-group">' +
+      '<label>' + escapeHtml(t(labelKey)) + '</label>' +
+      '<div class="input-row">' +
+        '<input type="number" step="any" min="0" id="' + prefix + 'Input" value="' + escapeAttr(p.input || 0) +
+          '" placeholder="' + escapeAttr(t('providers.priceInput')) + '" />' +
+        '<input type="number" step="any" min="0" id="' + prefix + 'Output" value="' + escapeAttr(p.output || 0) +
+          '" placeholder="' + escapeAttr(t('providers.priceOutput')) + '" />' +
+        '<input type="number" step="any" min="0" id="' + prefix + 'CacheWrite" value="' + escapeAttr(p.cacheWrite || 0) +
+          '" placeholder="' + escapeAttr(t('providers.priceCacheWrite')) + '" />' +
+        '<input type="number" step="any" min="0" id="' + prefix + 'CacheRead" value="' + escapeAttr(p.cacheRead || 0) +
+          '" placeholder="' + escapeAttr(t('providers.priceCacheRead')) + '" />' +
+      '</div>' +
+      '<span class="muted-text">' + escapeHtml(t('providers.priceHint')) + '</span>' +
+      '</div>';
+  }
+
+  function openProviderModal(provider) {
+    const editing = !!provider;
+    const p = provider || {
+      enabled: true, protocol: 'anthropic', priority: 0, weight: 1,
+      models: [], pricing: {}, headers: {}
+    };
+
+    $('providerModalTitle').textContent = t(editing ? 'providers.editTitle' : 'providers.addTitle');
+    const modelRows = (p.models || []).map(m =>
+      (m.alias || '') + ' = ' + (m.name || '')).join('\n');
+    const headerRows = Object.keys(p.headers || {}).map(k => k + ': ' + p.headers[k]).join('\n');
+
+    $('providerModalBody').innerHTML =
+      '<input type="hidden" id="pfId" value="' + escapeAttr(p.id || '') + '" />' +
+      '<div class="form-group"><label>' + escapeHtml(t('providers.fieldName')) + '</label>' +
+        '<input type="text" id="pfName" value="' + escapeAttr(p.name || '') + '" autocomplete="off" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('providers.fieldProtocol')) + '</label>' +
+        '<select id="pfProtocol">' +
+          '<option value="anthropic"' + (p.protocol === 'anthropic' ? ' selected' : '') + '>anthropic (/v1/messages)</option>' +
+          '<option value="openai"' + (p.protocol === 'openai' ? ' selected' : '') + '>openai (/v1/chat/completions)</option>' +
+        '</select>' +
+        '<span class="muted-text">' + escapeHtml(t('providers.protocolHint')) + '</span></div>' +
+      '<div class="form-group" id="pfResponsesRow"><label class="flex items-center gap-2">' +
+        '<span class="switch"><input type="checkbox" id="pfSupportsResponses"' + (p.supportsResponses ? ' checked' : '') +
+          ' /><span class="slider"></span></span>' +
+        '<span>' + escapeHtml(t('providers.fieldSupportsResponses')) + '</span></label></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('providers.fieldBaseUrl')) + '</label>' +
+        '<input type="text" id="pfBaseUrl" value="' + escapeAttr(p.baseUrl || '') +
+          '" placeholder="https://api.example.com/anthropic" autocomplete="off" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('providers.fieldApiKey')) + '</label>' +
+        '<input type="password" id="pfApiKey" value="" autocomplete="new-password" placeholder="' +
+          escapeAttr(editing && p.hasApiKey ? t('providers.apiKeyKeep') : '') + '" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('providers.fieldModels')) + '</label>' +
+        '<textarea id="pfModels" rows="4" placeholder="claude-sonnet-4.5 = glm-4.6">' + escapeHtml(modelRows) + '</textarea>' +
+        '<span class="muted-text">' + escapeHtml(t('providers.modelsHint')) + '</span></div>' +
+      providerPricingRow('pfPrice', p.pricing, 'providers.fieldPricing') +
+      '<div class="form-group"><label>' + escapeHtml(t('providers.fieldPriority')) + '</label>' +
+        '<div class="input-row">' +
+          '<input type="number" id="pfPriority" min="0" step="1" value="' + escapeAttr(p.priority || 0) + '" />' +
+          '<input type="number" id="pfWeight" min="1" step="1" value="' + escapeAttr(p.weight || 1) + '" />' +
+        '</div>' +
+        '<span class="muted-text">' + escapeHtml(t('providers.priorityHint')) + '</span></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('providers.fieldProxy')) + '</label>' +
+        '<input type="text" id="pfProxy" value="' + escapeAttr(p.proxyUrl || '') +
+          '" placeholder="socks5://host:port" autocomplete="off" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('providers.fieldHeaders')) + '</label>' +
+        '<textarea id="pfHeaders" rows="2" placeholder="X-Custom: value">' + escapeHtml(headerRows) + '</textarea></div>' +
+      '<div class="form-group"><label class="flex items-center gap-2">' +
+        '<span class="switch"><input type="checkbox" id="pfEnabled"' + (p.enabled ? ' checked' : '') +
+          ' /><span class="slider"></span></span>' +
+        '<span>' + escapeHtml(t('providers.fieldEnabled')) + '</span></label></div>' +
+      '<div class="modal-actions">' +
+        '<button class="btn btn-primary" type="button" id="pfSaveBtn">' + escapeHtml(t('common.save')) + '</button>' +
+      '</div>';
+
+    const protoSel = $('pfProtocol');
+    const syncResponsesRow = () => {
+      const row = $('pfResponsesRow');
+      if (row) row.classList.toggle('hidden', protoSel.value !== 'openai');
+    };
+    protoSel.addEventListener('change', syncResponsesRow);
+    syncResponsesRow();
+
+    $('pfSaveBtn').addEventListener('click', saveProvider);
+    openDialog('providerModal');
+  }
+
+  // parseProviderModels reads the "alias = upstream-name" textarea. A line with no
+  // "=" maps the alias onto itself, which is the common case when the provider
+  // already uses the same model ID.
+  function parseProviderModels(raw) {
+    return (raw || '').split('\n').map(line => line.trim()).filter(Boolean).map(line => {
+      const idx = line.indexOf('=');
+      if (idx < 0) return { alias: line, name: line };
+      return { alias: line.slice(0, idx).trim(), name: line.slice(idx + 1).trim() };
+    });
+  }
+
+  function parseProviderHeaders(raw) {
+    const out = {};
+    (raw || '').split('\n').map(line => line.trim()).filter(Boolean).forEach(line => {
+      const idx = line.indexOf(':');
+      if (idx <= 0) return;
+      out[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
+    });
+    return out;
+  }
+
+  function numVal(id) {
+    const el = $(id);
+    const n = el ? parseFloat(el.value) : 0;
+    return isNaN(n) ? 0 : n;
+  }
+
+  async function saveProvider() {
+    const id = $('pfId').value;
+    const payload = {
+      name: $('pfName').value.trim(),
+      enabled: $('pfEnabled').checked,
+      protocol: $('pfProtocol').value,
+      baseUrl: $('pfBaseUrl').value.trim(),
+      apiKey: $('pfApiKey').value,
+      proxyUrl: $('pfProxy').value.trim(),
+      priority: Math.max(0, Math.round(numVal('pfPriority'))),
+      weight: Math.max(1, Math.round(numVal('pfWeight'))),
+      supportsResponses: $('pfSupportsResponses').checked,
+      models: parseProviderModels($('pfModels').value),
+      headers: parseProviderHeaders($('pfHeaders').value),
+      pricing: {
+        input: numVal('pfPriceInput'),
+        output: numVal('pfPriceOutput'),
+        cacheWrite: numVal('pfPriceCacheWrite'),
+        cacheRead: numVal('pfPriceCacheRead')
+      }
+    };
+
+    try {
+      const res = await api(id ? '/providers/' + encodeURIComponent(id) : '/providers', {
+        method: id ? 'PUT' : 'POST',
+        body: JSON.stringify(payload)
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(d.error || t('common.saveFailed'));
+      closeDialog('providerModal');
+      toast(t('common.saved'), 'success');
+      loadProviders();
+    } catch (e) {
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+    }
+  }
+
+  async function deleteProvider(id) {
+    const ok = await confirmAction(t('providers.confirmDelete'), {
+      title: t('common.remove'),
+      confirmText: t('common.remove'),
+      variant: 'danger'
+    });
+    if (!ok) return;
+    try {
+      const res = await api('/providers/' + encodeURIComponent(id), { method: 'DELETE' });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(d.error || t('common.failed'));
+      toast(t('providers.deleted'), 'danger', { icon: 'fa-solid fa-trash' });
+      loadProviders();
+    } catch (e) {
+      toast((e && e.message) || t('common.failed'), 'error');
+    }
+  }
+
+  async function testProvider(id) {
+    toast(t('providers.testing'), 'info');
+    try {
+      const res = await api('/providers/' + encodeURIComponent(id) + '/test', {
+        method: 'POST',
+        body: JSON.stringify({})
+      });
+      const d = await res.json().catch(() => ({}));
+      if (d.ok) {
+        toast(t('providers.testOk', d.model || '', d.durationMs || 0), 'success');
+      } else {
+        toast(t('providers.testFailed', d.error || d.status || t('common.failed')), 'error');
+      }
+    } catch (e) {
+      toast((e && e.message) || t('common.failed'), 'error');
+    }
+  }
+
+  function bindProviderEvents() {
+    const addBtn = $('providerAddBtn');
+    if (addBtn) addBtn.addEventListener('click', () => openProviderModal(null));
+    const refreshBtn = $('providerRefreshBtn');
+    if (refreshBtn) refreshBtn.addEventListener('click', loadProviders);
+    const close = $('providerModalClose');
+    if (close) close.addEventListener('click', () => closeDialog('providerModal'));
+    bindDialogBackdropClose('providerModal', () => closeDialog('providerModal'));
+
+    const body = $('providerBody');
+    if (body) body.addEventListener('click', e => {
+      const btn = e.target.closest('[data-provider-action]');
+      if (!btn) return;
+      const id = btn.dataset.id;
+      const action = btn.dataset.providerAction;
+      if (action === 'delete') deleteProvider(id);
+      else if (action === 'test') testProvider(id);
+      else if (action === 'edit') {
+        const p = providersData.find(x => x.id === id);
+        if (p) openProviderModal(p);
+      }
+    });
+  }
+
   // isKnownTab guards against a hand-edited ?tab= value pointing at a panel that
   // does not exist — switchTab would otherwise throw on a null content element.
   function isKnownTab(tab) {
@@ -4563,6 +4871,7 @@
     // is one REST call, everything after that arrives on the stream.
     if (tab === 'apilog') { populateApiLogKeyFilter(); loadApiLog(); toggleApiLogLive(); }
     else if (tab === 'settings') { startTabPolling(refreshApiKeysIfIdle); }
+    else if (tab === 'providers') { loadProviders(); }
     else if (tab === 'ipbans') { loadIPBans(); }
     else if (tab === 'anomaly') { loadAnomalies(); }
     else if (tab === 'audit') { loadAuditLog(auditActionFilter); }
@@ -4772,6 +5081,7 @@
       const a = b.dataset.detailAction;
       if (a === 'saveMachineId') saveMachineId(id);
       else if (a === 'saveWeight') saveWeight(id);
+      else if (a === 'savePriority') savePriority(id);
       else if (a === 'toggleOverage') toggleOverageSwitch(id, b);
       else if (a === 'refreshOverage') refreshAccountOverage(id);
       else if (a === 'saveProxyURL') saveProxyURL(id);
@@ -4808,6 +5118,7 @@
     bindTestEvents();
     bindConsoleEvents();
     bindSecurityEvents();
+    bindProviderEvents();
   }
 
   // Init

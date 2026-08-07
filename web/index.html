@@ -104,6 +104,8 @@
           <div class="tabs" id="tabBar">
             <button type="button" class="tab active" data-tab="accounts"><i class="fa-solid fa-users tab-icon"></i><span
                 data-i18n="tabs.accounts"></span></button>
+            <button type="button" class="tab" data-tab="providers"><i
+                class="fa-solid fa-cloud-arrow-up tab-icon"></i><span data-i18n="tabs.providers"></span></button>
             <button type="button" class="tab" data-tab="settings"><i class="fa-solid fa-sliders tab-icon"></i><span
                 data-i18n="tabs.settings"></span></button>
             <button type="button" class="tab" data-tab="api"><i class="fa-solid fa-plug tab-icon"></i><span
@@ -240,6 +242,50 @@
           </div>
 
           <div id="accountsList"></div>
+        </div>
+      </div>
+
+      <!-- Providers tab -->
+      <div id="tabProviders" class="tab-content hidden">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title" data-i18n="providers.title"></span>
+            <div class="card-actions">
+              <button class="btn btn-outline btn-sm" id="providerRefreshBtn" type="button"><i
+                  class="fa-solid fa-arrows-rotate" aria-hidden="true"></i><span class="btn-text"
+                  data-i18n="apilog.refresh"></span></button>
+              <button class="btn btn-primary btn-sm" id="providerAddBtn" type="button"><i class="fa-solid fa-plus"
+                  aria-hidden="true"></i><span class="btn-text" data-i18n="providers.add"></span></button>
+            </div>
+          </div>
+
+          <p class="muted-text" data-i18n="providers.hint"></p>
+
+          <div class="form-group">
+            <label data-i18n="providers.chainTitle"></label>
+            <div id="providerChain" class="apilog-summary"></div>
+          </div>
+
+          <div class="table-scroll">
+            <table class="data-table" id="providerTable">
+              <thead>
+                <tr>
+                  <th class="num" data-i18n="providers.colPriority"></th>
+                  <th data-i18n="providers.colName"></th>
+                  <th data-i18n="providers.colProtocol"></th>
+                  <th data-i18n="providers.colBaseUrl"></th>
+                  <th data-i18n="providers.colModels"></th>
+                  <th class="num" data-i18n="providers.colRequests"></th>
+                  <th class="num" data-i18n="providers.colCredits"></th>
+                  <th data-i18n="providers.colStatus"></th>
+                  <th data-i18n="providers.colActions"></th>
+                </tr>
+              </thead>
+              <tbody id="providerBody"></tbody>
+            </table>
+          </div>
+          <div id="providerEmpty" class="muted-text hidden" style="padding:1rem 0;text-align:center;"
+            data-i18n="providers.noData"></div>
         </div>
       </div>
 
@@ -910,6 +956,13 @@
       <div class="modal-header"><span class="modal-title" data-i18n="detail.title"></span><button class="modal-close"
           id="detailModalClose" type="button" aria-label="" data-i18n-aria-label="common.close">&times;</button></div>
       <div class="modal-body" id="detailBody"></div>
+    </div>
+  </div>
+  <div id="providerModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header"><span class="modal-title" id="providerModalTitle"></span><button class="modal-close"
+          id="providerModalClose" type="button" aria-label="" data-i18n-aria-label="common.close">&times;</button></div>
+      <div class="modal-body" id="providerModalBody"></div>
     </div>
   </div>
   <div id="exportModal" class="modal">

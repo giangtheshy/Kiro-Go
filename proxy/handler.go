@@ -66,6 +66,9 @@ type Handler struct {
 	// EventSource (which cannot set headers) can open the per-key stream.
 	streamTickets    *streamTicketStore
 	stopAlertWatcher chan struct{}
+	// providerCursor drives weighted round-robin across external providers that
+	// share a routing tier. See proxy/upstream_router.go.
+	providerCursor uint64
 }
 
 // safeGo runs fn in a new goroutine with panic containment: a panic inside fn is
@@ -729,12 +732,47 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		buildModelInfo("gpt-4", "kiro-proxy", true),
 	)
 
+	// Models only reachable through an external provider still have to appear in
+	// the catalog, otherwise a client cannot address the fallback capacity at all.
+	models = append(models, providerOnlyModels(models, thinkingSuffix)...)
+
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"object": "list",
 		"data":   models,
 	})
 	return
+}
+
+// providerOnlyModels returns catalog entries for the aliases declared by enabled
+// external providers that are not already listed, each with its thinking variant.
+func providerOnlyModels(existing []map[string]interface{}, thinkingSuffix string) []map[string]interface{} {
+	providers := config.GetEnabledProviders()
+	if len(providers) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]bool, len(existing))
+	for _, m := range existing {
+		if id, ok := m["id"].(string); ok {
+			seen[strings.ToLower(id)] = true
+		}
+	}
+
+	var out []map[string]interface{}
+	for _, p := range providers {
+		for _, m := range p.Models {
+			for _, id := range []string{m.Alias, m.Alias + thinkingSuffix} {
+				key := strings.ToLower(id)
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				out = append(out, buildModelInfo(id, "provider:"+p.Name, false))
+			}
+		}
+	}
+	return out
 }
 
 func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []map[string]interface{} {
@@ -1157,11 +1195,20 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// 转换请求
 	kiroPayload := ClaudeToKiro(&req, thinking)
 
+	// The original body is kept so an external Anthropic-compatible provider can
+	// be handed the request verbatim instead of the Kiro translation.
+	pc := &passthroughCtx{
+		Raw:      body,
+		Header:   r.Header,
+		Stream:   req.Stream,
+		Endpoint: config.ProviderEndpointMessages,
+	}
+
 	// Stream or non-stream
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, pc)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, pc)
 	}
 }
 
@@ -1198,7 +1245,7 @@ func (h *Handler) nextAccountForKey(apiKeyID, model string, excluded map[string]
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, pc *passthroughCtx) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1241,10 +1288,20 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.nextAccountForKey(apiKeyID, model, excluded)
-		if account == nil {
+		step := h.nextUpstream(apiKeyID, model, pc.Endpoint, excluded)
+		if step == nil {
 			break
 		}
+		if step.Provider != nil {
+			handled, err := h.serveViaProvider(w, step, pc, model, apiKeyID, startedAt, estimatedInputTokens)
+			if handled {
+				return
+			}
+			lastErr = err
+			excluded[step.Provider.ID] = true
+			continue
+		}
+		account := step.Account
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -1820,16 +1877,26 @@ func (h *Handler) recordFailure() {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, pc *passthroughCtx) {
 	startedAt := time.Now()
 	excluded := make(map[string]bool)
 	var lastErr error
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.nextAccountForKey(apiKeyID, model, excluded)
-		if account == nil {
+		step := h.nextUpstream(apiKeyID, model, pc.Endpoint, excluded)
+		if step == nil {
 			break
 		}
+		if step.Provider != nil {
+			handled, err := h.serveViaProvider(w, step, pc, model, apiKeyID, startedAt, estimatedInputTokens)
+			if handled {
+				return
+			}
+			lastErr = err
+			excluded[step.Provider.ID] = true
+			continue
+		}
+		account := step.Account
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -2058,15 +2125,24 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	kiroPayload := OpenAIToKiro(&req, thinking)
 
+	// The original body is kept so an external OpenAI-compatible provider can be
+	// handed the request verbatim instead of the Kiro translation.
+	pc := &passthroughCtx{
+		Raw:      body,
+		Header:   r.Header,
+		Stream:   req.Stream,
+		Endpoint: config.ProviderEndpointChatCompletions,
+	}
+
 	if req.Stream {
-		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, pc)
 	} else {
-		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, pc)
 	}
 }
 
 // handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string, pc *passthroughCtx) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -2086,10 +2162,20 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	var lastErr error
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.nextAccountForKey(apiKeyID, model, excluded)
-		if account == nil {
+		step := h.nextUpstream(apiKeyID, model, pc.Endpoint, excluded)
+		if step == nil {
 			break
 		}
+		if step.Provider != nil {
+			handled, err := h.serveViaProvider(w, step, pc, model, apiKeyID, startedAt, estimatedInputTokens)
+			if handled {
+				return
+			}
+			lastErr = err
+			excluded[step.Provider.ID] = true
+			continue
+		}
+		account := step.Account
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -2459,16 +2545,26 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
-func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string, pc *passthroughCtx) {
 	startedAt := time.Now()
 	excluded := make(map[string]bool)
 	var lastErr error
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.nextAccountForKey(apiKeyID, model, excluded)
-		if account == nil {
+		step := h.nextUpstream(apiKeyID, model, pc.Endpoint, excluded)
+		if step == nil {
 			break
 		}
+		if step.Provider != nil {
+			handled, err := h.serveViaProvider(w, step, pc, model, apiKeyID, startedAt, estimatedInputTokens)
+			if handled {
+				return
+			}
+			lastErr = err
+			excluded[step.Provider.ID] = true
+			continue
+		}
+		account := step.Account
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -2730,6 +2826,20 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
 	switch {
+	// External providers. The /test suffix must be matched before the generic
+	// /providers/{id} prefix routes below, or it would be read as an ID.
+	case path == "/providers" && r.Method == "GET":
+		h.apiGetProviders(w, r)
+	case path == "/providers" && r.Method == "POST":
+		h.apiAddProvider(w, r)
+	case strings.HasPrefix(path, "/providers/") && strings.HasSuffix(path, "/test") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/providers/"), "/test")
+		h.apiTestProvider(w, r, id)
+	case strings.HasPrefix(path, "/providers/") && r.Method == "PUT":
+		h.apiUpdateProvider(w, r, strings.TrimPrefix(path, "/providers/"))
+	case strings.HasPrefix(path, "/providers/") && r.Method == "DELETE":
+		h.apiDeleteProvider(w, r, strings.TrimPrefix(path, "/providers/"))
+
 	case path == "/accounts" && r.Method == "GET":
 		h.apiGetAccounts(w, r)
 	case path == "/accounts" && r.Method == "POST":
@@ -2931,6 +3041,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"hasToken":          a.AccessToken != "",
 			"machineId":         a.MachineId,
 			"weight":            a.Weight,
+			"priority":          a.Priority,
 			"overageStatus":     a.OverageStatus,
 			"overageCapability": a.OverageCapability,
 			"overageCap":        a.OverageCap,
@@ -3056,6 +3167,9 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	}
 	if v, ok := updates["weight"].(float64); ok {
 		existing.Weight = int(v)
+	}
+	if v, ok := updates["priority"].(float64); ok && v >= 0 {
+		existing.Priority = int(v)
 	}
 	if v, ok := updates["proxyURL"].(string); ok {
 		existing.ProxyURL = v
