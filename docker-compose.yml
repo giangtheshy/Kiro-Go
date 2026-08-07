@@ -13,4 +13,7 @@ services:
     environment:
       - CONFIG_PATH=/app/data/config.json
       - LOOPBACK_HOST=0.0.0.0
+      - KIRO_TRUST_PROXY=true # nếu đứng sau nginx/Cloudflare — BẮT BUỘC
+      - KIRO_TRUSTED_PROXY_HOPS=1 # số hop proxy trước mặt
+      - KIRO_IP_RPM=0 # hoặc 0 để tắt hẳn nếu đã có limit per-key
     restart: unless-stopped

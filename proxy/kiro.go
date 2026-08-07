@@ -5,6 +5,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"kiro-go/config"
@@ -27,6 +28,19 @@ import (
 // an upper bound a corrupt/hostile frame could make us allocate multiple GiB and OOM the
 // whole process from a single response. 32 MiB is far above any legitimate SSE frame.
 const maxEventStreamFrameBytes = 32 << 20
+
+// kiroStreamTimeout bounds the ENTIRE streaming request, including reading the
+// response body (http.Client.Timeout is documented to cover the body read). It was
+// 5 minutes, which silently truncated long generations: a high thinking budget on
+// opus-class models routinely keeps a single turn streaming past that, and the abort
+// surfaced to the user as an abrupt mid-response stop. 30 minutes leaves ample
+// headroom while still capping a permanently stalled connection.
+//
+// The pre-body phase stays bounded much more tightly and independently (DialContext
+// 10s, ResponseHeaderTimeout in buildKiroTransport), so a dead proxy or unresponsive
+// endpoint still fails fast and rotates to the next account rather than waiting out
+// this ceiling. Override with KIRO_STREAM_TIMEOUT_SEC (0 removes the deadline).
+var kiroStreamTimeout = time.Duration(envInt("KIRO_STREAM_TIMEOUT_SEC", 1800)) * time.Second
 
 // Endpoint configuration (auto-fallback on quota exhaustion).
 type kiroEndpoint struct {
@@ -78,7 +92,7 @@ func GetClientForProxy(proxyURL string) *http.Client {
 		return cached.(*http.Client)
 	}
 	client := &http.Client{
-		Timeout:   5 * time.Minute,
+		Timeout:   kiroStreamTimeout,
 		Transport: buildKiroTransport(proxyURL),
 	}
 	proxyClientCache.Store(proxyURL, client)
@@ -266,12 +280,18 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 		ForceAttemptHTTP2:   true,
 		// Cap the connect/proxy-handshake phase so a dead or hung proxy fails
 		// fast and the request rotates to another account, instead of hanging
-		// for the full 5-minute stream timeout. The 5-minute client timeout
-		// still covers the streaming body once connected.
+		// for the full stream timeout.
 		DialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
+		TLSHandshakeTimeout: 15 * time.Second,
+		// Bound the wait for response HEADERS only. This is what makes it safe to
+		// give the streaming client a long overall Timeout: an endpoint that accepts
+		// the connection but never responds fails here in 2 minutes instead of
+		// occupying the request for the full kiroStreamTimeout. Once headers arrive
+		// this no longer applies, so the body may stream for as long as needed.
+		ResponseHeaderTimeout: 120 * time.Second,
 	}
 	if proxyURL != "" {
 		if u, err := url.Parse(proxyURL); err == nil {
@@ -288,7 +308,7 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 // InitKiroHttpClient initializes (or reinitializes) the HTTP clients used for Kiro API requests.
 func InitKiroHttpClient(proxyURL string) {
 	client := &http.Client{
-		Timeout:   5 * time.Minute,
+		Timeout:   kiroStreamTimeout,
 		Transport: buildKiroTransport(proxyURL),
 	}
 	kiroHttpStore.Store(client)
@@ -688,7 +708,15 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		// Prelude: 12 bytes (total_len + headers_len + crc)
 		prelude := make([]byte, 12)
 		_, err := io.ReadFull(body, prelude)
-		if err == io.EOF {
+		// io.EOF means the connection closed cleanly on a frame boundary.
+		// io.ErrUnexpectedEOF means it closed mid-prelude: io.ReadFull only reports
+		// io.EOF when ZERO bytes were read, so a close after even 1 of the 12 bytes
+		// surfaces as ErrUnexpectedEOF instead. AWS ends the event stream this way
+		// often enough on long-lived connections (a high thinking budget keeps the
+		// socket open for minutes) that treating it as fatal throws away an otherwise
+		// complete response and needlessly rotates the account — the abrupt-cutoff
+		// symptom. End the stream the same way a clean EOF would.
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 			break
 		}
 		if err != nil {
@@ -709,6 +737,13 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		remaining := totalLength - 12
 		msgBuf := make([]byte, remaining)
 		_, err = io.ReadFull(body, msgBuf)
+		// Same rationale as the prelude read above: a frame that started but was cut
+		// short by the upstream closing the connection is the end of the stream, not a
+		// fatal error. The partial frame is dropped; everything already handed to the
+		// callback stands.
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			break
+		}
 		if err != nil {
 			return err
 		}

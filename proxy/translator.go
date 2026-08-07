@@ -1867,6 +1867,55 @@ func maxInputTokensForModel(payload *KiroPayload, model string) int {
 	return 0
 }
 
+// payloadMaxTokens returns the client's requested max_tokens for the payload, or 0
+// when it was not specified.
+func payloadMaxTokens(payload *KiroPayload) int {
+	if payload == nil || payload.InferenceConfig == nil {
+		return 0
+	}
+	return payload.InferenceConfig.MaxTokens
+}
+
+// claudeStopReason infers the stop_reason for a completed turn.
+//
+// Kiro's event stream carries no native stop-reason field, so this is inferred.
+// Reporting a flat "end_turn" is actively harmful: when a response is truncated
+// (output hit max_tokens, or the upstream connection ended mid-generation) the
+// client is told the turn finished cleanly, so agentic callers never continue and
+// the user sees an answer that just stops. Distinguishing max_tokens lets the
+// client react, and makes the truncation visible in logs instead of silent.
+func claudeStopReason(toolUses []KiroToolUse, outputTokens, maxTokens int) string {
+	if len(toolUses) > 0 {
+		return "tool_use"
+	}
+	if hitMaxTokens(outputTokens, maxTokens) {
+		return "max_tokens"
+	}
+	return "end_turn"
+}
+
+// hitMaxTokens reports whether the output ran into the client's max_tokens ceiling.
+//
+// outputTokens is an ESTIMATE (estimateClaudeOutputTokens counts characters), not an
+// exact upstream count, so this deliberately errs toward under-reporting: it requires
+// the estimate to reach the cap outright rather than allowing a tolerance below it.
+// The asymmetry is intentional, because the two error directions are not equally bad:
+//
+//   - false negative → stop_reason stays "end_turn", i.e. exactly the behaviour before
+//     truncation was detected at all. No regression.
+//   - false positive → a COMPLETE answer is labelled truncated, and an agentic client
+//     issues a spurious continuation request against a finished turn.
+//
+// So a turn that legitimately finishes just short of the cap is reported as a normal
+// end_turn. Detection here is best-effort; Kiro's event stream carries no native
+// stop-reason field, and if one is added it should take precedence over this guess.
+func hitMaxTokens(outputTokens, maxTokens int) bool {
+	if maxTokens <= 0 || outputTokens <= 0 {
+		return false
+	}
+	return outputTokens >= maxTokens
+}
+
 // dropLeadingAssistant removes a leading assistant message from a history tail so
 // it does not directly follow the placeholder user turn with a broken pairing.
 func dropLeadingAssistant(tail []KiroHistoryMessage) []KiroHistoryMessage {

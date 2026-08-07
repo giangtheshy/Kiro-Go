@@ -17,6 +17,13 @@ import (
 const (
 	kiroRestAPIBase               = "https://codewhisperer.us-east-1.amazonaws.com"
 	profileArnUnsupportedCooldown = 24 * time.Hour
+
+	// profileArnMissingCooldown is the negative-cache TTL for the "no available
+	// Kiro profile" case (empty profile list across all regions). A 5-minute
+	// window stops each request from re-probing 2 regions × 3 retries + a token
+	// refresh every time while still allowing fast recovery when a profile is
+	// provisioned or an outage clears.
+	profileArnMissingCooldown = 5 * time.Minute
 )
 
 var profileArnResolutionCooldowns sync.Map
@@ -288,19 +295,40 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 		}
 	}
 
-	// Fallback: refresh token to get profileArn from auth response
+	// Fallback: refresh token to get profileArn from auth response.
+	// Persist any rotated credentials even when no ARN comes back — some IdC
+	// providers rotate the refresh token on every use, so discarding the new
+	// token here would invalidate the account on the next refresh cycle.
 	if account.RefreshToken != "" {
-		_, _, _, refreshedArn, refreshErr := auth.RefreshToken(account)
-		if refreshErr == nil && refreshedArn != "" {
-			region := regionFromProfileArn(refreshedArn)
-			if updateErr := config.UpdateAccountProfileArnWithRegion(account.ID, refreshedArn, region); updateErr != nil {
-				logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
+		newAccess, newRefresh, newExpiry, refreshedArn, refreshErr := auth.RefreshToken(account)
+		if refreshErr == nil {
+			// Persist rotated credentials regardless of whether an ARN was returned.
+			if newAccess != "" || newRefresh != "" {
+				storeRefresh := newRefresh
+				if storeRefresh == "" {
+					storeRefresh = account.RefreshToken
+				}
+				if err := config.UpdateAccountToken(account.ID, newAccess, storeRefresh, newExpiry); err != nil {
+					logger.Warnf("[ProfileArn] Failed to persist rotated token for %s: %v", account.Email, err)
+				} else {
+					account.AccessToken = newAccess
+					account.ExpiresAt = newExpiry
+					if newRefresh != "" {
+						account.RefreshToken = newRefresh
+					}
+				}
 			}
-			account.ProfileArn = refreshedArn
-			if region != "" && account.ApiRegion == "" {
-				account.ApiRegion = region
+			if refreshedArn != "" {
+				region := regionFromProfileArn(refreshedArn)
+				if updateErr := config.UpdateAccountProfileArnWithRegion(account.ID, refreshedArn, region); updateErr != nil {
+					logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
+				}
+				account.ProfileArn = refreshedArn
+				if region != "" && account.ApiRegion == "" {
+					account.ApiRegion = region
+				}
+				return refreshedArn, nil
 			}
-			return refreshedArn, nil
 		}
 	}
 
@@ -308,11 +336,17 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 		return "", fmt.Errorf("profile ARN resolution skipped: previous Builder ID profile lookup was unsupported")
 	}
 	if profileUnsupported {
-		suppressProfileArnResolution(account)
+		suppressProfileArnResolution(account, profileArnUnsupportedCooldown)
 		logger.Debugf("[ProfileArn] Builder ID profile lookup unsupported for %s: %v", accountEmailForLog(account), profileUnsupportedErr)
 		return "", fmt.Errorf("profile ARN unsupported for Builder ID account")
 	}
 
+	// No profile was found in any region and the refresh token fallback also
+	// yielded nothing. Cache this negative result so subsequent requests skip the
+	// expensive multi-region probe + token refresh for the next 5 minutes instead
+	// of redoing it on every single request.
+	suppressProfileArnResolution(account, profileArnMissingCooldown)
+	logger.Warnf("[ProfileArn] No available Kiro profile for %s (will suppress re-probe for %.0fm)", accountEmailForLog(account), profileArnMissingCooldown.Minutes())
 	return "", fmt.Errorf("no available Kiro profile")
 }
 
@@ -368,12 +402,12 @@ func profileArnCooldownKey(account *config.Account) string {
 	return provider + "\x00" + strings.TrimSpace(account.Email)
 }
 
-func suppressProfileArnResolution(account *config.Account) {
+func suppressProfileArnResolution(account *config.Account, cooldown time.Duration) {
 	key := profileArnCooldownKey(account)
 	if key == "" {
 		return
 	}
-	profileArnResolutionCooldowns.Store(key, time.Now().Add(profileArnUnsupportedCooldown))
+	profileArnResolutionCooldowns.Store(key, time.Now().Add(cooldown))
 }
 
 func isProfileArnResolutionSuppressed(account *config.Account) bool {
@@ -401,8 +435,14 @@ func isProfileArnResolutionUnsupportedError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "profile ARN unsupported for Builder ID account")
 }
 
+func isProfileArnResolutionMissingError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "no available Kiro profile")
+}
+
 func isProfileArnResolutionSoftError(err error) bool {
-	return isProfileArnResolutionSkippedError(err) || isProfileArnResolutionUnsupportedError(err)
+	return isProfileArnResolutionSkippedError(err) ||
+		isProfileArnResolutionUnsupportedError(err) ||
+		isProfileArnResolutionMissingError(err)
 }
 
 func listAvailableProfilesWithRetry(account *config.Account, region string) (string, error) {

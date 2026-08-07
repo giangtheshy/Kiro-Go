@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"kiro-go/config"
+	"kiro-go/logger"
 	"net/http"
 	"strings"
 	"time"
@@ -129,6 +130,12 @@ func (h *Handler) authenticate(r *http.Request) (*config.ApiKeyEntry, error) {
 					// rejected without waiting, so keeping the deduction would make
 					// the effective RPM drift below the configured limit.
 					h.rpmThrottle.refund(entry.ID, entry.RPMLimit)
+					// Log it: the handler never runs for a rejected request, so nothing
+					// downstream writes this to the request log. Without this line the
+					// 429 is invisible to the operator. Only reachable when the key has
+					// an explicit rpmLimit > 0 — an unlimited key never gets here.
+					logger.Warnf("[Guard] per-key in-flight cap hit: key=%s rpmLimit=%d maxWaiters=%d (raise KIRO_PER_KEY_INFLIGHT or the key's rpmLimit)",
+						config.MaskApiKey(entry.Key), entry.RPMLimit, h.guard.keyMaxWaiters)
 					return nil, newAuthError(http.StatusTooManyRequests, "rate_limit_error", "too many concurrent requests for this API key")
 				}
 				timer := time.NewTimer(wait)

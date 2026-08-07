@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"kiro-go/config"
 	"net/http"
 	"net/url"
@@ -202,9 +204,18 @@ func TestInitKiroHttpClientKeepsShortRestTimeout(t *testing.T) {
 	streamClient := kiroHttpStore.Load()
 	restClient := kiroRestHttpStore.Load()
 
-	if streamClient.Timeout != 5*time.Minute {
-		t.Fatalf("expected streaming timeout to be 5m, got %s", streamClient.Timeout)
+	// The streaming client must carry the long generation budget: http.Client.Timeout
+	// covers reading the response body, so a short value truncates long turns
+	// mid-stream (high thinking budgets routinely run past 5 minutes).
+	if streamClient.Timeout != kiroStreamTimeout {
+		t.Fatalf("expected streaming timeout to be %s, got %s", kiroStreamTimeout, streamClient.Timeout)
 	}
+	// Guard the default so a regression back to a body-truncating value is caught.
+	if streamClient.Timeout < 10*time.Minute {
+		t.Fatalf("streaming timeout %s is too short to cover a long generation", streamClient.Timeout)
+	}
+	// The REST client must NOT inherit that budget: its calls are short control-plane
+	// requests (model list, profile ARN) where a hang should fail fast and rotate.
 	if restClient.Timeout != 30*time.Second {
 		t.Fatalf("expected REST timeout to stay 30s, got %s", restClient.Timeout)
 	}
@@ -350,6 +361,72 @@ func TestParseEventStreamSurfacesMidStreamException(t *testing.T) {
 		t.Fatal("OnComplete must not fire when the stream ends in an exception")
 	}
 }
+
+// TestParseEventStreamTruncatedPreludeEndsCleanly covers the abrupt-cutoff bug:
+// AWS closes the event stream partway through a 12-byte prelude, io.ReadFull
+// reports io.ErrUnexpectedEOF (not io.EOF, because some bytes did arrive), and
+// treating that as fatal threw away a complete response and rotated the account.
+// Long thinking budgets keep the socket open for minutes, making this the common
+// case rather than the rare one.
+func TestParseEventStreamTruncatedPreludeEndsCleanly(t *testing.T) {
+	complete := awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "hello world"})
+	// 5 bytes of a 12-byte prelude: enough for io.ReadFull to return
+	// io.ErrUnexpectedEOF rather than io.EOF.
+	stream := bytes.NewReader(append(append([]byte{}, complete...), 0, 0, 0, 40, 0))
+
+	var text string
+	err := parseEventStream(stream, &KiroStreamCallback{
+		OnText: func(s string, _ bool) { text += s },
+	})
+	if err != nil {
+		t.Fatalf("a prelude cut short by the upstream close must end the stream cleanly, got error: %v", err)
+	}
+	if text != "hello world" {
+		t.Fatalf("expected the content delivered before the cut, got %q", text)
+	}
+}
+
+// TestParseEventStreamTruncatedBodyEndsCleanly is the same scenario one step
+// later: the prelude arrives in full and announces a frame length, but the
+// connection closes before the body does. The partial frame is dropped and
+// everything already delivered stands.
+func TestParseEventStreamTruncatedBodyEndsCleanly(t *testing.T) {
+	complete := awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "first"})
+	truncated := awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "never delivered"})
+	// Keep the prelude plus a few body bytes so the announced totalLength cannot
+	// be satisfied.
+	stream := bytes.NewReader(append(append([]byte{}, complete...), truncated[:16]...))
+
+	var text string
+	err := parseEventStream(stream, &KiroStreamCallback{
+		OnText: func(s string, _ bool) { text += s },
+	})
+	if err != nil {
+		t.Fatalf("a body cut short by the upstream close must end the stream cleanly, got error: %v", err)
+	}
+	if text != "first" {
+		t.Fatalf("expected only the fully-received frame, got %q", text)
+	}
+}
+
+// TestParseEventStreamRealErrorStillPropagates guards the fix from over-reaching:
+// only EOF-family errors are absorbed. A genuine transport failure must still
+// fail the account so the retry loop rotates.
+func TestParseEventStreamRealErrorStillPropagates(t *testing.T) {
+	wantErr := errors.New("connection reset by peer")
+	complete := awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "partial"})
+	stream := io.MultiReader(bytes.NewReader(complete), &errReader{err: wantErr})
+
+	err := parseEventStream(stream, &KiroStreamCallback{OnText: func(string, bool) {}})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected the transport error to propagate, got %v", err)
+	}
+}
+
+// errReader fails every read with a non-EOF error.
+type errReader struct{ err error }
+
+func (r *errReader) Read([]byte) (int, error) { return 0, r.err }
 
 func TestSelectProxyOverrideWins(t *testing.T) {
 	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {

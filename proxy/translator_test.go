@@ -640,3 +640,66 @@ func TestOpenAIToolResultImageCarriedWhenFollowedByUser(t *testing.T) {
 		t.Fatalf("tool image should not leak into a later user message, got %d on current", len(cur.Images))
 	}
 }
+
+// TestHitMaxTokensRequiresReachingTheCap pins the conservative side of the
+// estimate. outputTokens is a character-based estimate, not an exact upstream
+// count, and stop_reason drives whether an agentic client continues the turn.
+// A false "max_tokens" makes it retry a response that was actually complete, so
+// the check must not fire below the cap.
+func TestHitMaxTokensRequiresReachingTheCap(t *testing.T) {
+	cases := []struct {
+		name         string
+		outputTokens int
+		maxTokens    int
+		want         bool
+	}{
+		{"no max_tokens set", 5000, 0, false},
+		{"no output", 0, 4096, false},
+		{"well under the cap", 100, 4096, false},
+		{"just under the cap must not fire", 4000, 4096, false},
+		{"exactly at the cap", 4096, 4096, true},
+		{"over the cap", 4200, 4096, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hitMaxTokens(tc.outputTokens, tc.maxTokens); got != tc.want {
+				t.Fatalf("hitMaxTokens(%d, %d) = %v, want %v", tc.outputTokens, tc.maxTokens, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestClaudeStopReasonPrecedence checks tool_use wins over max_tokens: a turn
+// that emitted a tool call must report tool_use even if it also filled the
+// budget, otherwise the client stops instead of running the tool.
+func TestClaudeStopReasonPrecedence(t *testing.T) {
+	toolUses := []KiroToolUse{{ToolUseID: "t1", Name: "read"}}
+
+	if got := claudeStopReason(toolUses, 4096, 4096); got != "tool_use" {
+		t.Fatalf("tool call at the cap: got %q, want tool_use", got)
+	}
+	if got := claudeStopReason(nil, 4096, 4096); got != "max_tokens" {
+		t.Fatalf("no tool call at the cap: got %q, want max_tokens", got)
+	}
+	if got := claudeStopReason(nil, 100, 4096); got != "end_turn" {
+		t.Fatalf("short answer: got %q, want end_turn", got)
+	}
+	if got := claudeStopReason(nil, 100, 0); got != "end_turn" {
+		t.Fatalf("no max_tokens: got %q, want end_turn", got)
+	}
+}
+
+// TestPayloadMaxTokensHandlesMissingConfig guards the nil paths: the notice
+// handlers build responses without an InferenceConfig.
+func TestPayloadMaxTokensHandlesMissingConfig(t *testing.T) {
+	if got := payloadMaxTokens(nil); got != 0 {
+		t.Fatalf("nil payload: got %d, want 0", got)
+	}
+	if got := payloadMaxTokens(&KiroPayload{}); got != 0 {
+		t.Fatalf("no inference config: got %d, want 0", got)
+	}
+	p := &KiroPayload{InferenceConfig: &InferenceConfig{MaxTokens: 8192}}
+	if got := payloadMaxTokens(p); got != 8192 {
+		t.Fatalf("got %d, want 8192", got)
+	}
+}

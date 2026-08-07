@@ -488,6 +488,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// banned address cannot reach auth, the admin panel, or the upstream call path.
 	// /health and /status stay reachable so external monitors keep working.
 	if h.ipBanGate != nil && path != "/health" && path != "/status" && h.ipBanGate.isBanned(clientIP) {
+		// Log it: a banned address is rejected before auth and before the request log,
+		// so this used to leave no trace anywhere. Users reporting "429" are sometimes
+		// actually hitting this 403 (auto-ban after GetBanThreshold() bad keys within
+		// failWindow) — naming the ip lets an operator unban from the admin panel.
+		logger.Warnf("[Guard] blocked banned IP: ip=%s path=%s (unban via the admin panel IP ban list)", clientIP, path)
 		h.ipBanGate.reject(w)
 		return
 	}
@@ -499,6 +504,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 延迟的请求长时间占用 KIRO_MAX_CONCURRENT 槽位而饿死其他客户端。
 	if h.guard != nil && isGuardedAPIPath(path) {
 		if !h.guard.allowIP(clientIP) {
+			// Log it. This rejection happens BEFORE authentication, so there is no
+			// apiKeyID to attribute it to and it cannot reach the per-key request log
+			// — which used to make it completely invisible: users saw 429s while the
+			// admin API Log showed nothing at all. The warning names the limit and the
+			// env var so an operator can act on it without reading the source.
+			// Note KIRO_TRUST_PROXY defaults to false: behind a reverse proxy every
+			// client collapses into one bucket, turning this per-IP cap into a global one.
+			logger.Warnf("[Guard] per-IP rate limit hit: ip=%s path=%s limit=%d/min (raise KIRO_IP_RPM; set KIRO_TRUST_PROXY=true if behind a reverse proxy)",
+				clientIP, path, h.guard.ipRPM)
 			h.sendGuardError(w, path, http.StatusTooManyRequests, "rate_limit_error", "Too many requests from your address")
 			return
 		}
@@ -1669,9 +1683,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		h.promptCache.Update(account.ID, cacheProfile)
 		logSuspiciousReq("claude", model, inputTokens, outputTokens, len(toolUses) > 0)
 
-		stopReason := "end_turn"
-		if len(toolUses) > 0 {
-			stopReason = "tool_use"
+		stopReason := claudeStopReason(toolUses, outputTokens, payloadMaxTokens(payload))
+		if stopReason == "max_tokens" {
+			logger.Debugf("[Stream] claude turn truncated at max_tokens: model=%s output=%d max=%d", model, outputTokens, payloadMaxTokens(payload))
 		}
 
 		ensureMessageStart()
@@ -1985,6 +1999,11 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 
 		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
+		// KiroToClaudeResponse cannot see max_tokens, so correct the stop_reason here
+		// rather than widening its signature (it is also used by the notice paths that
+		// have no payload). Without this a truncated answer reports "end_turn" and the
+		// client treats a cut-off response as a clean finish.
+		resp.StopReason = claudeStopReason(toolUses, outputTokens, payloadMaxTokens(payload))
 		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
@@ -2508,6 +2527,10 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		finishReason := "stop"
 		if len(toolCalls) > 0 {
 			finishReason = "tool_calls"
+		} else if hitMaxTokens(outputTokens, payloadMaxTokens(payload)) {
+			// Mirror the Claude path: a truncated response must not report "stop",
+			// or the client treats a cut-off answer as a complete one.
+			finishReason = "length"
 		}
 
 		chunk := map[string]interface{}{
@@ -2534,13 +2557,18 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	if lastErr == nil {
+		h.recordFailureForApiKey(apiKeyID, "openai", model, 503, "No available accounts", startedAt, "")
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
 
-	h.recordFailure()
+	// Use recordFailureForApiKey, not the bare recordFailure: the latter only bumps the
+	// global counter, so an upstream quota 429 on streaming /v1/chat/completions was
+	// written nowhere — not the request log, not the per-key SSE feed. Every sibling
+	// handler (Claude stream/non-stream, OpenAI non-stream, /v1/responses) logs here.
 	status := statusForUpstreamError(lastErr)
 	applyRetryAfterHeader(w, lastErr)
+	h.recordFailureForApiKey(apiKeyID, "openai", model, status, lastErr.Error(), startedAt, "")
 	h.sendOpenAIError(w, status, errorTypeForOpenAIStatus(status), lastErr.Error())
 }
 
@@ -2624,6 +2652,12 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
+		// Surface truncation instead of reporting a clean "stop" — see claudeStopReason.
+		if len(toolUses) == 0 && hitMaxTokens(outputTokens, payloadMaxTokens(payload)) {
+			if choices, ok := resp["choices"].([]map[string]interface{}); ok && len(choices) > 0 {
+				choices[0]["finish_reason"] = "length"
+			}
+		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(resp)
 		return
