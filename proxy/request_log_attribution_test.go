@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -174,6 +175,72 @@ func TestCacheTokensAreReportedWithoutChangingTotals(t *testing.T) {
 	}
 }
 
+// The admin table needs a breakdown that adds up. UncachedInputTokens is the
+// fresh part of the prompt, so the four token columns are disjoint and sum to
+// Total — without disturbing InputTokens, which the quota and /check both read.
+func TestUncachedInputTokensCompleteTheBreakdown(t *testing.T) {
+	mustInitConfig(t)
+	h := &Handler{}
+
+	entry := logEntryAfter(t, func() {
+		h.recordSuccessForApiKey("", requestUsage{
+			Input:      1000,
+			Output:     200,
+			CacheRead:  700,
+			CacheWrite: 100,
+		}, "claude-test", nil, "claude", time.Time{})
+	})
+
+	if entry.UncachedInputTokens != 200 {
+		t.Fatalf("uncached input must be input-cacheRead-cacheWrite, got %d", entry.UncachedInputTokens)
+	}
+	// The whole point of the field: these four columns must reconcile.
+	sum := entry.UncachedInputTokens + entry.CacheReadTokens + entry.CacheWriteTokens + entry.OutputTokens
+	if sum != entry.TotalTokens {
+		t.Fatalf("breakdown must sum to total: %d != %d", sum, entry.TotalTokens)
+	}
+	// InputTokens stays the raw prompt size so quota accounting is untouched.
+	if entry.InputTokens != 1000 {
+		t.Fatalf("input must stay the full prompt, got %d", entry.InputTokens)
+	}
+}
+
+// Cache counts are estimated on some paths, so they could exceed the recorded
+// prompt size. That must clamp to zero rather than render a negative column.
+func TestUncachedInputTokensNeverGoNegative(t *testing.T) {
+	mustInitConfig(t)
+	h := &Handler{}
+
+	entry := logEntryAfter(t, func() {
+		h.recordSuccessForApiKey("", requestUsage{
+			Input:      100,
+			Output:     10,
+			CacheRead:  900,
+			CacheWrite: 50,
+		}, "claude-test", nil, "claude", time.Time{})
+	})
+
+	if entry.UncachedInputTokens != 0 {
+		t.Fatalf("uncached input must clamp at zero, got %d", entry.UncachedInputTokens)
+	}
+}
+
+// A request with no cache activity must report the whole prompt as uncached, so
+// the In column is unchanged for the OpenAI/Responses paths that never track cache.
+func TestUncachedInputEqualsInputWithoutCache(t *testing.T) {
+	mustInitConfig(t)
+	h := &Handler{}
+
+	entry := logEntryAfter(t, func() {
+		h.recordSuccessForApiKey("", requestUsage{Input: 500, Output: 40},
+			"claude-test", nil, "claude", time.Time{})
+	})
+
+	if entry.UncachedInputTokens != 500 {
+		t.Fatalf("with no cache traffic uncached input must equal input, got %d", entry.UncachedInputTokens)
+	}
+}
+
 // ClientIP is admin-only. The customer-facing self-service log must not carry it
 // even though it sits on the same underlying entry.
 func TestSelfServiceLogsOmitClientIP(t *testing.T) {
@@ -202,5 +269,45 @@ func TestSelfServiceLogsOmitClientIP(t *testing.T) {
 	}
 	if strings.Contains(body, "203.0.113.200") || strings.Contains(body, "clientIp") {
 		t.Fatalf("client IP must not leak to the key owner:\n%s", body)
+	}
+}
+
+// The admin breakdown was added by deriving a new field, deliberately leaving
+// InputTokens alone, because the customer-facing /check view reports it directly.
+// This pins that: the self-service row keeps showing the full prompt size, and the
+// admin-only uncached field does not leak into it.
+func TestSelfServiceInputTokensStayTheFullPrompt(t *testing.T) {
+	mustInitConfig(t)
+	created, err := config.AddApiKey(config.ApiKeyEntry{Name: "cust2", Key: "sk-cust2", Enabled: true})
+	if err != nil {
+		t.Fatalf("seed key: %v", err)
+	}
+
+	h := &Handler{}
+	requestLog.reset()
+	h.recordSuccessForApiKey(created.ID, requestUsage{
+		Input:      1000,
+		Output:     200,
+		CacheRead:  700,
+		CacheWrite: 100,
+	}, "claude-test", nil, "claude", time.Time{})
+
+	views := h.usageLogsForKey(created.ID, 10)
+	if len(views) != 1 {
+		t.Fatalf("expected exactly one row for the key, got %d", len(views))
+	}
+	if views[0].InputTokens != 1000 {
+		t.Fatalf("/check must keep reporting the full prompt size, got %d", views[0].InputTokens)
+	}
+	if views[0].OutputTokens != 200 {
+		t.Fatalf("/check output tokens changed, got %d", views[0].OutputTokens)
+	}
+
+	raw, err := json.Marshal(views[0])
+	if err != nil {
+		t.Fatalf("marshal view: %v", err)
+	}
+	if strings.Contains(string(raw), "uncachedInputTokens") {
+		t.Fatalf("the admin-only uncached field must not reach /check:\n%s", raw)
 	}
 }

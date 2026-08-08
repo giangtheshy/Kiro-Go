@@ -22,11 +22,25 @@ type RequestLogEntry struct {
 	Model            string  `json:"model,omitempty"`
 	AccountID        string  `json:"accountId,omitempty"`
 	AccountEmail     string  `json:"accountEmail,omitempty"`
-	InputTokens      int     `json:"inputTokens"`
-	OutputTokens     int     `json:"outputTokens"`
-	CacheReadTokens  int     `json:"cacheReadTokens,omitempty"`  // prompt-cache read tokens
-	CacheWriteTokens int     `json:"cacheWriteTokens,omitempty"` // prompt-cache write tokens
-	TotalTokens      int     `json:"totalTokens"`
+	// InputTokens is the FULL prompt size, cache traffic included. It is what the
+	// upstream charged and what the per-key quota counts, so it stays the raw
+	// total — the self-service /check view reports this field directly.
+	InputTokens  int `json:"inputTokens"`
+	OutputTokens int `json:"outputTokens"`
+	// UncachedInputTokens is InputTokens with the cache traffic taken out, i.e.
+	// the freshly-processed part of the prompt. Derived in logRequest, never set
+	// by callers.
+	//
+	// It exists because "input" means two different things in this codebase and
+	// the admin table needs the one that adds up: this field plus CacheRead plus
+	// CacheWrite plus Output equals TotalTokens, so an operator can read the
+	// breakdown as four disjoint parts. It also matches the input_tokens the
+	// client itself receives (see billedClaudeInputTokens), which InputTokens
+	// does not.
+	UncachedInputTokens int `json:"uncachedInputTokens"`
+	CacheReadTokens     int `json:"cacheReadTokens,omitempty"`  // prompt-cache read tokens
+	CacheWriteTokens    int `json:"cacheWriteTokens,omitempty"` // prompt-cache write tokens
+	TotalTokens         int `json:"totalTokens"`
 	Credits          float64 `json:"credits"`
 	DurationMs       int64   `json:"durationMs"`
 	StatusCode       int     `json:"statusCode,omitempty"` // upstream/HTTP status on error
@@ -151,6 +165,10 @@ func logRequest(e RequestLogEntry) {
 		e.Status = "ok"
 	}
 	e.TotalTokens = e.InputTokens + e.OutputTokens
+	// Derived centrally so every serving path gets it, and clamped at zero: the
+	// cache counts come from an estimator on some paths and could in principle
+	// exceed the recorded prompt size, which must not render as a negative column.
+	e.UncachedInputTokens = maxInt(e.InputTokens-e.CacheReadTokens-e.CacheWriteTokens, 0)
 	requestLog.add(e)
 }
 

@@ -582,6 +582,7 @@
   "apilog.colCache": "缓存 读/写",
   "apilog.cacheRead": "缓存读取 Token",
   "apilog.cacheWrite": "缓存写入 Token",
+  "apilog.inUncached": "未缓存的输入 Token（仅新处理的提示词；缓存读/写单独显示，输入 + 缓存读 + 缓存写 + 输出 = 总计）",
   "apilog.colCredits": "Credit",
   "apilog.colDuration": "耗时",
   "apilog.colDetail": "详情",

@@ -602,6 +602,7 @@
   "apilog.colCache": "Cache R/W",
   "apilog.cacheRead": "Cache read tokens",
   "apilog.cacheWrite": "Cache write tokens",
+  "apilog.inUncached": "Uncached input tokens (fresh prompt only; cache read/write are shown separately, and In + Cache R + Cache W + Out = Total)",
   "apilog.colCredits": "Credits",
   "apilog.colDuration": "Duration",
   "apilog.colDetail": "Detail",

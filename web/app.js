@@ -4046,6 +4046,14 @@
         : dash;
       const durationCell = e.durationMs ? escapeHtml(formatNumber(e.durationMs)) + 'ms' : dash;
       const numOrDash = v => (isError && !v) ? dash : escapeHtml(formatNumber(v || 0));
+      // The In column shows the UNCACHED prompt only, so the four token columns
+      // are disjoint and In + Cache R + Cache W + Out == Total. inputTokens is the
+      // full prompt with cache included, which is what the quota counts; showing
+      // that here instead made the row look like it did not add up.
+      // Older entries in the ring predate the field, so fall back to deriving it.
+      const uncachedIn = e.uncachedInputTokens != null
+        ? e.uncachedInputTokens
+        : Math.max((e.inputTokens || 0) - (e.cacheReadTokens || 0) - (e.cacheWriteTokens || 0), 0);
       // Prompt-cache traffic. Only the Claude paths track it, so a request with
       // no cache activity shows a dash rather than a misleading "0 / 0".
       const cacheCell = (e.cacheReadTokens || e.cacheWriteTokens)
@@ -4068,7 +4076,7 @@
         '<td>' + ipCell + '</td>' +
         '<td class="text-xs">' + escapeHtml(e.model || '') + '</td>' +
         '<td>' + (isError ? dash : accountLabel) + '</td>' +
-        '<td class="num text-xs"><span style="color:#22c55e;">&#9660; ' + numOrDash(e.inputTokens) + '</span> / <span style="color:#f59e0b;">&#9650; ' + numOrDash(e.outputTokens) + '</span></td>' +
+        '<td class="num text-xs"><span style="color:#22c55e;" title="' + escapeAttr(t('apilog.inUncached')) + '">&#9660; ' + numOrDash(uncachedIn) + '</span> / <span style="color:#f59e0b;">&#9650; ' + numOrDash(e.outputTokens) + '</span></td>' +
         '<td class="num text-xs">' + cacheCell + '</td>' +
         '<td class="num">' + numOrDash(e.totalTokens) + '</td>' +
         '<td class="num">' + numOrDash(e.credits) + '</td>' +
@@ -4105,7 +4113,10 @@
     if (!entries.length) { toast(t('logs.exportFailed'), 'error'); return; }
     let blob;
     if (format === 'csv') {
-      const cols = ['time', 'status', 'endpoint', 'apiKeyName', 'apiKeyMasked', 'clientIp', 'model', 'accountEmail', 'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'totalTokens', 'credits', 'durationMs', 'statusCode', 'error'];
+      // inputTokens is the full prompt (cache included) and uncachedInputTokens is
+      // the fresh part; both are exported so a spreadsheet can reconcile either
+      // against the quota or against the disjoint breakdown.
+      const cols = ['time', 'status', 'endpoint', 'apiKeyName', 'apiKeyMasked', 'clientIp', 'model', 'accountEmail', 'inputTokens', 'uncachedInputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'totalTokens', 'credits', 'durationMs', 'statusCode', 'error'];
       const esc = v => {
         const s = String(v == null ? '' : v);
         return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;

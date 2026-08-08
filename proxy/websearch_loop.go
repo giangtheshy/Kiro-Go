@@ -27,6 +27,13 @@ type webSearchRoundOutcome struct {
 	inputTokens        int
 	credits            float64
 	stopReasonOverride string
+	// upstreamStopReason carries metadataEvent.stopReason verbatim (END_TURN,
+	// MAX_TOKENS, ...) when the upstream sent one. Kiro enforces its OWN output
+	// ceiling, unrelated to the client's max_tokens, so a turn it cuts short looks
+	// well under the limit and would otherwise be flushed as a clean end_turn —
+	// the client believes the answer finished and stops. This is the only in-band
+	// signal that distinguishes the two.
+	upstreamStopReason string
 	// truncated marks a round whose stream ended mid-turn. Its text and toolUses
 	// are partial, so they must not drive a search decision or be written into
 	// history — see runWebSearchLoop.
@@ -64,6 +71,7 @@ func (h *Handler) callUpstreamForWebSearch(req *ClaudeRequest, thinking bool, ap
 			OnComplete:  func(inTok, _ int) { round.inputTokens = inTok },
 			OnCredits:   func(c float64) { round.credits = c },
 			OnTruncated: func() { round.truncated = true },
+			OnStopReason: func(reason string) { round.upstreamStopReason = reason },
 		}
 
 		if err := CallKiroAPI(account, payload, callback); err != nil {
@@ -165,7 +173,13 @@ func appendSearchRound(req *ClaudeRequest, round *webSearchRoundOutcome, searche
 //
 // Only CLIENT tools produce a tool_use the client must act on; web_search has
 // already been consumed internally, so a web_search-only round ends the turn.
-func resolveFlushStopReason(override string, toolUses []KiroToolUse, content []map[string]interface{}) string {
+//
+// Precedence is deliberate. A pending client tool_use outranks the upstream's
+// stopReason: the client MUST be told to run that tool, and reporting max_tokens
+// instead would strand the tool call. The upstream reason is consulted only once
+// no tool is owed, where it is the difference between a turn Kiro cut at its own
+// output ceiling and one the model chose to end.
+func resolveFlushStopReason(override, upstream string, toolUses []KiroToolUse, content []map[string]interface{}) string {
 	if override != "" {
 		return override
 	}
@@ -180,6 +194,15 @@ func resolveFlushStopReason(override string, toolUses []KiroToolUse, content []m
 		if tu.Name != webSearchToolName {
 			return "tool_use"
 		}
+	}
+	// No client tool is owed. "tool_use" is therefore unreachable as an answer
+	// here even if the upstream says so — claiming it would leave the client
+	// blocked on a tool it never received — so only the terminal reasons map.
+	switch upstreamStopReasonToClaude(upstream) {
+	case "max_tokens":
+		return "max_tokens"
+	case "stop_sequence":
+		return "stop_sequence"
 	}
 	return "end_turn"
 }
@@ -278,7 +301,11 @@ func (h *Handler) runWebSearchLoop(
 		}
 
 		content := buildFlushContent(presentation, round.text, round.toolUses)
-		stopReason := resolveFlushStopReason(round.stopReasonOverride, round.toolUses, content)
+		stopReason := resolveFlushStopReason(round.stopReasonOverride, round.upstreamStopReason, round.toolUses, content)
+		if stopReason == "max_tokens" {
+			logger.Warnf("[WebSearch] round %d hit the upstream output ceiling (upstream=%q); reporting max_tokens so the client continues",
+				roundIdx, round.upstreamStopReason)
+		}
 		h.flushWebSearchLoop(w, req, content, stopReason, totalInputTokens, estimatedInputTokens,
 			searchCount, apiKeyID, startedAt, clientIP, lastAccount, totalCredits, false)
 		return

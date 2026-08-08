@@ -602,6 +602,7 @@
   "apilog.colCache": "Cache Đọc/Ghi",
   "apilog.cacheRead": "Token đọc từ cache",
   "apilog.cacheWrite": "Token ghi vào cache",
+  "apilog.inUncached": "Token đầu vào chưa cache (chỉ phần prompt xử lý mới; cache đọc/ghi hiển thị riêng, Vào + Cache Đọc + Cache Ghi + Ra = Tổng)",
   "apilog.colCredits": "Credits",
   "apilog.colDuration": "Thời lượng",
   "apilog.colDetail": "Chi tiết",

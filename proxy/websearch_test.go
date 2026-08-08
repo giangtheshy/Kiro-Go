@@ -306,18 +306,57 @@ func TestResolveFlushStopReason(t *testing.T) {
 	clientTool := KiroToolUse{Name: "bash"}
 
 	// web_search was consumed internally, so the client has nothing left to do.
-	if got := resolveFlushStopReason("", []KiroToolUse{search}, nil); got != "end_turn" {
+	if got := resolveFlushStopReason("", "", []KiroToolUse{search}, nil); got != "end_turn" {
 		t.Fatalf("web_search-only should end the turn, got %q", got)
 	}
-	if got := resolveFlushStopReason("", []KiroToolUse{clientTool}, nil); got != "tool_use" {
+	if got := resolveFlushStopReason("", "", []KiroToolUse{clientTool}, nil); got != "tool_use" {
 		t.Fatalf("a client tool requires tool_use, got %q", got)
 	}
 	content := []map[string]interface{}{{"type": "tool_use", "name": "bash"}}
-	if got := resolveFlushStopReason("", nil, content); got != "tool_use" {
+	if got := resolveFlushStopReason("", "", nil, content); got != "tool_use" {
 		t.Fatalf("a client tool in content requires tool_use, got %q", got)
 	}
-	if got := resolveFlushStopReason("max_tokens", []KiroToolUse{clientTool}, nil); got != "max_tokens" {
+	if got := resolveFlushStopReason("max_tokens", "", []KiroToolUse{clientTool}, nil); got != "max_tokens" {
 		t.Fatalf("an explicit override must win, got %q", got)
+	}
+}
+
+// The websearch loop was the one serving path left without the upstream
+// stopReason wiring: a turn Kiro cut at its own output ceiling was flushed as a
+// clean end_turn, so the client believed the answer finished and stopped.
+func TestResolveFlushStopReasonHonoursUpstream(t *testing.T) {
+	search := KiroToolUse{Name: "web_search"}
+	clientTool := KiroToolUse{Name: "bash"}
+
+	if got := resolveFlushStopReason("", "MAX_TOKENS", []KiroToolUse{search}, nil); got != "max_tokens" {
+		t.Fatalf("upstream MAX_TOKENS must surface as max_tokens, got %q", got)
+	}
+	if got := resolveFlushStopReason("", "END_TURN", []KiroToolUse{search}, nil); got != "end_turn" {
+		t.Fatalf("upstream END_TURN stays end_turn, got %q", got)
+	}
+	if got := resolveFlushStopReason("", "STOP_SEQUENCE", nil, nil); got != "stop_sequence" {
+		t.Fatalf("upstream STOP_SEQUENCE must map through, got %q", got)
+	}
+	// An unknown or absent reason must not invent a verdict.
+	if got := resolveFlushStopReason("", "SOMETHING_NEW", nil, nil); got != "end_turn" {
+		t.Fatalf("an unknown upstream reason falls back to end_turn, got %q", got)
+	}
+
+	// Precedence: a pending client tool_use outranks the upstream reason. Answering
+	// max_tokens here would strand the tool call — the client would never run it.
+	if got := resolveFlushStopReason("", "MAX_TOKENS", []KiroToolUse{clientTool}, nil); got != "tool_use" {
+		t.Fatalf("a client tool must outrank upstream MAX_TOKENS, got %q", got)
+	}
+	content := []map[string]interface{}{{"type": "tool_use", "name": "bash"}}
+	if got := resolveFlushStopReason("", "MAX_TOKENS", nil, content); got != "tool_use" {
+		t.Fatalf("a client tool in content must outrank upstream MAX_TOKENS, got %q", got)
+	}
+
+	// Upstream TOOL_USE with no client tool left to forward must NOT claim
+	// tool_use: web_search was consumed internally, so there is no tool_use block
+	// for the client to act on and it would block forever waiting for one.
+	if got := resolveFlushStopReason("", "TOOL_USE", []KiroToolUse{search}, nil); got != "end_turn" {
+		t.Fatalf("upstream TOOL_USE without a forwarded tool must end the turn, got %q", got)
 	}
 }
 
