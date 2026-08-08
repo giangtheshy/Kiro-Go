@@ -220,7 +220,14 @@ func TestRouteWritesUnauthorizedClaude(t *testing.T) {
 	}
 }
 
-func TestRouteOverLimitRendersNoticeOpenAI(t *testing.T) {
+// An over-limit key must be reported as HTTP 429, not as a 200 assistant message.
+//
+// The 200 shape is what made agentic clients hallucinate: a 200 is
+// indistinguishable from model output, so the client fed the notice sentence back
+// into the model, which then reasoned about "exhausted credentials" as though that
+// were the task it had been given. A 429 is unambiguously transport, and clients
+// already know how to back off and retry it.
+func TestRouteOverLimitReturns429OpenAI(t *testing.T) {
 	mustInitConfig(t)
 	created, err := config.AddApiKey(config.ApiKeyEntry{
 		Name: "openai", Key: "sk-openai", Enabled: true, TokenLimit: 50,
@@ -242,11 +249,128 @@ func TestRouteOverLimitRendersNoticeOpenAI(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	r.Header.Set("Authorization", "Bearer sk-openai")
 	h.ServeHTTP(rec, r)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 for an over-limit key, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	// The operator's custom message still reaches the client — as an error message.
+	if !strings.Contains(rec.Body.String(), "quota gone, renew via bot") {
+		t.Fatalf("expected the configured message in the error body, got %s", rec.Body.String())
+	}
+	// Shaped as an error envelope, not an assistant turn.
+	if !strings.Contains(rec.Body.String(), `"error"`) {
+		t.Fatalf("expected an error envelope, got %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), `"choices"`) {
+		t.Fatalf("a blocked key must not produce an assistant reply: %s", rec.Body.String())
+	}
+	// Retry-After bounds how fast the client comes back.
+	if got := rec.Header().Get("Retry-After"); got == "" {
+		t.Fatal("expected a Retry-After header on a quota 429")
+	}
+}
+
+// The legacy 200-assistant-message shape stays reachable for clients that cannot
+// display an error body, but only when explicitly opted into.
+func TestRouteOverLimitLegacyNoticeShapeOptIn(t *testing.T) {
+	mustInitConfig(t)
+	created, err := config.AddApiKey(config.ApiKeyEntry{
+		Name: "openai", Key: "sk-legacy", Enabled: true, TokenLimit: 50,
+	})
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := config.RecordApiKeyUsage(created.ID, 50, 0, "", false); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	if err := config.SetLimitNoticeMessage("quota gone, renew via bot"); err != nil {
+		t.Fatalf("set notice: %v", err)
+	}
+	if err := config.SetLimitNoticeAsError(false); err != nil {
+		t.Fatalf("opt into legacy notice: %v", err)
+	}
+	requireAuth(t)
+
+	h := &Handler{}
+	rec := httptest.NewRecorder()
+	body := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	r.Header.Set("Authorization", "Bearer sk-legacy")
+	h.ServeHTTP(rec, r)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 notice reply, got %d body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("legacy mode should still answer 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
 	if !strings.Contains(rec.Body.String(), "quota gone, renew via bot") {
 		t.Fatalf("expected notice message in body, got %s", rec.Body.String())
+	}
+}
+
+// Each block reason maps to the status that describes it, so a client can tell
+// "retry later" from "this will never work".
+func TestBlockedKeyStatusPerReason(t *testing.T) {
+	cases := []struct {
+		name       string
+		entry      config.ApiKeyEntry
+		usedTokens int64
+		wantStatus int
+		wantInMsg  string
+	}{
+		{
+			name:       "over limit is retryable",
+			entry:      config.ApiKeyEntry{Name: "q", Key: "sk-quota", Enabled: true, TokenLimit: 10},
+			usedTokens: 10,
+			wantStatus: http.StatusTooManyRequests,
+			wantInMsg:  "quota",
+		},
+		{
+			name:       "disabled is refused on purpose",
+			entry:      config.ApiKeyEntry{Name: "d", Key: "sk-disabled", Enabled: false},
+			wantStatus: http.StatusForbidden,
+			wantInMsg:  "disabled",
+		},
+		{
+			name:       "expired is an auth problem",
+			entry:      config.ApiKeyEntry{Name: "e", Key: "sk-expired", Enabled: true, ExpiresAt: 1},
+			wantStatus: http.StatusUnauthorized,
+			wantInMsg:  "expired",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mustInitConfig(t)
+			created, err := config.AddApiKey(tc.entry)
+			if err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			if tc.usedTokens > 0 {
+				if err := config.RecordApiKeyUsage(created.ID, tc.usedTokens, 0, "", false); err != nil {
+					t.Fatalf("record: %v", err)
+				}
+			}
+			requireAuth(t)
+
+			h := &Handler{}
+			rec := httptest.NewRecorder()
+			body := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+			r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+			r.Header.Set("Authorization", "Bearer "+tc.entry.Key)
+			h.ServeHTTP(rec, r)
+
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d, body=%s", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if !strings.Contains(strings.ToLower(rec.Body.String()), tc.wantInMsg) {
+				t.Fatalf("message should mention %q, got %s", tc.wantInMsg, rec.Body.String())
+			}
+			// Only a quota block invites a retry; the others must not.
+			retryAfter := rec.Header().Get("Retry-After")
+			if tc.wantStatus == http.StatusTooManyRequests && retryAfter == "" {
+				t.Error("expected Retry-After on a quota block")
+			}
+			if tc.wantStatus != http.StatusTooManyRequests && retryAfter != "" {
+				t.Errorf("a permanent block must not advertise Retry-After, got %q", retryAfter)
+			}
+		})
 	}
 }
 

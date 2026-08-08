@@ -247,7 +247,7 @@ func TestBug2GlobalSlotHeldDuringThrottleSleep(t *testing.T) {
 	}
 
 	// One unrelated, non-throttled key (RPMLimit=0). It is made over-limit so that once
-	// it is admitted past the guard it renders a fast 200 notice reply WITHOUT touching
+	// it is admitted past the guard it fails fast at auth (429, quota) WITHOUT touching
 	// upstream — the only thing under test is that it is NOT 503'd while others sleep.
 	unrelated, err := config.AddApiKey(config.ApiKeyEntry{
 		Name: "unrelated", Key: "sk-unrelated", Enabled: true, TokenLimit: 1,

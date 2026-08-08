@@ -1482,6 +1482,8 @@
     $('maxPayloadBytes').value = String(d.maxPayloadBytes || 2000000);
     if ($('publicBaseURL')) $('publicBaseURL').value = d.publicBaseURL || '';
     if ($('limitNoticeMessage')) $('limitNoticeMessage').value = d.limitNoticeMessage || '';
+    // Defaults to true when the server omits it, matching config.GetLimitNoticeAsError.
+    if ($('limitNoticeAsError')) $('limitNoticeAsError').checked = d.limitNoticeAsError !== false;
     populateForceModelOptions(d.forceModel || '');
     populateIdentityModelOptions(d.identityModel || '');
     await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadProxyPool(), loadPromptFilter(), loadApiKeys()]);
@@ -1588,8 +1590,12 @@
   }
   async function saveLimitNotice() {
     const msg = $('limitNoticeMessage').value.trim();
+    const asError = $('limitNoticeAsError') ? !!$('limitNoticeAsError').checked : true;
     try {
-      const res = await api('/settings', { method: 'POST', body: JSON.stringify({ limitNoticeMessage: msg }) });
+      const res = await api('/settings', {
+        method: 'POST',
+        body: JSON.stringify({ limitNoticeMessage: msg, limitNoticeAsError: asError }),
+      });
       const d = await res.json().catch(() => ({}));
       if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
       toast(t('settings.limitNoticeSaved'), 'success');

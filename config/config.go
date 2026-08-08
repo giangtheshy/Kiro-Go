@@ -396,10 +396,23 @@ type Config struct {
 	TotalTokens     int64   `json:"totalTokens,omitempty"`     // Total tokens processed
 	TotalCredits    float64 `json:"totalCredits,omitempty"`    // Total credits consumed
 
-	// LimitNoticeMessage is a friendly in-chat reply shown to a client whose key is
-	// blocked (disabled/expired/over-limit/IP-denied) instead of a 401/429 error.
-	// Empty falls back to a built-in default at render time.
+	// LimitNoticeMessage is the message shown to a client whose key is blocked
+	// (disabled/expired/over-limit/IP-denied). Empty falls back to a per-reason
+	// default at render time. Keep it short: it is delivered as an HTTP error
+	// message, and long prose invites coding agents to reason about it as content.
 	LimitNoticeMessage string `json:"limitNoticeMessage,omitempty"`
+
+	// LimitNoticeAsError controls how a blocked key is reported. Default true:
+	// a real HTTP error (429 quota / 401 expired / 403 disabled-or-IP-denied), which
+	// clients retry or surface correctly.
+	//
+	// Set false to restore the legacy behaviour of answering HTTP 200 with the notice
+	// text as an assistant message. That shape is why agentic clients hallucinated:
+	// a 200 is indistinguishable from model output, so the client fed the sentence
+	// back to the model, which reasoned about exhausted credentials as if that were
+	// the task. Kept only as an escape hatch for clients that cannot show an error
+	// body at all.
+	LimitNoticeAsError *bool `json:"limitNoticeAsError,omitempty"`
 
 	// ForceModel, when non-empty, overrides the model of EVERY incoming request
 	// (after thinking-suffix parsing) with this Kiro model ID. It takes precedence
@@ -1199,15 +1212,34 @@ func UpdateThinkingConfig(suffix, openaiFormat, claudeFormat string) error {
 }
 
 // defaultLimitNoticeMessage is served when no custom LimitNoticeMessage is configured.
-const defaultLimitNoticeMessage = "Your API key has reached its limit or has expired. Please contact the administrator to renew it."
+//
+// Kept short and machine-readable on purpose. It travels as an HTTP error message,
+// where a long prose sentence is actively harmful: coding agents feed the text back
+// into the model, which then reasons about it as if it were task output ("the
+// credentials are exhausted, so I cannot continue...") instead of treating it as a
+// transport failure. A terse quota statement gives the client nothing to narrate.
+const defaultLimitNoticeMessage = "API key quota exceeded"
 
 // GetLimitNoticeMessage returns the configured limit-notice message, or the built-in
 // default when none is set.
 func GetLimitNoticeMessage() string {
+	return LimitNoticeMessageOr(defaultLimitNoticeMessage)
+}
+
+// LimitNoticeMessageOr returns the operator's custom limit message when one is
+// configured, otherwise the caller's more specific default.
+//
+// Callers pass a reason-specific default ("API key has expired", "API key is
+// disabled") so the client is told which of the several block reasons applies,
+// while an operator who set a custom message still sees exactly that message for
+// every reason.
+func LimitNoticeMessageOr(specific string) string {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
-	if strings.TrimSpace(cfg.LimitNoticeMessage) == "" {
-		return defaultLimitNoticeMessage
+	// The cfg == nil guard is not defensive padding: this is reached from the auth
+	// path, which unit tests exercise without calling Init().
+	if cfg == nil || strings.TrimSpace(cfg.LimitNoticeMessage) == "" {
+		return specific
 	}
 	return cfg.LimitNoticeMessage
 }
@@ -1217,6 +1249,26 @@ func SetLimitNoticeMessage(msg string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.LimitNoticeMessage = msg
+	return Save()
+}
+
+// GetLimitNoticeAsError reports whether a blocked key is answered with a real HTTP
+// error (default) rather than a 200 assistant message. See LimitNoticeAsError.
+func GetLimitNoticeAsError() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	// cfg == nil is reached from the auth path in unit tests that never call Init().
+	if cfg == nil || cfg.LimitNoticeAsError == nil {
+		return true
+	}
+	return *cfg.LimitNoticeAsError
+}
+
+// SetLimitNoticeAsError persists how a blocked key is reported to clients.
+func SetLimitNoticeAsError(asError bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.LimitNoticeAsError = &asError
 	return Save()
 }
 

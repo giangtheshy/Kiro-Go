@@ -479,6 +479,15 @@ type KiroStreamCallback struct {
 	// Handlers that report a clean stop here cause the silent-truncation bug,
 	// where a cut-off answer is indistinguishable from a complete one.
 	OnTruncated func()
+
+	// OnStopReason fires when the upstream states, in band, why the turn ended
+	// (metadataEvent.stopReason: END_TURN / MAX_TOKENS / TOOL_USE). This is
+	// authoritative and must win over any local guess: Kiro enforces its OWN
+	// output ceiling, which is unrelated to the client's max_tokens, so a turn
+	// cut short by the server looks well under the client's limit and would
+	// otherwise be reported as a clean end_turn. The client then believes the
+	// answer finished and stops — the silent mid-task stop.
+	OnStopReason func(reason string)
 }
 
 // ==================== API Call ====================
@@ -859,6 +868,12 @@ type StreamOutcome struct {
 	// turn finished — this is the only in-band signal that a stream which
 	// closed cleanly was actually cut short.
 	Metered bool
+	// StopReason carries metadataEvent.stopReason verbatim (END_TURN,
+	// MAX_TOKENS, TOOL_USE, ...) when the upstream sent one, else "". Unlike
+	// Metered this says WHY the turn ended, which a locally-inferred
+	// stop_reason cannot know: Kiro applies its own output limit independent of
+	// the client's max_tokens.
+	StopReason string
 }
 
 // parseEventStream decodes an AWS binary Event Stream response body, discarding
@@ -1009,6 +1024,16 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (Stre
 			if pct, ok := event["contextUsagePercentage"].(float64); ok {
 				if callback.OnContextUsage != nil {
 					callback.OnContextUsage(pct)
+				}
+			}
+		case "metadataEvent":
+			// The upstream's own verdict on why generation stopped. Previously
+			// dropped on the floor, which is what let a server-side cut be
+			// reported to the client as a clean end_turn. See OnStopReason.
+			if reason, ok := event["stopReason"].(string); ok && strings.TrimSpace(reason) != "" {
+				outcome.StopReason = strings.TrimSpace(reason)
+				if callback.OnStopReason != nil {
+					callback.OnStopReason(outcome.StopReason)
 				}
 			}
 		}

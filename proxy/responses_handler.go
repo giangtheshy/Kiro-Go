@@ -127,7 +127,8 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 
 	respID := generateResponseID()
 
-	// Valid-but-blocked key: render the limit-notice as a normal assistant reply.
+	// Legacy escape hatch only — see handleClaudeMessagesInternal. A blocked key
+	// normally fails at auth with a real HTTP error.
 	if limitNoticeRequested(r.Context()) {
 		h.sendResponsesNotice(w, actualModel, req.Stream, config.GetLimitNoticeMessage(), respID, &req)
 		return
@@ -191,6 +192,7 @@ func (h *Handler) handleResponsesNonStream(
 		var credits float64
 		var realInputTokens int
 		var truncated bool
+		var upstreamStopReason string
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -200,10 +202,11 @@ func (h *Handler) handleResponsesNonStream(
 					content += text
 				}
 			},
-			OnToolUse:   func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
-			OnComplete:  func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
-			OnCredits:   func(c float64) { credits = c },
-			OnTruncated: func() { truncated = true },
+			OnToolUse:    func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
+			OnComplete:   func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
+			OnCredits:    func(c float64) { credits = c },
+			OnTruncated:  func() { truncated = true },
+			OnStopReason: func(reason string) { upstreamStopReason = reason },
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
@@ -251,6 +254,10 @@ func (h *Handler) handleResponsesNonStream(
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions
 		respObj.APIKeyID = apiKeyID
+		// The upstream may have stopped at its OWN output ceiling, which sits well
+		// below the client's limit. Saying "completed" there tells the client the
+		// answer is whole and it stops mid-task with nothing to act on.
+		applyResponsesIncomplete(respObj, upstreamStopReason, len(toolUses) > 0, outputTokens, payloadMaxTokens(payload))
 
 		if storeResponse {
 			if saveErr := saveResponse(respObj); saveErr != nil {
@@ -329,6 +336,25 @@ func buildResponsesObject(
 		PreviousResponseID: req.PreviousResponseID,
 		Metadata:           req.Metadata,
 	}
+}
+
+// applyResponsesIncomplete downgrades a response from "completed" to "incomplete"
+// when the turn was actually cut off, attaching the reason.
+//
+// This is the Responses API's only way to say "the output stopped early": there is
+// no finish_reason field. It is separate from the truncation path (a dropped
+// connection), which is a transport failure and becomes response.failed instead.
+// Here the turn ended in an orderly way — the upstream simply hit a limit.
+func applyResponsesIncomplete(respObj *ResponsesObject, upstreamStopReason string, hasToolUses bool, outputTokens, maxTokens int) {
+	if respObj == nil {
+		return
+	}
+	reason := responsesIncompleteReason(upstreamStopReason, hasToolUses, outputTokens, maxTokens)
+	if reason == "" {
+		return
+	}
+	respObj.Status = "incomplete"
+	respObj.IncompleteDetails = &ResponsesIncompleteDetails{Reason: reason}
 }
 
 // sendResponsesNotice returns the limit-notice text as a normal assistant reply in the
@@ -507,14 +533,15 @@ func (h *Handler) handleResponsesStream(
 		})
 
 		var (
-			fullText        strings.Builder
-			reasoningText   strings.Builder
-			toolUses        []KiroToolUse
-			inputTokens     int
-			outputTokens    int
-			credits         float64
-			realInputTokens int
-			truncated       bool
+			fullText           strings.Builder
+			reasoningText      strings.Builder
+			toolUses           []KiroToolUse
+			inputTokens        int
+			outputTokens       int
+			credits            float64
+			realInputTokens    int
+			truncated          bool
+			upstreamStopReason string
 		)
 
 		messageItemID := generateOutputItemID("msg")
@@ -636,9 +663,10 @@ func (h *Handler) handleResponsesStream(
 				outputIndex++
 				responseStarted = true
 			},
-			OnComplete:  func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
-			OnCredits:   func(c float64) { credits = c },
-			OnTruncated: func() { truncated = true },
+			OnComplete:   func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
+			OnCredits:    func(c float64) { credits = c },
+			OnTruncated:  func() { truncated = true },
+			OnStopReason: func(reason string) { upstreamStopReason = reason },
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
@@ -757,6 +785,10 @@ func (h *Handler) handleResponsesStream(
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions
 		respObj.APIKeyID = apiKeyID
+		// The upstream enforces its own output ceiling, well below the client's, so a
+		// turn it cut short must not be announced as completed — the client would
+		// treat a partial answer as whole and stop mid-task with nothing to act on.
+		applyResponsesIncomplete(respObj, upstreamStopReason, len(toolUses) > 0, outputTokens, payloadMaxTokens(payload))
 
 		if storeResponse {
 			if saveErr := saveResponse(respObj); saveErr != nil {
@@ -764,8 +796,22 @@ func (h *Handler) handleResponsesStream(
 			}
 		}
 
-		send("response.completed", map[string]interface{}{
-			"type":     "response.completed",
+		// The terminal event name must agree with the status: the Responses API
+		// spells an early stop as response.incomplete. Emitting response.completed
+		// with status "incomplete" inside it contradicts itself, and clients key off
+		// the event name.
+		terminalEvent := "response.completed"
+		if respObj.Status == "incomplete" {
+			terminalEvent = "response.incomplete"
+			reason := ""
+			if respObj.IncompleteDetails != nil {
+				reason = respObj.IncompleteDetails.Reason
+			}
+			logger.Warnf("[Responses] turn incomplete (%s): model=%s output=%d max=%d upstream=%q",
+				reason, model, outputTokens, payloadMaxTokens(payload), upstreamStopReason)
+		}
+		send(terminalEvent, map[string]interface{}{
+			"type":     terminalEvent,
 			"response": respObj,
 		})
 		fmt.Fprintf(w, "data: [DONE]\n\n")

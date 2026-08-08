@@ -433,9 +433,14 @@
 
           <div class="form-group">
             <label data-i18n="settings.limitNotice"></label>
-            <textarea id="limitNoticeMessage" rows="3" autocomplete="off"
+            <textarea id="limitNoticeMessage" rows="2" autocomplete="off"
               data-i18n-placeholder="settings.limitNoticePlaceholder"></textarea>
             <small data-i18n="settings.limitNoticeHint"></small>
+            <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.5rem;font-weight:normal;">
+              <input type="checkbox" id="limitNoticeAsError" />
+              <span data-i18n="settings.limitNoticeAsError"></span>
+            </label>
+            <small data-i18n="settings.limitNoticeAsErrorHint"></small>
             <button class="btn btn-primary btn-sm" id="saveLimitNoticeBtn" style="margin-top:0.5rem;"
               data-i18n="settings.saveLimitNotice"></button>
           </div>

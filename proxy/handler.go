@@ -412,11 +412,17 @@ func (h *Handler) authenticateForClaude(w http.ResponseWriter, r *http.Request) 
 	entry, err := h.authenticate(r)
 	if err != nil {
 		ae, _ := err.(*authError)
-		if ae != nil && ae.notice {
+		// A blocked-but-valid key is reported as a real HTTP error so the client can
+		// tell transport from content. Only the explicit escape hatch renders it as a
+		// 200 assistant message — see config.LimitNoticeAsError.
+		if ae != nil && ae.notice && !config.GetLimitNoticeAsError() {
 			return withLimitNotice(r)
 		}
 		if ae == nil {
 			ae = newAuthError(http.StatusUnauthorized, "authentication_error", err.Error())
+		}
+		if ae.notice {
+			applyLimitNoticeRetryAfter(w, ae.status)
 		}
 		h.sendClaudeError(w, ae.status, ae.code, ae.message)
 		return nil
@@ -424,16 +430,37 @@ func (h *Handler) authenticateForClaude(w http.ResponseWriter, r *http.Request) 
 	return withApiKeyContext(r, entry)
 }
 
+// applyLimitNoticeRetryAfter advertises a back-off window on a quota block so
+// clients retry on a schedule instead of hammering. Only 429 gets one: 401/403
+// mean "this will not fix itself", and a Retry-After there would invite a loop.
+func applyLimitNoticeRetryAfter(w http.ResponseWriter, status int) {
+	if w == nil || status != http.StatusTooManyRequests {
+		return
+	}
+	if w.Header().Get("Retry-After") == "" {
+		w.Header().Set("Retry-After", limitNoticeRetryAfterSeconds)
+	}
+}
+
+// limitNoticeRetryAfterSeconds is deliberately long: an exhausted key needs an
+// operator to top it up, so a short retry only produces noise.
+const limitNoticeRetryAfterSeconds = "300"
+
 // authenticateForOpenAI runs authenticate and writes an OpenAI-style error on failure.
 func (h *Handler) authenticateForOpenAI(w http.ResponseWriter, r *http.Request) *http.Request {
 	entry, err := h.authenticate(r)
 	if err != nil {
 		ae, _ := err.(*authError)
-		if ae != nil && ae.notice {
+		// See authenticateForClaude: a blocked-but-valid key is an HTTP error unless
+		// the operator explicitly opted back into the 200-assistant-message shape.
+		if ae != nil && ae.notice && !config.GetLimitNoticeAsError() {
 			return withLimitNotice(r)
 		}
 		if ae == nil {
 			ae = newAuthError(http.StatusUnauthorized, "authentication_error", err.Error())
+		}
+		if ae.notice {
+			applyLimitNoticeRetryAfter(w, ae.status)
 		}
 		h.sendOpenAIError(w, ae.status, ae.code, ae.message)
 		return nil
@@ -1196,7 +1223,9 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Valid-but-blocked key: render the limit-notice as a normal assistant reply.
+	// Legacy escape hatch only: a blocked key normally fails at auth with a real HTTP
+	// error. This renders the notice as a 200 assistant reply, which is reachable
+	// solely when limitNoticeAsError is turned off.
 	if limitNoticeRequested(r.Context()) {
 		h.sendClaudeNotice(w, req.Model, req.Stream, config.GetLimitNoticeMessage())
 		return
@@ -1376,6 +1405,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		var realInputTokens int
 		var toolUses []KiroToolUse
 		var truncated bool
+		var upstreamStopReason string
 		var nextContentIndex int
 		var rawContentBuilder strings.Builder
 		var rawThinkingBuilder strings.Builder
@@ -1688,6 +1718,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			OnTruncated: func() {
 				truncated = true
 			},
+			OnStopReason: func(reason string) {
+				upstreamStopReason = reason
+			},
 		}
 
 		// History-fallback aware: tries rich (structured) payload first; if the
@@ -1772,9 +1805,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			return
 		}
 
-		stopReason := claudeStopReason(toolUses, outputTokens, payloadMaxTokens(payload))
+		stopReason := claudeStopReasonWithUpstream(upstreamStopReason, toolUses, outputTokens, payloadMaxTokens(payload))
 		if stopReason == "max_tokens" {
-			logger.Debugf("[Stream] claude turn truncated at max_tokens: model=%s output=%d max=%d", model, outputTokens, payloadMaxTokens(payload))
+			logger.Debugf("[Stream] claude turn truncated at max_tokens: model=%s output=%d max=%d upstream=%q", model, outputTokens, payloadMaxTokens(payload), upstreamStopReason)
 		}
 
 		stream.sendEvent("message_delta", map[string]interface{}{
@@ -2105,6 +2138,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		var credits float64
 		var realInputTokens int
 		var truncated bool
+		var upstreamStopReason string
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -2129,6 +2163,9 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			},
 			OnTruncated: func() {
 				truncated = true
+			},
+			OnStopReason: func(reason string) {
+				upstreamStopReason = reason
 			},
 		}
 
@@ -2204,7 +2241,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		// rather than widening its signature (it is also used by the notice paths that
 		// have no payload). Without this a truncated answer reports "end_turn" and the
 		// client treats a cut-off response as a clean finish.
-		resp.StopReason = claudeStopReason(toolUses, outputTokens, payloadMaxTokens(payload))
+		resp.StopReason = claudeStopReasonWithUpstream(upstreamStopReason, toolUses, outputTokens, payloadMaxTokens(payload))
 		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
@@ -2328,7 +2365,8 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Valid-but-blocked key: render the limit-notice as a normal assistant reply.
+	// Legacy escape hatch only — see handleClaudeMessagesInternal. A blocked key
+	// normally fails at auth with a real HTTP error.
 	if limitNoticeRequested(r.Context()) {
 		h.sendOpenAINotice(w, req.Model, req.Stream, config.GetLimitNoticeMessage())
 		return
@@ -2415,6 +2453,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		var credits float64
 		var realInputTokens int
 		var truncated bool
+		var upstreamStopReason string
 		var rawContentBuilder strings.Builder
 		var rawReasoningBuilder strings.Builder
 		var textBuffer string
@@ -2692,6 +2731,9 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			OnTruncated: func() {
 				truncated = true
 			},
+			OnStopReason: func(reason string) {
+				upstreamStopReason = reason
+			},
 		}
 
 		safeP := payload
@@ -2744,7 +2786,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		logSuspiciousReq("openai", model, inputTokens, outputTokens, len(toolCalls) > 0)
 
-		finishReason := "stop"
+		var finishReason string
 		if truncated {
 			// The upstream died mid-turn. OpenAI's protocol has no way to withhold
 			// finish_reason the way Anthropic does — omitting it entirely trips
@@ -2753,12 +2795,14 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			// finished cleanly.
 			logger.Warnf("[Stream] openai turn truncated mid-generation: model=%s account=%s", model, accountEmailForLog(account))
 			finishReason = "length"
-		} else if len(toolCalls) > 0 {
-			finishReason = "tool_calls"
-		} else if hitMaxTokens(outputTokens, payloadMaxTokens(payload)) {
-			// Mirror the Claude path: a truncated response must not report "stop",
-			// or the client treats a cut-off answer as a complete one.
-			finishReason = "length"
+		} else {
+			// Prefer the upstream's own stopReason over inference: Kiro's output
+			// ceiling is its own, so a server-side cut sits well under the client's
+			// max_tokens and would otherwise be reported as a clean "stop".
+			finishReason = openaiFinishReasonWithUpstream(upstreamStopReason, len(toolCalls) > 0, outputTokens, payloadMaxTokens(payload))
+			if finishReason == "length" {
+				logger.Debugf("[Stream] openai turn truncated: model=%s output=%d max=%d upstream=%q", model, outputTokens, payloadMaxTokens(payload), upstreamStopReason)
+			}
 		}
 
 		chunk := map[string]interface{}{
@@ -2835,6 +2879,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		var credits float64
 		var realInputTokens int
 		var truncated bool
+		var upstreamStopReason string
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -2847,7 +2892,8 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			OnToolUse:   func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
 			OnComplete:  func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:   func(c float64) { credits = c },
-			OnTruncated: func() { truncated = true },
+			OnTruncated:  func() { truncated = true },
+			OnStopReason: func(reason string) { upstreamStopReason = reason },
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
@@ -2897,9 +2943,13 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
 		// Surface truncation instead of reporting a clean "stop" — see claudeStopReason.
-		if len(toolUses) == 0 && hitMaxTokens(outputTokens, payloadMaxTokens(payload)) {
-			if choices, ok := resp["choices"].([]map[string]interface{}); ok && len(choices) > 0 {
-				choices[0]["finish_reason"] = "length"
+		// KiroToOpenAIResponseWithReasoning already sets tool_calls when there are
+		// tool uses, so only the no-tool case needs correcting here.
+		if len(toolUses) == 0 {
+			if fr := openaiFinishReasonWithUpstream(upstreamStopReason, false, outputTokens, payloadMaxTokens(payload)); fr != "stop" {
+				if choices, ok := resp["choices"].([]map[string]interface{}); ok && len(choices) > 0 {
+					choices[0]["finish_reason"] = fr
+				}
 			}
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -4479,6 +4529,7 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"maxPayloadBytes":    config.GetMaxPayloadBytes(),
 		"publicBaseURL":      config.GetPublicBaseURL(),
 		"limitNoticeMessage": config.GetLimitNoticeMessage(),
+		"limitNoticeAsError": config.GetLimitNoticeAsError(),
 		"forceModel":         config.GetForceModel(),
 		"identityModel":      config.GetIdentityModel(),
 	})
@@ -4536,6 +4587,7 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		MaxPayloadBytes    *int    `json:"maxPayloadBytes,omitempty"`
 		PublicBaseURL      *string `json:"publicBaseURL,omitempty"`
 		LimitNoticeMessage *string `json:"limitNoticeMessage,omitempty"`
+		LimitNoticeAsError *bool   `json:"limitNoticeAsError,omitempty"`
 		ForceModel         *string `json:"forceModel,omitempty"`
 		IdentityModel      *string `json:"identityModel,omitempty"`
 	}
@@ -4582,6 +4634,14 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 
 	if req.LimitNoticeMessage != nil {
 		if err := config.SetLimitNoticeMessage(strings.TrimSpace(*req.LimitNoticeMessage)); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	if req.LimitNoticeAsError != nil {
+		if err := config.SetLimitNoticeAsError(*req.LimitNoticeAsError); err != nil {
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return

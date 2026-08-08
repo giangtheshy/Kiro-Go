@@ -27,7 +27,13 @@ type ResponsesObject struct {
 	PreviousResponseID string               `json:"previous_response_id,omitempty"`
 	Metadata           map[string]string    `json:"metadata,omitempty"`
 	Error              *ResponsesError      `json:"error,omitempty"`
-	Instructions       string               `json:"instructions,omitempty"`
+	// IncompleteDetails explains a Status of "incomplete". The Responses API has no
+	// finish_reason: a turn the upstream cut at its own output ceiling is expressed
+	// as status "incomplete" plus reason "max_output_tokens". Reporting such a turn
+	// as "completed" tells an agentic client the answer is whole, so it stops
+	// mid-task without any error to act on.
+	IncompleteDetails *ResponsesIncompleteDetails `json:"incomplete_details,omitempty"`
+	Instructions      string                      `json:"instructions,omitempty"`
 	StoredInput        json.RawMessage      `json:"-"`
 	StoredInstr        string               `json:"-"`
 	StoredAt           int64                `json:"stored_at,omitempty"`
@@ -64,4 +70,11 @@ type ResponsesError struct {
 	Type    string `json:"type"`
 	Code    string `json:"code,omitempty"`
 	Message string `json:"message"`
+}
+
+// ResponsesIncompleteDetails carries the reason a response is "incomplete".
+// Reason values follow the OpenAI Responses API: "max_output_tokens" or
+// "content_filter".
+type ResponsesIncompleteDetails struct {
+	Reason string `json:"reason"`
 }

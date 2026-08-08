@@ -15,9 +15,17 @@ type apiKeyContextKey struct{}
 
 // authError describes why authentication failed. status is the HTTP status code to send.
 //
-// When notice is true the key is VALID but blocked (over-limit, disabled, or expired):
-// callers render the configured limit-notice message as a normal successful chat reply
-// instead of writing an HTTP error. status/code are unused on the notice path.
+// When notice is true the key is VALID but blocked (over-limit, disabled, expired, or
+// IP-denied). Unlike a plain auth failure this is the operator's own gate rather than a
+// bad credential, so the message is operator-facing text.
+//
+// Such a block is reported as a real HTTP error (status/code/message are always
+// populated). It used to be rendered as an HTTP 200 assistant reply carrying the notice
+// text, which is what made agentic clients hallucinate: a 200 is indistinguishable from
+// model output, so the client fed the sentence back to the model, which then reasoned
+// about "exhausted credentials" as though that were the task. An error status is the only
+// thing that tells a client "this is transport, not content" — see
+// config.GetLimitNoticeAsError for the escape hatch back to the old behaviour.
 type authError struct {
 	status  int
 	code    string
@@ -31,10 +39,39 @@ func newAuthError(status int, code, message string) *authError {
 	return &authError{status: status, code: code, message: message}
 }
 
-// newNoticeError signals a valid-but-blocked key. The handler turns this into the
-// limit-notice chat reply once it has parsed the request (model + stream flag).
-func newNoticeError() *authError {
-	return &authError{notice: true}
+// newNoticeError signals a valid-but-blocked key, carrying the HTTP status the client
+// should see. A custom limitNoticeMessage, when configured, replaces the specific text.
+func newNoticeError(status int, code, specificMessage string) *authError {
+	return &authError{
+		status:  status,
+		code:    code,
+		message: config.LimitNoticeMessageOr(specificMessage),
+		notice:  true,
+	}
+}
+
+// Quota exhaustion is reported as 429 rather than a 4xx that reads as "never retry":
+// clients already know how to back off and retry a 429, and an operator topping the key
+// up makes the next attempt succeed. Retry-After bounds how fast that retrying happens.
+func newQuotaExceededError() *authError {
+	return newNoticeError(http.StatusTooManyRequests, "rate_limit_error", "API key quota exceeded")
+}
+
+// Expiry is an authentication problem, and no amount of retrying fixes it — the client
+// should surface it and stop rather than loop.
+func newKeyExpiredError() *authError {
+	return newNoticeError(http.StatusUnauthorized, "authentication_error", "API key has expired")
+}
+
+// A disabled key and an IP-denied key are both "valid credential, refused on purpose",
+// which is precisely 403. Distinguishing them in the message keeps the log actionable
+// without inviting a retry loop.
+func newKeyDisabledError() *authError {
+	return newNoticeError(http.StatusForbidden, "permission_error", "API key is disabled")
+}
+
+func newIPNotAllowedError() *authError {
+	return newNoticeError(http.StatusForbidden, "permission_error", "API key is not allowed from this IP address")
 }
 
 // extractProvidedKey reads the API key from Authorization (Bearer ...) or X-Api-Key header.
@@ -89,14 +126,13 @@ func (h *Handler) authenticate(r *http.Request) (*config.ApiKeyEntry, error) {
 		// customer who fixed a typo is not banned by their own stale counter.
 		h.clearAuthFailures(r)
 		if !entry.Enabled {
-			// Valid key, just disabled → friendly notice instead of a 401 that breaks clients.
-			return nil, newNoticeError()
+			return nil, newKeyDisabledError()
 		}
 		if config.ApiKeyExpired(*entry) {
-			return nil, newNoticeError()
+			return nil, newKeyExpiredError()
 		}
 		if overToken, overCredit := config.ApiKeyOverLimit(*entry); overToken || overCredit {
-			return nil, newNoticeError()
+			return nil, newQuotaExceededError()
 		}
 		// IP 限制：优先用硬性白名单 (IPAllowlist)，非空时只有匹配的 IP/CIDR 才放行，
 		// 其余一律按“被封锁的 key”处理，返回限额提示而非 401。白名单为空时退回到
@@ -108,7 +144,7 @@ func (h *Handler) authenticate(r *http.Request) (*config.ApiKeyEntry, error) {
 				ip = h.resolveClientIP(r)
 			}
 			if !ipMatchesAllowlist(ip, entry.IPAllowlist) {
-				return nil, newNoticeError()
+				return nil, newIPNotAllowedError()
 			}
 		} else if h.ipLimiter != nil && entry.IPLimit > 0 {
 			ip := clientIPFromContext(r.Context())
@@ -116,7 +152,7 @@ func (h *Handler) authenticate(r *http.Request) (*config.ApiKeyEntry, error) {
 				ip = h.resolveClientIP(r)
 			}
 			if !h.ipLimiter.allow(entry.ID, ip, entry.IPLimit) {
-				return nil, newNoticeError()
+				return nil, newIPNotAllowedError()
 			}
 		}
 		// RPM 限速：不拒绝请求，而是按配置的每分钟速率把请求排队延迟，

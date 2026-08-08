@@ -1024,6 +1024,15 @@ func cloneSchemaValue(v interface{}) interface{} {
 func cleanSchema(m map[string]interface{}) {
 	delete(m, "additionalProperties")
 
+	// JSON-Schema meta keys that the native Kiro client never sends. Anthropic
+	// and OpenAI clients routinely include them (Claude Code emits "$schema" on
+	// every tool), and forwarding vocabulary the backend does not expect in a
+	// toolSpecification is a needless difference from real client traffic.
+	// Dropping them is safe: none constrain the arguments a model may produce.
+	delete(m, "$schema")
+	delete(m, "$id")
+	delete(m, "$comment")
+
 	// required 必须是非空数组，否则 Kiro 会报 Improperly formed request。
 	if req, exists := m["required"]; exists {
 		switch arr := req.(type) {
@@ -2336,6 +2345,100 @@ func payloadMaxTokens(payload *KiroPayload) int {
 		return 0
 	}
 	return payload.InferenceConfig.MaxTokens
+}
+
+// upstreamStopReasonToClaude maps metadataEvent.stopReason onto an Anthropic
+// stop_reason, returning "" when the upstream sent nothing recognisable.
+//
+// This is the authoritative signal and the reason the guess below exists at all:
+// Kiro enforces its own output ceiling, unrelated to the client's max_tokens. A
+// turn the server cut short therefore looks comfortably under the client's limit,
+// so inference alone reports a clean "end_turn" and the client stops mid-task
+// believing the answer is complete.
+func upstreamStopReasonToClaude(reason string) string {
+	switch strings.ToUpper(strings.TrimSpace(reason)) {
+	case "END_TURN":
+		return "end_turn"
+	case "MAX_TOKENS":
+		return "max_tokens"
+	case "TOOL_USE":
+		return "tool_use"
+	case "STOP_SEQUENCE":
+		return "stop_sequence"
+	default:
+		// Unknown or absent: the caller falls back to local inference rather
+		// than inventing a reason from a value it does not understand.
+		return ""
+	}
+}
+
+// claudeStopReasonWithUpstream resolves stop_reason preferring what the upstream
+// actually reported, falling back to claudeStopReason's inference.
+func claudeStopReasonWithUpstream(upstream string, toolUses []KiroToolUse, outputTokens, maxTokens int) string {
+	// A real tool call outranks every other reason: the client has to execute it
+	// for the agentic loop to advance. Turns whose tool arguments were cut off
+	// never reach here — they fail earlier as errIncompleteKiroToolInput.
+	if len(toolUses) > 0 {
+		return "tool_use"
+	}
+	mapped := upstreamStopReasonToClaude(upstream)
+	// "tool_use" is only meaningful alongside a tool_use block the client can act
+	// on, and there is none here (the len check above already returned). Reporting
+	// it anyway is worse than the bug this function fixes: the client blocks
+	// waiting to run a tool it was never given. This is reachable — the proxy
+	// consumes some tool calls itself (web_search) and never forwards them — so
+	// fall through to inference instead of echoing the upstream verbatim.
+	if mapped == "" || mapped == "tool_use" {
+		return claudeStopReason(toolUses, outputTokens, maxTokens)
+	}
+	return mapped
+}
+
+// openaiFinishReasonWithUpstream is claudeStopReasonWithUpstream for the OpenAI
+// wire format, where truncation is spelled "length".
+func openaiFinishReasonWithUpstream(upstream string, hasToolCalls bool, outputTokens, maxTokens int) string {
+	if hasToolCalls {
+		return "tool_calls"
+	}
+	switch upstreamStopReasonToClaude(upstream) {
+	case "max_tokens":
+		return "length"
+	case "end_turn", "stop_sequence":
+		return "stop"
+		// "tool_use" is deliberately absent. hasToolCalls is already false here, so
+		// there is no tool_calls array for the client to act on; answering
+		// "tool_calls" would leave it waiting on a tool it never received. Do not
+		// add that case — fall through to inference instead.
+	}
+	if hitMaxTokens(outputTokens, maxTokens) {
+		return "length"
+	}
+	return "stop"
+}
+
+// responsesIncompleteReason maps the upstream stopReason onto an OpenAI Responses
+// API incomplete_details.reason, returning "" when the turn is not incomplete.
+//
+// The Responses API has no finish_reason field: truncation is expressed as
+// status "incomplete" plus a reason. Only reasons that mean "the output was cut
+// off" qualify — END_TURN and TOOL_USE are normal completions.
+func responsesIncompleteReason(upstream string, hasToolUses bool, outputTokens, maxTokens int) string {
+	// A tool call is a complete turn by definition: the model stopped because it
+	// wants the client to run something, not because it ran out of room.
+	if hasToolUses {
+		return ""
+	}
+	switch upstreamStopReasonToClaude(upstream) {
+	case "max_tokens":
+		return "max_output_tokens"
+	case "end_turn", "stop_sequence":
+		return ""
+	}
+	// Upstream silent: fall back to the same inference the other protocols use.
+	if hitMaxTokens(outputTokens, maxTokens) {
+		return "max_output_tokens"
+	}
+	return ""
 }
 
 // claudeStopReason infers the stop_reason for a completed turn.

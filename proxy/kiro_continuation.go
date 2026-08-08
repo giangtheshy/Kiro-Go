@@ -55,14 +55,28 @@ func CallKiroAPIWithContinuation(account *config.Account, payload *KiroPayload, 
 
 	userOnText := callback.OnText
 	userOnTruncated := callback.OnTruncated
+	userOnStopReason := callback.OnStopReason
 
 	// pendingTrim holds the tail of already-delivered text that the next chunk
 	// must be de-overlapped against. It is set once per resume and cleared after
 	// the first chunk of that attempt, because only the seam can overlap.
 	var pendingTrim string
 
+	// The upstream's stopReason is buffered per attempt instead of being passed
+	// straight through. A turn that gets cut typically reports MAX_TOKENS on the
+	// attempt that broke; if a later resume finishes cleanly, forwarding that
+	// stale value would label a now-complete answer as truncated. Only the final
+	// attempt's verdict describes the turn the client actually receives.
+	var lastStopReason string
+	flushStopReason := func() {
+		if userOnStopReason != nil && lastStopReason != "" {
+			userOnStopReason(lastStopReason)
+		}
+	}
+
 	attemptCallback := *callback
 	attemptCallback.OnTruncated = func() { truncated = true }
+	attemptCallback.OnStopReason = func(reason string) { lastStopReason = reason }
 	attemptCallback.OnText = func(text string, isThinking bool) {
 		if isThinking {
 			// Thinking output is not part of the answer being resumed, so it is
@@ -88,6 +102,7 @@ func CallKiroAPIWithContinuation(account *config.Account, payload *KiroPayload, 
 
 	err := CallKiroAPI(account, payload, &attemptCallback)
 	if err != nil || !truncated {
+		flushStopReason()
 		return err
 	}
 
@@ -106,6 +121,10 @@ func CallKiroAPIWithContinuation(account *config.Account, payload *KiroPayload, 
 			len(text), attempt, maxContinuationAttempts, accountEmailForLog(account))
 
 		truncated = false
+		// Cleared so a resume that sends no metadataEvent cannot inherit the
+		// previous attempt's verdict — an absent reason must read as absent, which
+		// falls the handler back to local inference.
+		lastStopReason = ""
 		pendingTrim = overlapAnchor(text)
 
 		// A resume failing is not the client's problem: the text already
@@ -117,12 +136,14 @@ func CallKiroAPIWithContinuation(account *config.Account, payload *KiroPayload, 
 		}
 		if !truncated {
 			logger.Infof("[KiroAPI] Turn resumed successfully after %d attempt(s)", attempt)
+			flushStopReason()
 			return nil
 		}
 	}
 
 	// Every resume was also cut short. Hand the truncation to the handler so it
 	// withholds the "finished" signal, exactly as it would have without resuming.
+	flushStopReason()
 	if userOnTruncated != nil {
 		userOnTruncated()
 	}
