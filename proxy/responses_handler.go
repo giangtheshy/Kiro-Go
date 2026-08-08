@@ -644,7 +644,10 @@ func (h *Handler) handleResponsesStream(
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		// Streaming path: bytes already sent cannot be taken back, so a mid-turn
+		// cut is resumed rather than retried. OnTruncated still fires if every
+		// resume also breaks.
+		err := CallKiroAPIWithContinuation(account, payload, callback)
 		if err != nil {
 			if !responseStarted {
 				lastErr = err

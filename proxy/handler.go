@@ -1682,7 +1682,10 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		// Continuation-aware: a turn cut off mid-generation is resumed upstream
+		// before the handler ever sees OnTruncated, so the client gets one
+		// continuous answer instead of a partial one plus an error.
+		err := CallKiroAPIWithContinuation(account, payload, callback)
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -2673,7 +2676,9 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		// See the Claude stream path: resume a mid-generation cut upstream so the
+		// client is not handed a partial answer.
+		err := CallKiroAPIWithContinuation(account, payload, callback)
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true

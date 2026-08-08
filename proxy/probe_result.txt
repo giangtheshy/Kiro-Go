@@ -1,8 +1,0 @@
-text survives anywhere: false
-payload: {"conversationState":{"agentContinuationId":"c4c3194f-3bd8-5392-ae02-baea7dab8fe3","agentTaskType":"vibe","chatTriggerType":"MANUAL","conversationId":"ec92a965-c5ab-4724-97ce-32e5806ab7bd","currentMessage":{"userInputMessage":{"content":"Please analyze the attached image.","modelId":"claude-opus-4.8","origin":"AI_EDITOR","images":[{"format":"png","source":{"bytes":"<IMG>"}}]}}}}
-text survives anywhere: true
-text survives anywhere: false
-payload: {"conversationState":{"agentContinuationId":"0ad33e14-600c-5274-aa93-295b8755c64f","agentTaskType":"vibe","chatTriggerType":"MANUAL","conversationId":"876c3b14-6f57-504b-9729-48e364a98ce5","currentMessage":{"userInputMessage":{"content":"and now?","modelId":"claude-opus-4.8","origin":"AI_EDITOR"}}}}
-hist[0] user content="look at the file" ctxNil=true nImages=0
-hist[1] user content="Tool results:\n\n[read] [Tool returned an image; the image is attached to this message.]" ctxNil=true nImages=1
-current nImages=0

@@ -307,6 +307,13 @@ type Config struct {
 	// Defaults to true. Set to false to only use the preferred endpoint.
 	EndpointFallback *bool `json:"endpointFallback,omitempty"`
 
+	// StreamContinuation controls whether a turn cut off mid-generation is
+	// transparently resumed by replaying the delivered text back to the model and
+	// asking it to continue. Defaults to true. Each resume costs an extra upstream
+	// turn, so set it to false to trade seamless answers for strictly one billed
+	// turn per request.
+	StreamContinuation *bool `json:"streamContinuation,omitempty"`
+
 	// Global default regions. Used as a fallback when an account does not
 	// specify its own region. All default to "us-east-1" when empty.
 	Region     string `json:"region,omitempty"`     // Default region for both auth and API
@@ -1240,6 +1247,26 @@ func UpdateEndpointFallback(enabled bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.EndpointFallback = &enabled
+	return Save()
+}
+
+// GetStreamContinuation returns whether a turn cut off mid-generation is
+// transparently resumed. Defaults to true: without it, every upstream mid-stream
+// drop surfaces to the user as an answer that stops in the middle of a sentence.
+func GetStreamContinuation() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg.StreamContinuation == nil {
+		return true
+	}
+	return *cfg.StreamContinuation
+}
+
+// UpdateStreamContinuation sets the stream continuation switch and persists the change.
+func UpdateStreamContinuation(enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.StreamContinuation = &enabled
 	return Save()
 }
 

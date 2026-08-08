@@ -30,6 +30,34 @@ import (
 // whole process from a single response. 32 MiB is far above any legitimate SSE frame.
 const maxEventStreamFrameBytes = 32 << 20
 
+const (
+	// esPreludeLen is the fixed AWS Event Stream prelude: total_len(4) +
+	// headers_len(4) + prelude_crc(4).
+	esPreludeLen = 12
+	// esMsgCRCLen is the 4-byte message CRC that trails every frame.
+	esMsgCRCLen = 4
+	// esMinMsgBytes is the smallest byte count a frame can legitimately claim:
+	// prelude + trailing CRC, with zero headers and an empty payload.
+	esMinMsgBytes = esPreludeLen + esMsgCRCLen
+	// maxEventStreamHeaderBytes bounds the header block. Like totalLength, this
+	// value is read straight off the wire and must be range-checked before it is
+	// used to slice.
+	maxEventStreamHeaderBytes = 128 << 10
+)
+
+// errCorruptKiroStream means the byte offset is no longer aligned to a frame
+// boundary — a prelude was read that cannot describe a real frame. It is a
+// distinct sentinel because the correct response differs from a truncated
+// stream: nothing after this point can be trusted, so the connection is
+// abandoned rather than resynchronized.
+var errCorruptKiroStream = errors.New("corrupt upstream event stream")
+
+// errEmptyMeteredKiroTurn means the upstream billed a turn (meteringEvent
+// arrived) but produced no text, reasoning or tool call. It must stay distinct
+// from an unmetered empty stream: that one is safely retryable, this one is not
+// — the turn is already paid for, so re-running it would be charged twice.
+var errEmptyMeteredKiroTurn = errors.New("upstream billed a turn that produced no content")
+
 // kiroStreamTimeout bounds the ENTIRE streaming request, including reading the
 // response body (http.Client.Timeout is documented to cover the body read). It was
 // 5 minutes, which silently truncated long generations: a high thinking budget on
@@ -755,6 +783,21 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 				continue
 			}
 
+			// Billed, but nothing the client can see was produced. Returning nil
+			// here let the handler finish the turn normally, which emits
+			// stop_reason "end_turn" over an empty content array — Claude Code
+			// reads that as "API returned an empty or malformed response
+			// (HTTP 200)" and aborts the whole task. Report it as an error so the
+			// handler either rotates to another account (nothing was written yet)
+			// or surfaces an in-band SSE error, never a clean empty finish.
+			//
+			// The turn is NOT retried against the same endpoint: it was already
+			// billed, so re-running it here would pay twice for one turn.
+			if !outcome.Emitted {
+				logger.Warnf("[KiroAPI] Endpoint %s billed a turn that produced no content", ep.Name)
+				return fmt.Errorf("%w from %s", errEmptyMeteredKiroTurn, ep.Name)
+			}
+
 			// Content was emitted but the turn was never billed: the upstream
 			// dropped the connection mid-generation. Retrying would append a
 			// second, partial answer on top of what the client already has, so
@@ -862,11 +905,21 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (Stre
 		totalLength := int(prelude[0])<<24 | int(prelude[1])<<16 | int(prelude[2])<<8 | int(prelude[3])
 		headersLength := int(prelude[4])<<24 | int(prelude[5])<<16 | int(prelude[6])<<8 | int(prelude[7])
 
-		if totalLength < 16 {
-			continue
+		// A prelude that cannot describe a real frame means the byte offset is no
+		// longer on a frame boundary. Skipping ("continue") is not recoverable
+		// here: the next read starts 12 bytes into arbitrary payload data, so the
+		// parser walks garbage and can spin until the connection dies. Stop and
+		// report corruption instead, which lets the caller rotate the account.
+		if totalLength < esMinMsgBytes {
+			return outcome, fmt.Errorf("%w: frame length %d below the %d-byte minimum", errCorruptKiroStream, totalLength, esMinMsgBytes)
 		}
 		if totalLength > maxEventStreamFrameBytes {
 			return outcome, fmt.Errorf("event stream frame too large: %d bytes (max %d)", totalLength, maxEventStreamFrameBytes)
+		}
+		// headersLength is attacker/corruption controlled, so it is bounded both
+		// against its own ceiling and against the frame it must fit inside.
+		if headersLength > maxEventStreamHeaderBytes || headersLength+esMinMsgBytes > totalLength {
+			return outcome, fmt.Errorf("%w: headers length %d does not fit a %d-byte frame", errCorruptKiroStream, headersLength, totalLength)
 		}
 
 		// Read the remaining message bytes.
@@ -884,10 +937,9 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (Stre
 			return outcome, err
 		}
 
-		if headersLength > len(msgBuf)-4 {
-			continue
-		}
-
+		// No bounds re-check is needed here: the prelude guard above already
+		// established headersLength+16 <= totalLength, and len(msgBuf) is
+		// totalLength-12, so headersLength <= len(msgBuf)-4 holds by construction.
 		headerBytes := msgBuf[0:headersLength]
 		eventType := extractStringHeader(headerBytes, ":event-type")
 		payloadBytes := msgBuf[headersLength : len(msgBuf)-4]
@@ -1243,10 +1295,94 @@ func readTokenNumber(m map[string]interface{}, keys ...string) (int, bool) {
 
 // ==================== Tool Use Handling ====================
 
+// toolInputAccumulator reconciles the two framings Kiro uses for a tool call's
+// argument JSON, which vary by upstream version and cannot be told apart from a
+// single fragment:
+//
+//	delta    — each frame carries the NEXT slice: `{"path":` then `"a.go"}`
+//	snapshot — each frame carries the WHOLE value so far: `{"path":` then `{"path":"a.go"}`
+//
+// Plain concatenation is correct for the first and produces doubled JSON for the
+// second (`{"path":{"path":"a.go"}}`), which surfaces to the client as a tool
+// call with malformed arguments — the "Error editing file" symptom. So both
+// readings are kept and the one that decodes to complete JSON wins at close.
+type toolInputAccumulator struct {
+	concat      strings.Builder
+	last        string
+	sawSnapshot bool
+}
+
+// Add folds in one argument fragment. A fragment that contains everything seen
+// so far is positive evidence of snapshot framing.
+func (t *toolInputAccumulator) Add(frag string) {
+	if frag == "" {
+		return
+	}
+	if t.last != "" && len(frag) > len(t.last) && strings.HasPrefix(frag, t.last) {
+		t.sawSnapshot = true
+	}
+	if c := t.concat.String(); c != "" && len(frag) >= len(c) && strings.HasPrefix(frag, c) {
+		t.sawSnapshot = true
+	}
+	// A frame repeating the previous one verbatim is only meaningful when that
+	// value already stands on its own as complete JSON; otherwise it is an
+	// ordinary duplicate delta.
+	if frag == t.last && isCompleteToolJSON(frag) {
+		t.sawSnapshot = true
+	}
+	t.concat.WriteString(frag)
+	t.last = frag
+}
+
+// SetSnapshot records arguments that arrived as a structured object rather than a
+// string fragment. Those are always the complete value, so earlier fragments are
+// discarded outright.
+func (t *toolInputAccumulator) SetSnapshot(js string) {
+	t.concat.Reset()
+	t.concat.WriteString(js)
+	t.last = js
+	t.sawSnapshot = true
+}
+
+func (t *toolInputAccumulator) Len() int { return t.concat.Len() }
+
+// Resolve returns the reading most likely to be the arguments the model actually
+// wrote. Decodability is the primary signal and is checked before the framing
+// heuristic, so a stream that mixes both still resolves to valid JSON.
+func (t *toolInputAccumulator) Resolve() string {
+	concat := strings.TrimSpace(t.concat.String())
+	last := strings.TrimSpace(t.last)
+	if concat == last {
+		return concat
+	}
+	concatOK, lastOK := isCompleteToolJSON(concat), isCompleteToolJSON(last)
+	switch {
+	case concatOK && !lastOK:
+		return concat
+	case lastOK && !concatOK:
+		return last
+	case t.sawSnapshot:
+		return last
+	default:
+		return concat
+	}
+}
+
+// isCompleteToolJSON reports whether s is a self-contained JSON object or array.
+// Tool arguments are always one of those two, so a bare scalar (a lone `"a.go"`
+// delta, which json.Valid accepts) must not count as complete.
+func isCompleteToolJSON(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" || (s[0] != '{' && s[0] != '[') {
+		return false
+	}
+	return json.Valid([]byte(s))
+}
+
 type toolUseState struct {
 	ToolUseID   string
 	Name        string
-	InputBuffer strings.Builder
+	Input       toolInputAccumulator
 	GeneratedID bool
 }
 
@@ -1286,11 +1422,10 @@ func handleToolUseEvent(event map[string]interface{}, current *toolUseState, cal
 
 	if current != nil {
 		if input, ok := event["input"].(string); ok {
-			current.InputBuffer.WriteString(input)
+			current.Input.Add(input)
 		} else if inputObj, ok := event["input"].(map[string]interface{}); ok {
 			data, _ := json.Marshal(inputObj)
-			current.InputBuffer.Reset()
-			current.InputBuffer.Write(data)
+			current.Input.SetSnapshot(string(data))
 		}
 	}
 
@@ -1322,8 +1457,8 @@ func finishToolUse(state *toolUseState, callback *KiroStreamCallback) (emitted b
 	}
 
 	var input map[string]interface{}
-	if state.InputBuffer.Len() > 0 {
-		if err := json.Unmarshal([]byte(state.InputBuffer.String()), &input); err != nil {
+	if state.Input.Len() > 0 {
+		if err := json.Unmarshal([]byte(state.Input.Resolve()), &input); err != nil {
 			return false, fmt.Errorf("%w: %v", errIncompleteKiroToolInput, err)
 		}
 	}
