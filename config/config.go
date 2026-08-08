@@ -307,18 +307,18 @@ type Config struct {
 	// Defaults to true. Set to false to only use the preferred endpoint.
 	EndpointFallback *bool `json:"endpointFallback,omitempty"`
 
-	// AgenticContinuation controls whether a "keep working" directive is appended
-	// to tool-results turns. Defaults to true. Kiro has no system-prompt field, so
-	// an agentic client's "continue until done" instructions lose their steering
-	// weight and the model tends to summarize the tool output and end the turn.
-	AgenticContinuation *bool `json:"agenticContinuation,omitempty"`
-
 	// StreamContinuation controls whether a turn cut off mid-generation is
 	// transparently resumed by replaying the delivered text back to the model and
 	// asking it to continue. Defaults to true. Each resume costs an extra upstream
 	// turn, so set it to false to trade seamless answers for strictly one billed
 	// turn per request.
 	StreamContinuation *bool `json:"streamContinuation,omitempty"`
+
+	// KeepToolHistory controls whether correctly-paired assistant tool-call turns
+	// keep their structured form in history, giving the model in-context evidence
+	// of the invocation→result pattern. Defaults to true. Disable to always use
+	// the flattened (safe) payload if the upstream rejects the richer one.
+	KeepToolHistory *bool `json:"keepToolHistory,omitempty"`
 
 	// Global default regions. Used as a fallback when an account does not
 	// specify its own region. All default to "us-east-1" when empty.
@@ -1279,24 +1279,22 @@ func UpdateStreamContinuation(enabled bool) error {
 	return Save()
 }
 
-// GetAgenticContinuation returns whether the agentic-continuation directive is
-// re-anchored onto tool-results turns. Defaults to true: Kiro has no
-// system-prompt field, so without this steer an agentic client's "keep going"
-// instructions lose their weight and the model summarizes and stops mid-task.
-func GetAgenticContinuation() bool {
+// GetKeepToolHistory returns whether structured tool history is preserved for
+// correctly-paired turns. Defaults to true.
+func GetKeepToolHistory() bool {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
-	if cfg == nil || cfg.AgenticContinuation == nil {
+	if cfg == nil || cfg.KeepToolHistory == nil {
 		return true
 	}
-	return *cfg.AgenticContinuation
+	return *cfg.KeepToolHistory
 }
 
-// UpdateAgenticContinuation sets the agentic-continuation switch and persists it.
-func UpdateAgenticContinuation(enabled bool) error {
+// UpdateKeepToolHistory sets the keep-tool-history switch and persists it.
+func UpdateKeepToolHistory(enabled bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	cfg.AgenticContinuation = &enabled
+	cfg.KeepToolHistory = &enabled
 	return Save()
 }
 

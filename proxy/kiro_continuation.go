@@ -223,7 +223,7 @@ func buildContinuationPayload(payload *KiroPayload, delivered string) *KiroPaylo
 				names[tu.ToolUseID] = tu.Name
 			}
 		}
-		interrupted.Content = joinHistoryText(interrupted.Content, narrateToolResults(ctx.ToolResults, names))
+		interrupted.Content = joinHistoryText(interrupted.Content, narrateToolResults(ctx.ToolResults, names, nil))
 	}
 	// History never carries tool specs or results, only prose.
 	interrupted.UserInputMessageContext = nil

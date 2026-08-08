@@ -1232,24 +1232,32 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// 转换请求
-	kiroPayload := ClaudeToKiro(&req, thinking)
+	// 转换请求 — build rich (structured history) and safe (flat history) payloads.
+	// The rich form is tried first; if the upstream rejects the structured history
+	// with a recoverable error and nothing has been written yet, callWithHistoryFallback
+	// retries the same account with the flat form automatically.
+	safePayload := ClaudeToKiro(&req, thinking)
+	richPayload := safePayload
+	if config.GetKeepToolHistory() {
+		richPayload = ClaudeToKiroWithHistoryMode(&req, thinking, true)
+	}
 
 	// The original body is kept so an external Anthropic-compatible provider can
 	// be handed the request verbatim instead of the Kiro translation.
 	pc := &passthroughCtx{
-		Raw:      body,
-		Header:   r.Header,
-		ClientIP: h.resolveClientIP(r),
-		Stream:   req.Stream,
-		Endpoint: config.ProviderEndpointMessages,
+		Raw:         body,
+		Header:      r.Header,
+		ClientIP:    h.resolveClientIP(r),
+		Stream:      req.Stream,
+		Endpoint:    config.ProviderEndpointMessages,
+		SafePayload: safePayload,
 	}
 
 	// Stream or non-stream
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, pc)
+		h.handleClaudeStream(w, richPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, pc)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, pc)
+		h.handleClaudeNonStream(w, richPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, pc)
 	}
 }
 
@@ -1682,10 +1690,15 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			},
 		}
 
-		// Continuation-aware: a turn cut off mid-generation is resumed upstream
-		// before the handler ever sees OnTruncated, so the client gets one
-		// continuous answer instead of a partial one plus an error.
-		err := CallKiroAPIWithContinuation(account, payload, callback)
+		// History-fallback aware: tries rich (structured) payload first; if the
+		// upstream rejects it and nothing has been written yet, retries the same
+		// account with the flat safe payload. Inside the retry, continuation is
+		// still active, so a mid-stream cut on the safe payload is also resumed.
+		safeP := payload
+		if pc.SafePayload != nil {
+			safeP = pc.SafePayload
+		}
+		err := callWithHistoryFallback(account, payload, safeP, callback, func() bool { return messageStarted })
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -2330,22 +2343,27 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	req.Model = applyModelOverride(actualModel, apiKeyID, thinkingCfg.Suffix)
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
-	kiroPayload := OpenAIToKiro(&req, thinking)
+	safeOAIPayload := OpenAIToKiro(&req, thinking)
+	richOAIPayload := safeOAIPayload
+	if config.GetKeepToolHistory() {
+		richOAIPayload = OpenAIToKiroWithHistoryMode(&req, thinking, true)
+	}
 
 	// The original body is kept so an external OpenAI-compatible provider can be
 	// handed the request verbatim instead of the Kiro translation.
 	pc := &passthroughCtx{
-		Raw:      body,
-		Header:   r.Header,
-		Stream:   req.Stream,
-		Endpoint: config.ProviderEndpointChatCompletions,
-		ClientIP: h.resolveClientIP(r),
+		Raw:         body,
+		Header:      r.Header,
+		Stream:      req.Stream,
+		Endpoint:    config.ProviderEndpointChatCompletions,
+		ClientIP:    h.resolveClientIP(r),
+		SafePayload: safeOAIPayload,
 	}
 
 	if req.Stream {
-		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, pc)
+		h.handleOpenAIStream(w, richOAIPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, pc)
 	} else {
-		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, pc)
+		h.handleOpenAINonStream(w, richOAIPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, pc)
 	}
 }
 
@@ -2676,9 +2694,11 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			},
 		}
 
-		// See the Claude stream path: resume a mid-generation cut upstream so the
-		// client is not handed a partial answer.
-		err := CallKiroAPIWithContinuation(account, payload, callback)
+		safeP := payload
+		if pc.SafePayload != nil {
+			safeP = pc.SafePayload
+		}
+		err := callWithHistoryFallback(account, payload, safeP, callback, func() bool { return responseStarted })
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true

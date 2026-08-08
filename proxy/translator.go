@@ -261,7 +261,18 @@ type ClaudeUsage struct {
 
 const maxToolDescLen = 10237
 
+// ClaudeToKiro builds the upstream payload with flattened history (safe mode).
+// Use ClaudeToKiroWithHistoryMode when the richer keepPaired form is needed.
 func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
+	return ClaudeToKiroWithHistoryMode(req, thinking, false)
+}
+
+// ClaudeToKiroWithHistoryMode builds the upstream payload. When keepPaired is
+// true, every correctly-paired assistant tool-call turn keeps its structured
+// toolUses, and the following user turn keeps its structured toolResults. This
+// preserves in-context evidence of the invocation→result pattern so the model
+// continues issuing structured tool calls across a long agentic session.
+func ClaudeToKiroWithHistoryMode(req *ClaudeRequest, thinking bool, keepPaired bool) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
 
@@ -341,39 +352,64 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		history = append(priming, history...)
 	}
 
-	// Decide whether the current tool results form a valid "active" tool turn:
-	// the last history assistant must carry matching structured toolUses. If not
-	// (orphaned tool results, e.g. after context compaction), flatten them into
-	// the current message text so the upstream does not reject the request.
+	// 转换工具. This runs BEFORE sanitizeKiroHistory because the sanitized wire
+	// names are needed to rewrite history: with keepPaired the structured
+	// toolUses survive in history, and if they kept the client's original names
+	// while the tool specs carry sanitized ones, the model sees two identities
+	// for one tool and the agent loop breaks.
+	kiroTools, toolNameMap := convertClaudeTools(req.Tools)
+	rewriteHistoryToolNames(history, toolNameMap, claudeToolWireName)
+
+	// Emulate tool_choice: "none" drops tools so the model must answer in text;
+	// "any"/"specific" append a forcing directive to the current message.
+	var toolChoice toolChoiceDirective
+	if req.ToolChoice != nil {
+		toolChoice = normalizeClaudeToolChoice(req.ToolChoice)
+	}
+	toolsWillBeSent := len(kiroTools) > 0 && toolChoice.mode != toolChoiceNone
+
 	currentToolResultIDs := collectToolResultIDs(currentToolResults)
+	// Kiro accepts structured tool_result without a toolConfig in the current
+	// message (unlike Bedrock which requires toolConfig). The only constraint
+	// is that the last history assistant had matching toolUses.
 	keepCurrentToolResults := currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
 
-	// Flatten structured tool calls/results that live in history; upstream only
-	// accepts a single active tool turn (last assistant toolUses ⟺ current toolResults).
 	if keepCurrentToolResults {
-		history = sanitizeKiroHistory(history, currentToolResultIDs)
+		history = sanitizeKiroHistory(history, currentToolResultIDs, keepPaired && toolsWillBeSent)
 	} else {
-		history = sanitizeKiroHistory(history, nil)
+		history = sanitizeKiroHistory(history, nil, keepPaired && toolsWillBeSent)
 	}
 
 	// 构建最终内容
 	finalContent := ""
 	if currentContent != "" {
 		finalContent = currentContent
+		// When user text coexists with orphan tool results (e.g. a tool_result
+		// block plus plain user text in the same turn), narrate the orphan results
+		// into the message so neither half is lost.
+		if len(currentToolResults) > 0 && !keepCurrentToolResults {
+			finalContent = joinHistoryText(finalContent, buildToolResultsContinuation(currentToolResults))
+		}
 	} else if len(currentImages) > 0 {
-		finalContent = normalizeUserContent("", true)
+		// Images were extracted from tool_result blocks. If there is also text
+		// content in those results, narrate it; otherwise use the placeholder.
+		if len(currentToolResults) > 0 && !keepCurrentToolResults {
+			finalContent = buildToolResultsContinuation(currentToolResults)
+		} else {
+			finalContent = normalizeUserContent("", true)
+		}
 	} else if len(currentToolResults) > 0 {
 		finalContent = buildToolResultsContinuation(currentToolResults)
 	} else {
 		finalContent = minimalFallbackUserContent
 	}
 
-	// 转换工具
-	kiroTools, toolNameMap := convertClaudeTools(req.Tools)
-
-	// Re-anchor the "keep working" steer onto a tool-results turn. Applied after
-	// the tool conversion because it must only fire while tools remain callable.
-	finalContent = applyAgenticContinuation(finalContent, len(currentToolResults) > 0, len(kiroTools) > 0)
+	// Emulate tool_choice (Kiro has no native field): may drop the tool specs
+	// ("none") or append a forcing directive to the current message.
+	if req.ToolChoice != nil {
+		finalContent, kiroTools = applyToolChoice(finalContent, kiroTools,
+			claudeWireNameResolver(toolNameMap, kiroTools), toolChoice)
+	}
 
 	// 构建 payload
 	payload := &KiroPayload{}
@@ -1131,6 +1167,7 @@ type OpenAIRequest struct {
 	TopP        float64         `json:"top_p,omitempty"`
 	Stream      bool            `json:"stream,omitempty"`
 	Tools       []OpenAITool    `json:"tools,omitempty"`
+	ToolChoice  interface{}     `json:"tool_choice,omitempty"`
 }
 
 type OpenAIMessage struct {
@@ -1229,7 +1266,14 @@ type OpenAIUsage struct {
 
 // ==================== OpenAI -> Kiro 转换 ====================
 
+// OpenAIToKiro builds the upstream payload with flattened history (safe mode).
 func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
+	return OpenAIToKiroWithHistoryMode(req, thinking, false)
+}
+
+// OpenAIToKiroWithHistoryMode builds the upstream payload. keepPaired has the
+// same semantics as in ClaudeToKiroWithHistoryMode.
+func OpenAIToKiroWithHistoryMode(req *OpenAIRequest, thinking bool, keepPaired bool) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
 
@@ -1374,15 +1418,29 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		history = append(priming, history...)
 	}
 
-	// Decide whether current tool results form a valid active tool turn; if not,
-	// flatten them into the current message text (see ClaudeToKiro for rationale).
+	// 转换工具, before sanitizing history (see ClaudeToKiro: with keepPaired the
+	// structured toolUses survive, so their names must match the tool specs).
+	// convertOpenAITools does not return a rename map, so history names are
+	// normalized with the same transform the specs get.
+	kiroTools := convertOpenAITools(req.Tools)
+	rewriteHistoryToolNames(history, nil, openaiToolWireName)
+
+	var toolChoice toolChoiceDirective
+	if req.ToolChoice != nil {
+		toolChoice = normalizeOpenAIToolChoice(req.ToolChoice)
+	}
+	toolsWillBeSent := len(kiroTools) > 0 && toolChoice.mode != toolChoiceNone
+
 	currentToolResultIDs := collectToolResultIDs(currentToolResults)
+	// Kiro accepts structured tool_result without a toolConfig in the current
+	// message (unlike Bedrock which requires toolConfig). The only constraint
+	// is that the last history assistant had matching toolUses.
 	keepCurrentToolResults := currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
 
 	if keepCurrentToolResults {
-		history = sanitizeKiroHistory(history, currentToolResultIDs)
+		history = sanitizeKiroHistory(history, currentToolResultIDs, keepPaired && toolsWillBeSent)
 	} else {
-		history = sanitizeKiroHistory(history, nil)
+		history = sanitizeKiroHistory(history, nil, keepPaired && toolsWillBeSent)
 	}
 
 	// 构建最终内容
@@ -1397,12 +1455,11 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		}
 	}
 
-	// 转换工具
-	kiroTools := convertOpenAITools(req.Tools)
-
-	// Same steer as the Claude path (see applyAgenticContinuation): a tool-results
-	// turn otherwise tends to end with a summary instead of the next tool call.
-	finalContent = applyAgenticContinuation(finalContent, len(currentToolResults) > 0, len(kiroTools) > 0)
+	// Emulate tool_choice on the OpenAI path (same semantics as Claude path).
+	if req.ToolChoice != nil {
+		finalContent, kiroTools = applyToolChoice(finalContent, kiroTools,
+			openAIWireNameResolver(nil, kiroTools), toolChoice)
+	}
 
 	// 构建 payload
 	payload := &KiroPayload{}
@@ -1544,6 +1601,223 @@ func collectToolResultIDs(toolResults []KiroToolResult) map[string]bool {
 	return ids
 }
 
+// toolUsesCoveredBy reports whether every tool use in the slice has its ID
+// present in the result set.
+func toolUsesCoveredBy(toolUses []KiroToolUse, resultIDs map[string]bool) bool {
+	if len(toolUses) == 0 {
+		return false
+	}
+	for _, tu := range toolUses {
+		if !resultIDs[tu.ToolUseID] {
+			return false
+		}
+	}
+	return true
+}
+
+// rewriteHistoryToolNames rewrites structured history toolUses from the client's
+// tool names to the sanitized "wire" names the model actually sees in the tool
+// specs.
+//
+// Without this, keepPaired history gives one tool TWO identities: the spec says
+// `mcpPlaywrightBrowserTakeScreenshot` while the history tool call says
+// `mcp__playwright__browser_take_screenshot`. The model cannot tell they are the
+// same tool, which breaks exactly the invocation→result pattern keepPaired exists
+// to demonstrate. It also fixes narration, so a flattened turn attributes its
+// result with the same name the specs use.
+//
+// Must be called BEFORE sanitizeKiroHistory so narrated turns pick up wire names
+// too. toWire performs the path's own sanitization — the Claude and OpenAI
+// converters do NOT transform names identically (Claude camelCases, OpenAI only
+// shortens), so sharing one transform here would invent a third name.
+// ==================== tool_choice handling ====================
+//
+// Kiro's upstream has no tool_choice/toolConfig field, so the client's
+// tool_choice is emulated at the proxy level: "none" drops the tool specs
+// entirely and tells the model to answer directly; "any"/"required" and a
+// forced specific tool append a strong directive to the current user message.
+// "auto" (the default) is a no-op.
+
+type toolChoiceMode int
+
+const (
+	toolChoiceAuto     toolChoiceMode = iota // model decides
+	toolChoiceNone                           // never call a tool
+	toolChoiceAny                            // must call some tool
+	toolChoiceSpecific                       // must call a named tool
+)
+
+type toolChoiceDirective struct {
+	mode toolChoiceMode
+	name string // client tool name in specific mode
+}
+
+// normalizeClaudeToolChoice parses Anthropic's tool_choice object.
+func normalizeClaudeToolChoice(v interface{}) toolChoiceDirective {
+	m, ok := v.(map[string]interface{})
+	if !ok {
+		return toolChoiceDirective{mode: toolChoiceAuto}
+	}
+	switch strings.ToLower(strings.TrimSpace(asStringV(m["type"]))) {
+	case "none":
+		return toolChoiceDirective{mode: toolChoiceNone}
+	case "any":
+		return toolChoiceDirective{mode: toolChoiceAny}
+	case "tool":
+		if name := asStringV(m["name"]); name != "" {
+			return toolChoiceDirective{mode: toolChoiceSpecific, name: name}
+		}
+		return toolChoiceDirective{mode: toolChoiceAny}
+	default:
+		return toolChoiceDirective{mode: toolChoiceAuto}
+	}
+}
+
+// normalizeOpenAIToolChoice parses OpenAI's tool_choice (string or object).
+func normalizeOpenAIToolChoice(v interface{}) toolChoiceDirective {
+	switch val := v.(type) {
+	case string:
+		switch strings.ToLower(strings.TrimSpace(val)) {
+		case "none":
+			return toolChoiceDirective{mode: toolChoiceNone}
+		case "required", "any":
+			return toolChoiceDirective{mode: toolChoiceAny}
+		default:
+			return toolChoiceDirective{mode: toolChoiceAuto}
+		}
+	case map[string]interface{}:
+		if fn, ok := val["function"].(map[string]interface{}); ok {
+			if name := asStringV(fn["name"]); name != "" {
+				return toolChoiceDirective{mode: toolChoiceSpecific, name: name}
+			}
+		}
+		return toolChoiceDirective{mode: toolChoiceAny}
+	default:
+		return toolChoiceDirective{mode: toolChoiceAuto}
+	}
+}
+
+func asStringV(v interface{}) string {
+	s, _ := v.(string)
+	return s
+}
+
+// applyToolChoice shapes the payload to emulate the requested tool_choice.
+// It returns the (possibly-augmented) content and the (possibly-emptied) tools.
+// resolveWire maps a client tool name to the sanitized wire name the model sees.
+func applyToolChoice(content string, tools []KiroToolWrapper, resolveWire func(string) string, d toolChoiceDirective) (string, []KiroToolWrapper) {
+	if len(tools) == 0 {
+		return content, tools
+	}
+	switch d.mode {
+	case toolChoiceNone:
+		return appendToolDirective(content, "Do not call any tools. Respond directly to the user in plain text."), nil
+	case toolChoiceAny:
+		return appendToolDirective(content, "You must respond by calling one of the available tools. Do not answer in plain text."), tools
+	case toolChoiceSpecific:
+		wire := d.name
+		if resolveWire != nil {
+			wire = resolveWire(d.name)
+		}
+		return appendToolDirective(content, fmt.Sprintf("You must respond by calling the `%s` tool. Do not call any other tool and do not answer in plain text.", wire)), tools
+	default:
+		return content, tools
+	}
+}
+
+// appendToolDirective appends a tool_choice instruction on its own line so it
+// reads as a separate constraint, not as part of the user's message body.
+func appendToolDirective(content, directive string) string {
+	if strings.TrimSpace(content) == "" || content == minimalFallbackUserContent {
+		return directive
+	}
+	return content + "\n\n" + directive
+}
+
+// claudeWireNameResolver returns a function that maps an original client tool
+// name to the sanitized wire name the model sees in its tool specs.
+func claudeWireNameResolver(nameMap map[string]string, tools []KiroToolWrapper) func(string) string {
+	return func(original string) string {
+		for wire, orig := range nameMap {
+			if orig == original {
+				return wire
+			}
+		}
+		for _, t := range tools {
+			if t.ToolSpecification.Name == original {
+				return original
+			}
+		}
+		return claudeToolWireName(original)
+	}
+}
+
+// openAIWireNameResolver is the OpenAI equivalent of claudeWireNameResolver.
+func openAIWireNameResolver(nameMap map[string]string, tools []KiroToolWrapper) func(string) string {
+	return func(original string) string {
+		for wire, orig := range nameMap {
+			if orig == original {
+				return wire
+			}
+		}
+		for _, t := range tools {
+			if t.ToolSpecification.Name == original {
+				return original
+			}
+		}
+		return openaiToolWireName(original)
+	}
+}
+
+// claudeToolWireName and openaiToolWireName mirror the name transform each
+// converter applies to a tool spec. They must stay in lockstep with
+// convertClaudeTools / convertOpenAITools respectively: the Claude path
+// camelCases AND shortens, the OpenAI path only shortens. Using one transform
+// for both paths would rewrite history into a name the model never sees in its
+// tool specs — the same two-identities bug this function exists to prevent.
+func claudeToolWireName(name string) string {
+	return shortenToolName(sanitizeToolName(name))
+}
+
+func openaiToolWireName(name string) string {
+	return shortenToolName(name)
+}
+
+func rewriteHistoryToolNames(history []KiroHistoryMessage, nameMap map[string]string, toWire func(string) string) {
+	if len(history) == 0 {
+		return
+	}
+	// nameMap is sanitized→original; invert it for an O(1) forward lookup.
+	origToWire := make(map[string]string, len(nameMap))
+	for wire, orig := range nameMap {
+		origToWire[orig] = wire
+	}
+	for i := range history {
+		a := history[i].AssistantResponseMessage
+		if a == nil {
+			continue
+		}
+		for j := range a.ToolUses {
+			name := a.ToolUses[j].Name
+			if name == "" {
+				continue
+			}
+			if wire, ok := origToWire[name]; ok {
+				a.ToolUses[j].Name = wire
+				continue
+			}
+			// Not in the current tool list (or this request declared no tools):
+			// still normalize, so replayed history matches the usual wire form.
+			if toWire == nil {
+				continue
+			}
+			if wire := toWire(name); wire != "" && wire != name {
+				a.ToolUses[j].Name = wire
+			}
+		}
+	}
+}
+
 // currentToolResultsMatchLastAssistant reports whether the current message's
 // tool results answer the structured tool calls of the final history assistant
 // message. Only in that case may the current toolResults stay structured.
@@ -1595,7 +1869,7 @@ func stripPollutedToolCallText(content string) string {
 // text instead of issuing real structured tool calls. All tool narration lives
 // in user "Tool results" turns, which the model reads but never authors, so it
 // has no invocation pattern to copy.
-func narrateToolResults(toolResults []KiroToolResult, names map[string]string) string {
+func narrateToolResults(toolResults []KiroToolResult, names map[string]string, inputs map[string]map[string]interface{}) string {
 	if len(toolResults) == 0 {
 		return ""
 	}
@@ -1611,7 +1885,17 @@ func narrateToolResults(toolResults []KiroToolResult, names map[string]string) s
 		if strings.TrimSpace(body) == "" {
 			body = "(no output)"
 		}
-		if name := names[tr.ToolUseID]; name != "" {
+		name := names[tr.ToolUseID]
+		if inp := inputs[tr.ToolUseID]; len(inp) > 0 && name != "" {
+			// Preserve the input args so the model sees what invocation pattern
+			// produced this output — critical for orchestration tools (Task,
+			// Workflow) whose result alone gives no hint of what was requested.
+			if b, err := json.Marshal(inp); err == nil && len(b) <= 256 {
+				parts = append(parts, fmt.Sprintf("[%s %s] %s", name, string(b), body))
+			} else {
+				parts = append(parts, fmt.Sprintf("[%s] %s", name, body))
+			}
+		} else if name != "" {
 			parts = append(parts, fmt.Sprintf("[%s] %s", name, body))
 		} else {
 			parts = append(parts, body)
@@ -1643,43 +1927,76 @@ func joinHistoryText(existing, narrated string) string {
 // message's toolResults. Everything else is narrated as text so the upstream
 // accepts the request.
 //
-// currentToolResultIDs is the set of toolUseId values carried by the current
-// (outgoing) message. When the last history entry is an assistant message whose
-// tool uses are fully covered by that set, its structured toolUses are kept.
-func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[string]bool) []KiroHistoryMessage {
+// keepPaired relaxes the "at most one structured turn" rule: when true, every
+// assistant turn whose toolUses are fully answered by the immediately following
+// user turn's toolResults keeps its structured form (and that user turn keeps its
+// structured toolResults). This gives agentic clients in-context evidence of the
+// invocation→result pattern so they keep issuing structured tool calls. Orphaned
+// or unpaired structured data is still flattened to text in both modes, since the
+// upstream rejects it. The request handlers fall back to keepPaired=false if the
+// upstream rejects the richer payload, so this is safe to enable.
+func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[string]bool, keepPaired bool) []KiroHistoryMessage {
 	if len(history) == 0 {
 		return history
 	}
 
-	// Map every tool-use ID to its tool name across all assistant turns, so a
-	// user "Tool results" turn can attribute each result to its originating tool
+	// Map every tool-use ID to its tool name AND input args across all assistant
+	// turns, so a user "Tool results" turn can attribute each result with context
 	// even after the structured toolUses are stripped from the assistant turn.
 	toolNames := make(map[string]string)
+	toolInputs := make(map[string]map[string]interface{})
 	for i := range history {
 		if a := history[i].AssistantResponseMessage; a != nil {
 			for _, tu := range a.ToolUses {
 				if tu.ToolUseID != "" && tu.Name != "" {
 					toolNames[tu.ToolUseID] = tu.Name
+					if len(tu.Input) > 0 {
+						toolInputs[tu.ToolUseID] = tu.Input
+					}
 				}
 			}
 		}
 	}
 
-	// Determine whether the last history assistant turn is the "active" tool turn
-	// answered by the current message. If so, its structured toolUses stay.
-	activeIdx := -1
+	// Decide which turns keep their structured tool data.
+	keptAssistant := make(map[int]bool)
+	keptUser := make(map[int]bool)
+
+	if len(currentToolResultIDs) > 0 {
+		lastIdx := len(history) - 1
+		last := history[lastIdx]
+		if last.AssistantResponseMessage != nil && len(last.AssistantResponseMessage.ToolUses) > 0 {
+			if toolUsesCoveredBy(last.AssistantResponseMessage.ToolUses, currentToolResultIDs) {
+				keptAssistant[lastIdx] = true
+			}
+		}
+	}
+
+	if keepPaired {
+		for i := 0; i+1 < len(history); i++ {
+			a := history[i].AssistantResponseMessage
+			if a == nil || len(a.ToolUses) == 0 {
+				continue
+			}
+			next := history[i+1].UserInputMessage
+			if next == nil || next.UserInputMessageContext == nil {
+				continue
+			}
+			resultIDs := collectToolResultIDs(next.UserInputMessageContext.ToolResults)
+			if len(resultIDs) == 0 {
+				continue
+			}
+			if toolUsesCoveredBy(a.ToolUses, resultIDs) && len(resultIDs) == len(a.ToolUses) {
+				keptAssistant[i] = true
+				keptUser[i+1] = true
+			}
+		}
+	}
 	if len(currentToolResultIDs) > 0 {
 		last := history[len(history)-1]
 		if last.AssistantResponseMessage != nil && len(last.AssistantResponseMessage.ToolUses) > 0 {
-			allCovered := true
-			for _, tu := range last.AssistantResponseMessage.ToolUses {
-				if !currentToolResultIDs[tu.ToolUseID] {
-					allCovered = false
-					break
-				}
-			}
-			if allCovered {
-				activeIdx = len(history) - 1
+			if toolUsesCoveredBy(last.AssistantResponseMessage.ToolUses, currentToolResultIDs) {
+				keptAssistant[len(history)-1] = true
 			}
 		}
 	}
@@ -1697,8 +2014,8 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 		}
 
 		if msg.AssistantResponseMessage != nil && len(msg.AssistantResponseMessage.ToolUses) > 0 {
-			if i == activeIdx {
-				continue // keep the active tool turn structured
+			if keptAssistant[i] {
+				continue // keep this tool turn structured
 			}
 			// Drop the structured tool calls WITHOUT writing any tool-invocation
 			// text into the assistant turn. Narrating the call here (e.g.
@@ -1711,8 +2028,8 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 
 		if msg.UserInputMessage != nil && msg.UserInputMessage.UserInputMessageContext != nil {
 			ctx := msg.UserInputMessage.UserInputMessageContext
-			if len(ctx.ToolResults) > 0 {
-				narrated := narrateToolResults(ctx.ToolResults, toolNames)
+			if len(ctx.ToolResults) > 0 && !keptUser[i] {
+				narrated := narrateToolResults(ctx.ToolResults, toolNames, toolInputs)
 				msg.UserInputMessage.Content = joinHistoryText(msg.UserInputMessage.Content, narrated)
 				ctx.ToolResults = nil
 			}
@@ -1856,13 +2173,84 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool, model string)
 		rebuilt = append(rebuilt, placeholderEntry)
 	}
 	rebuilt = append(rebuilt, tail...)
-	payload.ConversationState.History = rebuilt
+	// Truncation and dropLeadingAssistant can cut between a keepPaired assistant
+	// toolUses turn and its following user toolResults. Repair orphans so the
+	// upstream never sees a tool_result without a matching previous tool_use.
+	payload.ConversationState.History = repairOrphanedStructuredToolPairs(rebuilt)
 
 	// If still too large (current message or retained tail alone exceeds the
 	// limit), shrink the current message content as a last resort.
 	if payloadByteSize(payload) > limit {
 		truncateCurrentMessage(payload)
 	}
+}
+
+// repairOrphanedStructuredToolPairs flattens structured toolResults whose
+// tool_use_id is not present on the immediately preceding assistant turn.
+// keepPaired history is pair-safe before truncation; suffix cuts and
+// dropLeadingAssistant can break that invariant. The upstream rejects the
+// broken shape with TOOL_USE_RESULT_MISMATCH.
+func repairOrphanedStructuredToolPairs(history []KiroHistoryMessage) []KiroHistoryMessage {
+	if len(history) == 0 {
+		return history
+	}
+	toolNames := make(map[string]string)
+	toolInputs := make(map[string]map[string]interface{})
+	for i := range history {
+		a := history[i].AssistantResponseMessage
+		if a == nil {
+			continue
+		}
+		for _, tu := range a.ToolUses {
+			if id := strings.TrimSpace(tu.ToolUseID); id != "" {
+				toolNames[id] = tu.Name
+				if len(tu.Input) > 0 {
+					toolInputs[id] = tu.Input
+				}
+			}
+		}
+	}
+	for i := range history {
+		msg := &history[i]
+		if msg.UserInputMessage == nil || msg.UserInputMessage.UserInputMessageContext == nil {
+			continue
+		}
+		ctx := msg.UserInputMessage.UserInputMessageContext
+		if len(ctx.ToolResults) == 0 {
+			continue
+		}
+		var prevIDs map[string]bool
+		if i > 0 {
+			if prev := history[i-1].AssistantResponseMessage; prev != nil {
+				for _, tu := range prev.ToolUses {
+					if id := strings.TrimSpace(tu.ToolUseID); id != "" {
+						if prevIDs == nil {
+							prevIDs = make(map[string]bool, len(prev.ToolUses))
+						}
+						prevIDs[id] = true
+					}
+				}
+			}
+		}
+		orphan := false
+		for _, tr := range ctx.ToolResults {
+			id := strings.TrimSpace(tr.ToolUseID)
+			if id == "" || !prevIDs[id] {
+				orphan = true
+				break
+			}
+		}
+		if !orphan {
+			continue
+		}
+		narrated := narrateToolResults(ctx.ToolResults, toolNames, toolInputs)
+		msg.UserInputMessage.Content = joinHistoryText(msg.UserInputMessage.Content, narrated)
+		ctx.ToolResults = nil
+		if len(ctx.Tools) == 0 {
+			msg.UserInputMessage.UserInputMessageContext = nil
+		}
+	}
+	return history
 }
 
 // historyEntryByteSize returns the serialized size of a single history entry,
@@ -2030,35 +2418,6 @@ func truncateCurrentMessage(payload *KiroPayload) {
 		}
 		cur.Content = cur.Content[:budget]
 	}
-}
-
-// agenticContinuationDirective re-anchors a "keep working" steer onto a
-// tool-results turn.
-//
-// Kiro's payload has no system-prompt field, so an agentic client's system
-// instructions ("keep going until the task is done") are demoted into buried
-// history and lose their steering weight. The model then reads the tool output,
-// writes a summary of what it found, and ends the turn — the "runs the diagnosis
-// then stops" failure. Nothing is broken at the transport layer: the model
-// genuinely decided to stop, so the proxy faithfully reports end_turn and the
-// user has to type "continue" to get the next step.
-//
-// Phrased to still permit stopping once the task is genuinely complete, so it
-// cannot force an endless loop. Kept short because it costs tokens on every
-// single tool turn.
-const agenticContinuationDirective = "\n\n[Continue the task: take the next action yourself by calling the appropriate tools rather than only describing what should be done. Stop only when the task is fully complete.]"
-
-// applyAgenticContinuation appends agenticContinuationDirective to a
-// tool-results turn's content. All three guards matter: without tool results
-// this is an ordinary chat turn and the steer would be noise; without tools
-// still available the model has nothing to continue WITH, so the directive would
-// ask for the impossible; and the config switch lets an operator trade the extra
-// tokens back.
-func applyAgenticContinuation(content string, hasToolResults, toolsWillBeSent bool) string {
-	if !hasToolResults || !toolsWillBeSent || !config.GetAgenticContinuation() {
-		return content
-	}
-	return content + agenticContinuationDirective
 }
 
 func buildToolResultsContinuation(toolResults []KiroToolResult) string {

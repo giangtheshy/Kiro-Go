@@ -554,12 +554,11 @@ func TestClaudeToolResultMixedTextAndImage(t *testing.T) {
 	if len(cur.Images) != 1 {
 		t.Fatalf("expected one image extracted, got %d", len(cur.Images))
 	}
-	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.ToolResults) != 1 {
-		t.Fatalf("expected one tool result")
-	}
-	gotText := cur.UserInputMessageContext.ToolResults[0].Content[0].Text
-	if gotText != "here is the screenshot" {
-		t.Fatalf("expected original tool text preserved, got %q", gotText)
+	// An orphan tool_result (no matching assistant toolUse) cannot stay structured —
+	// the upstream rejects TOOL_USE_RESULT_MISMATCH. Text is narrated into the
+	// current message content; the image still attaches. Neither half is lost.
+	if !strings.Contains(cur.Content, "here is the screenshot") {
+		t.Fatalf("expected orphan tool text narrated into current content, got %q", cur.Content)
 	}
 }
 
@@ -624,10 +623,13 @@ func TestOpenAIToolResultImageCarriedWhenFollowedByUser(t *testing.T) {
 
 	payload := OpenAIToKiro(req, false)
 
+	// The tool turn is flushed to history: the image must survive on that history
+	// entry even after sanitizeKiroHistory narrates the structured ToolResults.
+	// The condition previously checked ToolResults > 0, but after narration the
+	// context is nil — check images directly on all user history entries instead.
 	var toolHistImages int
 	for _, h := range payload.ConversationState.History {
-		if h.UserInputMessage != nil && h.UserInputMessage.UserInputMessageContext != nil &&
-			len(h.UserInputMessage.UserInputMessageContext.ToolResults) > 0 {
+		if h.UserInputMessage != nil {
 			toolHistImages += len(h.UserInputMessage.Images)
 		}
 	}

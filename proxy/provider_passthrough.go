@@ -19,11 +19,12 @@ import (
 // already thrown away: the client's original body and headers (for provider
 // passthrough), plus attribution data used by recordSuccessForApiKey.
 type passthroughCtx struct {
-	Raw      []byte      // exact body the client sent
-	Header   http.Header // original client headers (for anthropic-beta passthrough)
-	Stream   bool
-	Endpoint string // one of the config.ProviderEndpoint* constants
-	ClientIP string // resolved real client IP; forwarded to request log entries
+	Raw         []byte      // exact body the client sent
+	Header      http.Header // original client headers (for anthropic-beta passthrough)
+	Stream      bool
+	Endpoint    string       // one of the config.ProviderEndpoint* constants
+	ClientIP    string       // resolved real client IP; forwarded to request log entries
+	SafePayload *KiroPayload // flat-history fallback for callWithHistoryFallback; nil = no fallback
 }
 
 // clientIP returns the resolved client IP, tolerating a nil receiver: several

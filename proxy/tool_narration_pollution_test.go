@@ -62,7 +62,7 @@ func TestNoToolInvocationTextInAssistantHistory(t *testing.T) {
 		}
 	}
 	// Tool identity should be attributed on the user side.
-	if !strings.Contains(combined, "[exec_command]") {
+	if !strings.Contains(combined, "[exec_command") {
 		t.Fatalf("expected tool results attributed to exec_command on the user side")
 	}
 }

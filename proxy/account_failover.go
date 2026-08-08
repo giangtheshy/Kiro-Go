@@ -245,3 +245,59 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 		h.pool.RecordError(account.ID, false)
 	}
 }
+
+// isMalformedPayloadError returns true for 400-class upstream errors that signal
+// the request body was structurally wrong — specifically those that a simpler
+// (flat-history) payload could fix. ValidationException and ModelError are broad
+// Bedrock-class errors also included.
+func isMalformedPayloadError(msg string) bool {
+	msg = strings.ToLower(msg)
+	if strings.Contains(msg, "validationexception") || strings.Contains(msg, "modelerror") {
+		return true
+	}
+	if !strings.Contains(msg, "http 400") {
+		return false
+	}
+	return strings.Contains(msg, "improperly formed") ||
+		strings.Contains(msg, "content_length_exceeds_threshold") ||
+		strings.Contains(msg, "tool_use_result_mismatch") ||
+		strings.Contains(msg, "tool_config_missing") ||
+		strings.Contains(msg, "toolconfig field must be defined") ||
+		strings.Contains(msg, "has no matching tool_use") ||
+		strings.Contains(msg, "unexpected tool_use_id")
+}
+
+// isGenericUpstreamServerError matches the opaque 5xx AWS returns for a payload
+// it dislikes but won't diagnose.
+func isGenericUpstreamServerError(msg string) bool {
+	lower := strings.ToLower(msg)
+	for _, s := range []string{"http 500", "http 501", "http 502", "http 503", "http 504", "http 505"} {
+		if strings.Contains(lower, s) {
+			return true
+		}
+	}
+	return strings.Contains(lower, "unexpected error when processing the request")
+}
+
+// shouldRetrySafePayload reports whether an upstream error is worth one
+// same-account retry with the flattened (safe) payload.
+func shouldRetrySafePayload(msg string) bool {
+	return isMalformedPayloadError(msg) || isGenericUpstreamServerError(msg)
+}
+
+// callWithHistoryFallback calls CallKiroAPIWithContinuation with the richer
+// payload first and, if the upstream rejects it with a recoverable error AND
+// nothing has been streamed yet, retries the SAME account once with the
+// flattened safe payload. When rich == safe (KeepToolHistory off) no fallback
+// is attempted.
+func callWithHistoryFallback(account *config.Account, rich, safe *KiroPayload, callback *KiroStreamCallback, started func() bool) error {
+	err := CallKiroAPIWithContinuation(account, rich, callback)
+	if err == nil {
+		return nil
+	}
+	if rich == safe || !shouldRetrySafePayload(err.Error()) || started() {
+		return err
+	}
+	logger.Warnf("[HistoryFallback] Rich payload rejected (%v); retrying same account with flattened history", err)
+	return CallKiroAPIWithContinuation(account, safe, callback)
+}

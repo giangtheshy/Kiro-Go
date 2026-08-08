@@ -70,8 +70,11 @@ func TestClaudeToKiroFlattensHistoryToolCyclesForCompaction(t *testing.T) {
 		}
 	}
 	combined := historyText.String()
-	if !strings.Contains(combined, "exec_command") {
-		t.Fatalf("expected narrated tool calls to mention exec_command, got:\n%s", combined)
+	// Tool names are normalized to the wire form the model sees in tool specs
+	// (rewriteHistoryToolNames), so assert on that rather than the client's
+	// original snake_case name.
+	if !strings.Contains(combined, "execCommand") {
+		t.Fatalf("expected narrated tool calls to mention the wire tool name, got:\n%s", combined)
 	}
 	if !strings.Contains(combined, "tests pass") {
 		t.Fatalf("expected narrated tool results to retain output, got:\n%s", combined)
@@ -88,8 +91,8 @@ func TestClaudeToKiroFlattensHistoryToolCyclesForCompaction(t *testing.T) {
 	}
 	// Tool identity must be attributed on the user (result) side, never authored
 	// by the assistant.
-	if !strings.Contains(combined, "[exec_command]") {
-		t.Fatalf("expected tool results to be attributed to exec_command on the user side, got:\n%s", combined)
+	if !strings.Contains(combined, "[execCommand") {
+		t.Fatalf("expected tool results attributed to the wire tool name on the user side, got:\n%s", combined)
 	}
 }
 
