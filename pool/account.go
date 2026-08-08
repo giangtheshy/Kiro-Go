@@ -563,6 +563,36 @@ func (p *AccountPool) AvailableCount() int {
 	return count
 }
 
+// HealthyCount returns the number of accounts that could actually serve a
+// request right now: enabled, not quota-blocked, and not cooling down.
+//
+// This deliberately re-reads config instead of counting p.accounts. That slice is
+// a snapshot taken by Reload, and UsageCurrent keeps climbing as requests are
+// served without Reload being called — so an account that exhausted its quota an
+// hour ago is still sitting in the snapshot. AvailableCount has the same blind
+// spot: it filters cooldowns only. Counting either one would report a healthy
+// pool while every account in it is refusing work, which is exactly the state an
+// unattended top-up is supposed to detect.
+func (p *AccountPool) HealthyCount() int {
+	enabled := config.GetEnabledAccounts()
+	allowOverUsage := config.GetAllowOverUsage()
+
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	count := 0
+	for _, acc := range enabled {
+		if isQuotaBlocked(acc, allowOverUsage) {
+			continue
+		}
+		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
 // UpdateStats 更新账号统计
 func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 	p.mu.Lock()

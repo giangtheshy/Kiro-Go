@@ -488,6 +488,14 @@ type KiroStreamCallback struct {
 	// otherwise be reported as a clean end_turn. The client then believes the
 	// answer finished and stops — the silent mid-task stop.
 	OnStopReason func(reason string)
+
+	// OnCacheTokens fires once at end of stream when the upstream reported its own
+	// prompt-cache split. These numbers are MEASURED, unlike the Claude paths'
+	// locally-derived estimate from cache_control breakpoints — and they are the
+	// only cache information available to the OpenAI and Responses protocols,
+	// which have no cache_control concept at all. read+write is a subset of the
+	// input token count, never an addition to it.
+	OnCacheTokens func(read, write int)
 }
 
 // ==================== API Call ====================
@@ -893,6 +901,7 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (Stre
 
 	// Read directly without bufio to avoid buffering latency in streaming responses.
 	var inputTokens, outputTokens int
+	var cacheTokens upstreamCacheTokens
 	var totalCredits float64
 	var currentToolUse *toolUseState
 	var lastAssistantContent string
@@ -980,7 +989,7 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (Stre
 			continue
 		}
 
-		inputTokens, outputTokens = updateTokensFromEvent(event, inputTokens, outputTokens)
+		inputTokens, outputTokens = updateTokensFromEvent(event, inputTokens, outputTokens, &cacheTokens)
 
 		// Dispatch by event type.
 		switch eventType {
@@ -1056,13 +1065,34 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (Stre
 		callback.OnCredits(totalCredits)
 	}
 
+	// Fired before OnComplete so a handler can fold the split into whatever it
+	// builds from the token counts.
+	if callback.OnCacheTokens != nil && cacheTokens.Reported {
+		callback.OnCacheTokens(cacheTokens.Read, cacheTokens.Write)
+	}
+
 	if callback.OnComplete != nil {
 		callback.OnComplete(inputTokens, outputTokens)
 	}
 	return outcome, nil
 }
 
-func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, currentOutputTokens int) (int, int) {
+// upstreamCacheTokens is the prompt-cache split the upstream reports itself.
+//
+// This is measured, not estimated. The Claude paths derive cache numbers locally
+// from cache_control breakpoints because Anthropic clients declare them, but the
+// OpenAI and Responses protocols have no such concept — for those, this is the
+// only cache information that exists, and it is better than any guess.
+type upstreamCacheTokens struct {
+	Read  int
+	Write int
+	// Reported distinguishes "the upstream said zero" from "the upstream said
+	// nothing", so a path with no cache activity is not confused with one whose
+	// numbers never arrived.
+	Reported bool
+}
+
+func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, currentOutputTokens int, cache *upstreamCacheTokens) (int, int) {
 	candidates := []map[string]interface{}{event}
 	collectUsageMaps(event, &candidates)
 
@@ -1081,6 +1111,20 @@ func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, cur
 			outputTokens = v
 		}
 
+		uncached, hasUncached := readTokenNumber(usage, "uncachedInputTokens", "uncached_input_tokens")
+		cacheRead, hasRead := readTokenNumber(usage, "cacheReadInputTokens", "cache_read_input_tokens")
+		cacheWrite, hasWrite := readTokenNumber(usage, "cacheWriteInputTokens", "cache_write_input_tokens", "cacheCreationInputTokens", "cache_creation_input_tokens")
+
+		// Captured BEFORE the inputTokens branch below. That branch returns early
+		// when the upstream also sent a plain total, which it usually does — so
+		// reading the split only in the fallback path threw the measured cache
+		// numbers away on exactly the requests that had them.
+		if cache != nil && (hasRead || hasWrite) {
+			cache.Read = cacheRead
+			cache.Write = cacheWrite
+			cache.Reported = true
+		}
+
 		if v, ok := readTokenNumber(usage,
 			"inputTokens", "promptTokens", "totalInputTokens",
 			"input_tokens", "prompt_tokens", "total_input_tokens",
@@ -1089,12 +1133,11 @@ func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, cur
 			continue
 		}
 
-		uncached, _ := readTokenNumber(usage, "uncachedInputTokens", "uncached_input_tokens")
-		cacheRead, _ := readTokenNumber(usage, "cacheReadInputTokens", "cache_read_input_tokens")
-		cacheWrite, _ := readTokenNumber(usage, "cacheWriteInputTokens", "cache_write_input_tokens", "cacheCreationInputTokens", "cache_creation_input_tokens")
-		if uncached+cacheRead+cacheWrite > 0 {
-			inputTokens = uncached + cacheRead + cacheWrite
-			continue
+		if hasUncached || hasRead || hasWrite {
+			if uncached+cacheRead+cacheWrite > 0 {
+				inputTokens = uncached + cacheRead + cacheWrite
+				continue
+			}
 		}
 
 		total, ok := readTokenNumber(usage, "totalTokens", "total_tokens")

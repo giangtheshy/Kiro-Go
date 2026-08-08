@@ -118,6 +118,8 @@
                 data-i18n="tabs.ipbans"></span></button>
             <button type="button" class="tab" data-tab="anomaly"><i
                 class="fa-solid fa-triangle-exclamation tab-icon"></i><span data-i18n="tabs.anomaly"></span></button>
+            <button type="button" class="tab" data-tab="autobuy"><i class="fa-solid fa-cart-shopping tab-icon"></i><span
+                data-i18n="tabs.autobuy"></span></button>
             <button type="button" class="tab" data-tab="audit"><i class="fa-solid fa-book tab-icon"></i><span
                 data-i18n="tabs.audit"></span></button>
           </div>
@@ -859,6 +861,229 @@
           </div>
           <div id="anomalyEmpty" class="muted-text hidden" style="padding:1rem 0;text-align:center;"
             data-i18n="anomaly.noData"></div>
+        </div>
+      </div>
+
+      <!-- Auto-buy tab -->
+      <div id="tabAutobuy" class="tab-content hidden">
+        <!-- Live status -->
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title" data-i18n="autobuy.statusTitle"></span>
+            <div class="card-actions">
+              <button class="btn btn-outline btn-sm" id="autobuyRefreshBtn" type="button"><i
+                  class="fa-solid fa-arrows-rotate" aria-hidden="true"></i><span class="btn-text"
+                  data-i18n="apilog.refresh"></span></button>
+            </div>
+          </div>
+          <p class="muted-text" data-i18n="autobuy.hint"></p>
+          <div id="autobuyStatus" class="apilog-summary"></div>
+          <div id="autobuyMarketError" class="muted-text hidden" style="padding:.5rem 0;"></div>
+        </div>
+
+        <!-- Purchase policy -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="autobuy.configTitle"></span></div>
+
+          <div class="form-group">
+            <label class="flex items-center gap-2">
+              <span class="switch"><input type="checkbox" id="autobuyEnabled" /><span class="slider"></span></span>
+              <span data-i18n="autobuy.enabled"></span>
+            </label>
+            <small data-i18n="autobuy.enabledHint"></small>
+          </div>
+
+          <div class="form-group">
+            <label class="flex items-center gap-2">
+              <span class="switch"><input type="checkbox" id="autobuyDryRun" /><span class="slider"></span></span>
+              <span data-i18n="autobuy.dryRun"></span>
+            </label>
+            <small data-i18n="autobuy.dryRunHint"></small>
+          </div>
+
+          <div class="form-group">
+            <label for="autobuyMarketKey" data-i18n="autobuy.marketKey"></label>
+            <input type="password" id="autobuyMarketKey" autocomplete="off" />
+            <small data-i18n="autobuy.marketKeyHint"></small>
+          </div>
+
+          <div class="form-group">
+            <label for="autobuyWebhookSecret" data-i18n="autobuy.webhookSecret"></label>
+            <input type="password" id="autobuyWebhookSecret" autocomplete="off" />
+            <small data-i18n="autobuy.webhookSecretHint"></small>
+          </div>
+
+          <div class="form-group">
+            <label for="autobuyBaseUrl" data-i18n="autobuy.baseUrl"></label>
+            <input type="text" id="autobuyBaseUrl" placeholder="https://api.91kiro.com" />
+          </div>
+
+          <div class="form-group">
+            <label for="autobuyNotifyWebhook" data-i18n="autobuy.notifyWebhook"></label>
+            <input type="text" id="autobuyNotifyWebhook" placeholder="https://..." />
+            <small data-i18n="autobuy.notifyWebhookHint"></small>
+          </div>
+
+          <div class="form-group">
+            <label data-i18n="autobuy.zonesTitle"></label>
+            <small data-i18n="autobuy.zonesHint"></small>
+          </div>
+
+          <div class="form-group">
+            <label class="flex items-center gap-2">
+              <span class="switch"><input type="checkbox" id="autobuyUsEnabled" /><span class="slider"></span></span>
+              <span data-i18n="autobuy.zoneUs"></span>
+            </label>
+          </div>
+
+          <div class="form-group">
+            <label for="autobuyUsMaxPrice" data-i18n="autobuy.maxUnitPrice"></label>
+            <input type="number" id="autobuyUsMaxPrice" min="0" step="1" />
+          </div>
+
+          <div class="form-group">
+            <label for="autobuyUsCount" data-i18n="autobuy.buyCount"></label>
+            <input type="number" id="autobuyUsCount" min="1" max="200" step="1" />
+          </div>
+
+          <div class="form-group">
+            <label for="autobuyUsMaxDay" data-i18n="autobuy.maxKeysPerDay"></label>
+            <input type="number" id="autobuyUsMaxDay" min="0" step="1" />
+          </div>
+
+          <div class="form-group">
+            <label class="flex items-center gap-2">
+              <span class="switch"><input type="checkbox" id="autobuyEuEnabled" /><span class="slider"></span></span>
+              <span data-i18n="autobuy.zoneEu"></span>
+            </label>
+          </div>
+
+          <div class="form-group">
+            <label for="autobuyEuMaxPrice" data-i18n="autobuy.maxUnitPrice"></label>
+            <input type="number" id="autobuyEuMaxPrice" min="0" step="1" />
+          </div>
+
+          <div class="form-group">
+            <label for="autobuyEuCount" data-i18n="autobuy.buyCount"></label>
+            <input type="number" id="autobuyEuCount" min="1" max="200" step="1" />
+          </div>
+
+          <div class="form-group">
+            <label for="autobuyEuMaxDay" data-i18n="autobuy.maxKeysPerDay"></label>
+            <input type="number" id="autobuyEuMaxDay" min="0" step="1" />
+          </div>
+
+          <div class="form-group">
+            <label for="autobuyMinHealthy" data-i18n="autobuy.minHealthy"></label>
+            <input type="number" id="autobuyMinHealthy" min="0" step="1" />
+            <small data-i18n="autobuy.minHealthyHint"></small>
+          </div>
+
+          <div class="form-group">
+            <label for="autobuyMaxPool" data-i18n="autobuy.maxPool"></label>
+            <input type="number" id="autobuyMaxPool" min="0" step="1" />
+            <small data-i18n="autobuy.maxPoolHint"></small>
+          </div>
+
+          <div class="form-group">
+            <label for="autobuyMinBalance" data-i18n="autobuy.minBalance"></label>
+            <input type="number" id="autobuyMinBalance" min="0" step="1" />
+            <small data-i18n="autobuy.minBalanceHint"></small>
+          </div>
+
+          <div class="form-group">
+            <label for="autobuyMaxCredits" data-i18n="autobuy.maxCreditsPerDay"></label>
+            <input type="number" id="autobuyMaxCredits" min="0" step="1" />
+            <small data-i18n="autobuy.maxCreditsPerDayHint"></small>
+          </div>
+
+          <div class="form-group">
+            <label class="flex items-center gap-2">
+              <span class="switch"><input type="checkbox" id="autobuyScheduleEnabled" /><span class="slider"></span></span>
+              <span data-i18n="autobuy.scheduleEnabled"></span>
+            </label>
+            <small data-i18n="autobuy.scheduleHint"></small>
+          </div>
+
+          <div class="form-group">
+            <label for="autobuyWindowStart" data-i18n="autobuy.windowStart"></label>
+            <input type="time" id="autobuyWindowStart" />
+          </div>
+
+          <div class="form-group">
+            <label for="autobuyWindowEnd" data-i18n="autobuy.windowEnd"></label>
+            <input type="time" id="autobuyWindowEnd" />
+          </div>
+
+          <div class="form-group">
+            <label data-i18n="autobuy.weekdays"></label>
+            <div id="autobuyWeekdays" class="input-row"></div>
+            <small data-i18n="autobuy.weekdaysHint"></small>
+          </div>
+
+          <div class="form-group">
+            <label for="autobuyPollInterval" data-i18n="autobuy.pollInterval"></label>
+            <input type="number" id="autobuyPollInterval" min="30" step="10" />
+            <small data-i18n="autobuy.pollIntervalHint"></small>
+          </div>
+
+          <div class="form-group">
+            <label for="autobuyRegion" data-i18n="autobuy.defaultRegion"></label>
+            <input type="text" id="autobuyRegion" placeholder="us-east-1" />
+            <small data-i18n="autobuy.defaultRegionHint"></small>
+          </div>
+
+          <div class="card-actions">
+            <button class="btn btn-primary btn-sm" id="autobuySaveBtn" type="button"><i
+                class="fa-solid fa-floppy-disk" aria-hidden="true"></i><span class="btn-text"
+                data-i18n="common.save"></span></button>
+            <button class="btn btn-outline btn-sm" id="autobuyDryRunBtn" type="button"><i
+                class="fa-solid fa-flask" aria-hidden="true"></i><span class="btn-text"
+                data-i18n="autobuy.testBuy"></span></button>
+            <select id="autobuyManualZone" data-i18n-aria-label="autobuy.zonesTitle">
+              <option value="us">us</option>
+              <option value="eu">eu</option>
+            </select>
+            <button class="btn btn-outline btn-sm" id="autobuyBuyNowBtn" type="button"><i
+                class="fa-solid fa-cart-plus" aria-hidden="true"></i><span class="btn-text"
+                data-i18n="autobuy.buyNow"></span></button>
+          </div>
+        </div>
+
+        <!-- Inbound market webhook -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="autobuy.webhookTitle"></span></div>
+          <p class="muted-text" data-i18n="autobuy.webhookHint"></p>
+          <div class="form-group">
+            <label for="autobuyWebhookUrl" data-i18n="autobuy.webhookUrl"></label>
+            <input type="text" id="autobuyWebhookUrl" readonly />
+          </div>
+
+        </div>
+
+        <!-- Purchase history -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="autobuy.logTitle"></span></div>
+          <div class="table-scroll">
+            <table class="data-table" id="autobuyLogTable">
+              <thead>
+                <tr>
+                  <th data-i18n="autobuy.colTime"></th>
+                  <th data-i18n="autobuy.colZone"></th>
+                  <th data-i18n="autobuy.colTrigger"></th>
+                  <th class="num" data-i18n="autobuy.colRequested"></th>
+                  <th class="num" data-i18n="autobuy.colPurchased"></th>
+                  <th class="num" data-i18n="autobuy.colUnitPrice"></th>
+                  <th class="num" data-i18n="autobuy.colCredits"></th>
+                  <th class="num" data-i18n="autobuy.colImported"></th>
+                  <th data-i18n="autobuy.colResult"></th>
+                </tr>
+              </thead>
+              <tbody id="autobuyLogBody"></tbody>
+            </table>
+          </div>
+          <div id="autobuyLogEmpty" class="muted-text hidden" style="padding:1rem 0;text-align:center;"
+            data-i18n="autobuy.noData"></div>
         </div>
       </div>
 

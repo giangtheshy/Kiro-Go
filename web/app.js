@@ -4914,6 +4914,377 @@
     });
   }
 
+  // ===================== Auto-buy (kiro-market) =====================
+
+  // autobuyWeekdays holds the currently selected days as time.Weekday numbers
+  // (0=Sunday), matching what the Go side expects. An empty set means every day.
+  let autobuyWeekdays = [];
+
+  function autobuyNum(id) {
+    const el = $(id);
+    if (!el) return 0;
+    const n = Number(el.value);
+    return isFinite(n) && n > 0 ? Math.floor(n) : 0;
+  }
+
+  function autobuySetNum(id, v) {
+    const el = $(id);
+    if (el) el.value = v == null || v === 0 ? '' : String(v);
+  }
+
+  function autobuyCheck(id) {
+    const el = $(id);
+    return !!(el && el.checked);
+  }
+
+  function autobuySetCheck(id, v) {
+    const el = $(id);
+    if (el) el.checked = !!v;
+  }
+
+  function autobuyText(id) {
+    const el = $(id);
+    return el ? el.value.trim() : '';
+  }
+
+  function autobuySetText(id, v) {
+    const el = $(id);
+    if (el) el.value = v == null ? '' : String(v);
+  }
+
+  function renderAutobuyWeekdays() {
+    const box = $('autobuyWeekdays');
+    if (!box) return;
+    // Sunday-first to match time.Weekday numbering, so the checkbox value is the
+    // number sent to the API rather than a translated label position.
+    const labels = ['weekday.sun', 'weekday.mon', 'weekday.tue', 'weekday.wed',
+      'weekday.thu', 'weekday.fri', 'weekday.sat'];
+    // Plain label + checkbox: the container is .input-row, and the stylesheet
+    // already lays out `.form-group .input-row > label` as an inline-flex row.
+    box.innerHTML = labels.map((key, idx) =>
+      '<label>' +
+        '<input type="checkbox" data-autobuy-weekday="' + idx + '"' +
+          (autobuyWeekdays.indexOf(idx) >= 0 ? ' checked' : '') + ' /> ' +
+        escapeHtml(t(key)) +
+      '</label>').join('');
+    qsa('#autobuyWeekdays input[data-autobuy-weekday]').forEach(el => {
+      el.addEventListener('change', () => {
+        const day = Number(el.dataset.autobuyWeekday);
+        const at = autobuyWeekdays.indexOf(day);
+        if (el.checked && at < 0) autobuyWeekdays.push(day);
+        else if (!el.checked && at >= 0) autobuyWeekdays.splice(at, 1);
+        autobuyWeekdays.sort((a, b) => a - b);
+      });
+    });
+  }
+
+  async function loadAutobuyConfig() {
+    let cfg = {};
+    try {
+      const res = await api('/autobuy/config');
+      const d = await res.json().catch(() => ({}));
+      cfg = d.config || {};
+    } catch (e) {
+      cfg = {};
+    }
+
+    autobuySetCheck('autobuyEnabled', cfg.enabled);
+    autobuySetCheck('autobuyDryRun', cfg.dryRun);
+    autobuySetText('autobuyBaseUrl', cfg.marketBaseUrl || '');
+    autobuySetText('autobuyNotifyWebhook', cfg.notifyWebhook || '');
+    autobuySetText('autobuyRegion', cfg.defaultRegion || '');
+
+    // Secrets are never sent to the browser. Leave the fields blank and say so in
+    // the placeholder: submitting blank means "keep the stored value".
+    const keyField = $('autobuyMarketKey');
+    if (keyField) {
+      keyField.value = '';
+      keyField.placeholder = cfg.hasMarketApiKey ? t('autobuy.secretStored') : 'usr-…';
+    }
+    const secretField = $('autobuyWebhookSecret');
+    if (secretField) {
+      secretField.value = '';
+      secretField.placeholder = cfg.hasWebhookSecret ? t('autobuy.secretStored') : '';
+    }
+
+    const zones = cfg.zones || {};
+    const us = zones.us || {};
+    const eu = zones.eu || {};
+    autobuySetCheck('autobuyUsEnabled', us.enabled);
+    autobuySetNum('autobuyUsMaxPrice', us.maxUnitPrice);
+    autobuySetNum('autobuyUsCount', us.buyCount);
+    autobuySetNum('autobuyUsMaxDay', us.maxKeysPerDay);
+    autobuySetCheck('autobuyEuEnabled', eu.enabled);
+    autobuySetNum('autobuyEuMaxPrice', eu.maxUnitPrice);
+    autobuySetNum('autobuyEuCount', eu.buyCount);
+    autobuySetNum('autobuyEuMaxDay', eu.maxKeysPerDay);
+
+    autobuySetNum('autobuyMinHealthy', cfg.minHealthyAccounts);
+    autobuySetNum('autobuyMaxPool', cfg.maxPoolAccounts);
+    autobuySetNum('autobuyMinBalance', cfg.minBalance);
+    autobuySetNum('autobuyMaxCredits', cfg.maxCreditsPerDay);
+    autobuySetNum('autobuyPollInterval', cfg.pollIntervalSec);
+
+    autobuySetCheck('autobuyScheduleEnabled', cfg.scheduleEnabled);
+    autobuySetText('autobuyWindowStart', cfg.windowStart || '');
+    autobuySetText('autobuyWindowEnd', cfg.windowEnd || '');
+    autobuyWeekdays = Array.isArray(cfg.weekdays) ? cfg.weekdays.slice() : [];
+    renderAutobuyWeekdays();
+
+    const urlField = $('autobuyWebhookUrl');
+    if (urlField) {
+      urlField.value = location.origin + (cfg.webhookPath || '/autobuy/webhook');
+    }
+  }
+
+  function collectAutobuyConfig() {
+    return {
+      enabled: autobuyCheck('autobuyEnabled'),
+      dryRun: autobuyCheck('autobuyDryRun'),
+      // Blank means unchanged; the server carries the stored secret over.
+      marketApiKey: autobuyText('autobuyMarketKey'),
+      webhookSecret: autobuyText('autobuyWebhookSecret'),
+      marketBaseUrl: autobuyText('autobuyBaseUrl'),
+      notifyWebhook: autobuyText('autobuyNotifyWebhook'),
+      defaultRegion: autobuyText('autobuyRegion'),
+      zones: {
+        us: {
+          enabled: autobuyCheck('autobuyUsEnabled'),
+          maxUnitPrice: autobuyNum('autobuyUsMaxPrice'),
+          buyCount: autobuyNum('autobuyUsCount'),
+          maxKeysPerDay: autobuyNum('autobuyUsMaxDay')
+        },
+        eu: {
+          enabled: autobuyCheck('autobuyEuEnabled'),
+          maxUnitPrice: autobuyNum('autobuyEuMaxPrice'),
+          buyCount: autobuyNum('autobuyEuCount'),
+          maxKeysPerDay: autobuyNum('autobuyEuMaxDay')
+        }
+      },
+      minHealthyAccounts: autobuyNum('autobuyMinHealthy'),
+      maxPoolAccounts: autobuyNum('autobuyMaxPool'),
+      minBalance: autobuyNum('autobuyMinBalance'),
+      maxCreditsPerDay: autobuyNum('autobuyMaxCredits'),
+      scheduleEnabled: autobuyCheck('autobuyScheduleEnabled'),
+      windowStart: autobuyText('autobuyWindowStart'),
+      windowEnd: autobuyText('autobuyWindowEnd'),
+      weekdays: autobuyWeekdays.slice(),
+      pollIntervalSec: autobuyNum('autobuyPollInterval')
+    };
+  }
+
+  async function saveAutobuyConfig() {
+    try {
+      const res = await api('/autobuy/config', {
+        method: 'PUT',
+        body: JSON.stringify(collectAutobuyConfig())
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toastError(d.error || t('autobuy.saveFailed'));
+        return;
+      }
+      toastPrimary(t('autobuy.saved'));
+      await loadAutobuyConfig();
+      await loadAutobuyStatus();
+    } catch (e) {
+      toastError(t('autobuy.saveFailed'));
+    }
+  }
+
+  // autobuyChip renders one status pill. Label and value go in as flat text
+  // because .apilog-chip styles its own text directly and has no inner
+  // label/value elements to hook onto.
+  function autobuyChip(label, value, style) {
+    return '<span class="apilog-chip"' + (style ? ' style="' + escapeAttr(style) + '"' : '') + '>' +
+      escapeHtml(label + ': ' + value) + '</span>';
+  }
+
+  async function loadAutobuyStatus() {
+    const box = $('autobuyStatus');
+    const errBox = $('autobuyMarketError');
+    if (!box) return;
+
+    let s = {};
+    try {
+      const res = await api('/autobuy/status');
+      s = await res.json().catch(() => ({}));
+    } catch (e) {
+      box.innerHTML = '<span class="muted-text">' + escapeHtml(t('autobuy.statusUnavailable')) + '</span>';
+      return;
+    }
+
+    let stateKey = 'autobuy.stateDisabled';
+    if (s.enabled && s.dryRun) stateKey = 'autobuy.stateDryRun';
+    else if (s.enabled && s.withinWindow === false) stateKey = 'autobuy.stateOutsideWindow';
+    else if (s.enabled) stateKey = 'autobuy.stateActive';
+
+    const chips = [];
+    // Colour the state chip so "disabled" and "outside window" read at a glance:
+    // both mean nothing will be bought, which is the thing an operator checks for.
+    const stateStyle = (s.enabled && !s.dryRun && s.withinWindow !== false)
+      ? 'color:#22c55e;'
+      : 'color:#f59e0b;';
+    chips.push(autobuyChip(t('autobuy.state'), t(stateKey), stateStyle));
+    chips.push(autobuyChip(t('autobuy.healthyAccounts'), formatNumber(s.healthyAccounts || 0)));
+    chips.push(autobuyChip(t('autobuy.poolTotal'), formatNumber(s.totalAccounts || 0)));
+
+    const market = s.market || {};
+    if (market.balance != null) {
+      chips.push(autobuyChip(t('autobuy.balance'), formatNumber(market.balance)));
+    }
+    if (market.keysHeld != null) {
+      // 0 upstream means unlimited, so render that rather than "of 0".
+      const cap = market.holdCapEffective ? formatNumber(market.holdCapEffective) : '∞';
+      chips.push(autobuyChip(t('autobuy.keysHeld'), formatNumber(market.keysHeld) + ' / ' + cap));
+    }
+
+    const spent = formatNumber(s.spentToday || 0);
+    chips.push(autobuyChip(t('autobuy.spentToday'),
+      s.maxCreditsPerDay ? spent + ' / ' + formatNumber(s.maxCreditsPerDay) : spent));
+
+    // Live stock per zone, as "available @ current price". The price is the
+    // already-decayed one the market would charge right now.
+    const stock = s.stock || {};
+    (stock.zones || []).forEach(z => {
+      chips.push(autobuyChip((z.zone || '').toUpperCase(),
+        formatNumber(z.available || 0) + ' @ ' + formatNumber(z.unit_price || 0)));
+    });
+
+    const zones = s.zones || {};
+    ['us', 'eu'].forEach(z => {
+      const zc = zones[z];
+      if (!zc || !zc.enabled) return;
+      const bought = formatNumber(zc.boughtToday || 0);
+      chips.push(autobuyChip(t('autobuy.boughtToday') + ' ' + z.toUpperCase(),
+        zc.maxKeysPerDay ? bought + ' / ' + formatNumber(zc.maxKeysPerDay) : bought));
+    });
+
+    box.innerHTML = chips.join('');
+
+    if (errBox) {
+      if (s.marketError) {
+        errBox.textContent = t('autobuy.marketError') + ': ' + s.marketError;
+        errBox.classList.remove('hidden');
+      } else {
+        errBox.classList.add('hidden');
+      }
+    }
+  }
+
+  async function loadAutobuyLogs() {
+    const body = $('autobuyLogBody');
+    const empty = $('autobuyLogEmpty');
+    if (!body) return;
+
+    let logs = [];
+    try {
+      const res = await api('/autobuy/logs?limit=50');
+      const d = await res.json().catch(() => ({}));
+      logs = Array.isArray(d.logs) ? d.logs : [];
+    } catch (e) {
+      logs = [];
+    }
+
+    if (!logs.length) {
+      body.innerHTML = '';
+      if (empty) empty.classList.remove('hidden');
+      return;
+    }
+    if (empty) empty.classList.add('hidden');
+
+    body.innerHTML = logs.map(e => {
+      let resultHtml;
+      if (e.error) {
+        // The upstream code is the actionable part (no_stock is routine,
+        // purchase_cap_reached needs a human), so lead with it.
+        const label = e.code || t('autobuy.resultFailed');
+        resultHtml = '<span class="badge badge-error" title="' + escapeAttr(e.error) + '">' +
+          escapeHtml(label) + '</span>';
+      } else if (e.dryRun) {
+        resultHtml = '<span class="badge badge-muted">' + escapeHtml(t('autobuy.resultDryRun')) + '</span>';
+      } else {
+        resultHtml = '<span class="badge badge-success">' + escapeHtml(t('autobuy.resultOk')) + '</span>';
+      }
+      const imported = e.skipped
+        ? formatNumber(e.imported || 0) + ' (+' + formatNumber(e.skipped) + ')'
+        : formatNumber(e.imported || 0);
+      return '<tr>' +
+        '<td class="text-xs font-mono">' + escapeHtml(formatLogTime(e.timeUnix)) + '</td>' +
+        '<td class="text-xs">' + escapeHtml((e.zone || '').toUpperCase()) + '</td>' +
+        '<td class="text-xs">' + escapeHtml(e.trigger || '') + '</td>' +
+        '<td class="num">' + escapeHtml(formatNumber(e.requested || 0)) + '</td>' +
+        '<td class="num">' + escapeHtml(formatNumber(e.purchased || 0)) + '</td>' +
+        '<td class="num">' + escapeHtml(formatNumber(e.unitPrice || 0)) + '</td>' +
+        '<td class="num">' + escapeHtml(formatNumber(e.credits || 0)) + '</td>' +
+        '<td class="num">' + escapeHtml(imported) + '</td>' +
+        '<td>' + resultHtml + '</td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  async function loadAutobuy() {
+    await loadAutobuyConfig();
+    await Promise.all([loadAutobuyStatus(), loadAutobuyLogs()]);
+  }
+
+  // triggerAutobuyBuy runs one purchase attempt through the same guards the
+  // unattended worker uses, so the button verifies the live policy rather than
+  // bypassing it.
+  async function triggerAutobuyBuy(dryRun) {
+    const zoneSel = $('autobuyManualZone');
+    const zone = zoneSel ? zoneSel.value : 'us';
+    try {
+      const res = await api('/autobuy/buy', {
+        method: 'POST',
+        body: JSON.stringify({ zone: zone, dryRun: !!dryRun })
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toastError(d.error || t('autobuy.buyFailed'));
+      } else if (d.skipped) {
+        // A skip is the policy working, not an error, so it is a warning.
+        toastWarning(t('autobuy.buySkipped') + ': ' + (d.reason || ''));
+      } else {
+        const entry = d.entry || {};
+        if (entry.dryRun) {
+          toastPrimary(t('autobuy.dryRunResult', formatNumber(entry.requested || 0),
+            formatNumber(entry.unitPrice || 0)));
+        } else {
+          toastPrimary(t('autobuy.buyResult', formatNumber(entry.purchased || 0),
+            formatNumber(entry.credits || 0)));
+        }
+      }
+    } catch (e) {
+      toastError(t('autobuy.buyFailed'));
+    }
+    await Promise.all([loadAutobuyStatus(), loadAutobuyLogs()]);
+  }
+
+  function bindAutobuyEvents() {
+    const refresh = $('autobuyRefreshBtn');
+    if (refresh) refresh.addEventListener('click', () => {
+      loadAutobuyStatus();
+      loadAutobuyLogs();
+    });
+    const save = $('autobuySaveBtn');
+    if (save) save.addEventListener('click', saveAutobuyConfig);
+    const dry = $('autobuyDryRunBtn');
+    if (dry) dry.addEventListener('click', () => triggerAutobuyBuy(true));
+
+    const buyNow = $('autobuyBuyNowBtn');
+    if (buyNow) buyNow.addEventListener('click', async () => {
+      // Real money, so confirm. The dry-run button next to it is one character
+      // away and an accidental click here would spend credits.
+      const ok = await confirmAction(t('autobuy.buyNowConfirm'));
+      if (!ok) return;
+      triggerAutobuyBuy(false);
+    });
+
+    const urlField = $('autobuyWebhookUrl');
+    if (urlField) urlField.addEventListener('focus', () => urlField.select());
+  }
+
   // isKnownTab guards against a hand-edited ?tab= value pointing at a panel that
   // does not exist — switchTab would otherwise throw on a null content element.
   function isKnownTab(tab) {
@@ -4937,6 +5308,7 @@
     if (tab === 'apilog') { populateApiLogKeyFilter(); loadApiLog(); toggleApiLogLive(); }
     else if (tab === 'settings') { startTabPolling(refreshApiKeysIfIdle); }
     else if (tab === 'providers') { loadProviders(); }
+    else if (tab === 'autobuy') { loadAutobuy(); }
     else if (tab === 'ipbans') { loadIPBans(); }
     else if (tab === 'anomaly') { loadAnomalies(); }
     else if (tab === 'audit') { loadAuditLog(auditActionFilter); }
@@ -5184,6 +5556,7 @@
     bindConsoleEvents();
     bindSecurityEvents();
     bindProviderEvents();
+    bindAutobuyEvents();
   }
 
   // Init

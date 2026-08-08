@@ -193,6 +193,7 @@ func (h *Handler) handleResponsesNonStream(
 		var realInputTokens int
 		var truncated bool
 		var upstreamStopReason string
+		var cacheRead, cacheWrite int
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -202,11 +203,12 @@ func (h *Handler) handleResponsesNonStream(
 					content += text
 				}
 			},
-			OnToolUse:    func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
-			OnComplete:   func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
-			OnCredits:    func(c float64) { credits = c },
-			OnTruncated:  func() { truncated = true },
-			OnStopReason: func(reason string) { upstreamStopReason = reason },
+			OnToolUse:     func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
+			OnComplete:    func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
+			OnCredits:     func(c float64) { credits = c },
+			OnTruncated:   func() { truncated = true },
+			OnStopReason:  func(reason string) { upstreamStopReason = reason },
+			OnCacheTokens: func(read, write int) { cacheRead = read; cacheWrite = write },
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
@@ -242,10 +244,12 @@ func (h *Handler) handleResponsesNonStream(
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
 		h.recordSuccessForApiKey(apiKeyID, requestUsage{
-			Input:    inputTokens,
-			Output:   outputTokens,
-			Credits:  credits,
-			ClientIP: pc.clientIP(),
+			Input:      inputTokens,
+			Output:     outputTokens,
+			CacheRead:  cacheRead,
+			CacheWrite: cacheWrite,
+			Credits:    credits,
+			ClientIP:   pc.clientIP(),
 		}, model, account, "openai", startedAt)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
@@ -542,6 +546,8 @@ func (h *Handler) handleResponsesStream(
 			realInputTokens    int
 			truncated          bool
 			upstreamStopReason string
+			cacheRead          int
+			cacheWrite         int
 		)
 
 		messageItemID := generateOutputItemID("msg")
@@ -663,10 +669,11 @@ func (h *Handler) handleResponsesStream(
 				outputIndex++
 				responseStarted = true
 			},
-			OnComplete:   func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
-			OnCredits:    func(c float64) { credits = c },
-			OnTruncated:  func() { truncated = true },
-			OnStopReason: func(reason string) { upstreamStopReason = reason },
+			OnComplete:    func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
+			OnCredits:     func(c float64) { credits = c },
+			OnTruncated:   func() { truncated = true },
+			OnStopReason:  func(reason string) { upstreamStopReason = reason },
+			OnCacheTokens: func(read, write int) { cacheRead = read; cacheWrite = write },
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
@@ -772,10 +779,12 @@ func (h *Handler) handleResponsesStream(
 		}
 
 		h.recordSuccessForApiKey(apiKeyID, requestUsage{
-			Input:    inputTokens,
-			Output:   outputTokens,
-			Credits:  credits,
-			ClientIP: pc.clientIP(),
+			Input:      inputTokens,
+			Output:     outputTokens,
+			CacheRead:  cacheRead,
+			CacheWrite: cacheWrite,
+			Credits:    credits,
+			ClientIP:   pc.clientIP(),
 		}, model, account, "openai", startedAt)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)

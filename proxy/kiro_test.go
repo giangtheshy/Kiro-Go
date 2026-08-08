@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -191,19 +192,32 @@ func TestBuildKiroTransportUsesExplicitProxyURL(t *testing.T) {
 	assertProxyURL(t, got, "http://proxy.local:8080")
 }
 
+// An empty proxyURL must leave proxy selection to the environment.
+//
+// This asserts the wiring rather than calling transport.Proxy and checking the URL
+// it returns. http.ProxyFromEnvironment reads the environment exactly once per
+// process and memoises the result, so a t.Setenv here only takes effect if this
+// test is the first thing in the whole binary to touch proxy configuration. Any
+// earlier test that builds a transport or makes an HTTP request wins the race, and
+// the assertion then fails for a reason unrelated to the code under test — which
+// is what made this test order-dependent.
 func TestBuildKiroTransportFallsBackToEnvironmentProxy(t *testing.T) {
-	t.Setenv("HTTPS_PROXY", "http://env-proxy.local:2323")
-	t.Setenv("NO_PROXY", "")
-	t.Setenv("no_proxy", "")
-
 	transport := buildKiroTransport("")
-	req := &http.Request{URL: mustParseURL(t, "https://q.us-east-1.amazonaws.com")}
 
-	got, err := transport.Proxy(req)
-	if err != nil {
-		t.Fatalf("unexpected proxy error: %v", err)
+	if transport.Proxy == nil {
+		t.Fatal("expected the environment proxy resolver to be wired, got nil")
 	}
-	assertProxyURL(t, got, "http://env-proxy.local:2323")
+	want := reflect.ValueOf(http.ProxyFromEnvironment).Pointer()
+	got := reflect.ValueOf(transport.Proxy).Pointer()
+	if got != want {
+		t.Fatal("expected Proxy to be http.ProxyFromEnvironment so HTTPS_PROXY/NO_PROXY are honoured")
+	}
+
+	// HTTP/2 stays enabled on the direct path; it is only disabled for an
+	// explicitly proxied transport, which cannot negotiate it.
+	if !transport.ForceAttemptHTTP2 {
+		t.Fatal("expected HTTP/2 to remain enabled when no explicit proxy is set")
+	}
 }
 
 func TestInitKiroHttpClientKeepsShortRestTimeout(t *testing.T) {

@@ -66,6 +66,8 @@ type Handler struct {
 	// EventSource (which cannot set headers) can open the per-key stream.
 	streamTickets    *streamTicketStore
 	stopAlertWatcher chan struct{}
+	// stopAutoBuy stops the unattended market key buyer. See proxy/autobuy_worker.go.
+	stopAutoBuy chan struct{}
 	// providerCursor drives weighted round-robin across external providers that
 	// share a routing tier. See proxy/upstream_router.go.
 	providerCursor uint64
@@ -287,6 +289,7 @@ func NewHandler() *Handler {
 	h.keyLogHub = newKeyLogHub()
 	h.streamTickets = newStreamTicketStore()
 	h.stopAlertWatcher = make(chan struct{})
+	h.stopAutoBuy = make(chan struct{})
 	// 启动后台刷新
 	safeGo(func() { h.backgroundRefresh() })
 	// 启动后台统计保存 (每30秒保存一次)
@@ -295,6 +298,8 @@ func NewHandler() *Handler {
 	safeGo(func() { h.backgroundPurge() })
 	// 低额度 / 即将过期告警扫描
 	safeGo(func() { h.backgroundAlertWatcher() })
+	// 市场 Key 自动购买（轮询兜底，webhook 为主路径）
+	safeGo(func() { h.backgroundAutoBuy() })
 	return h
 }
 
@@ -325,6 +330,7 @@ func (h *Handler) Shutdown() {
 		close(h.stopStatsSaver)
 		close(h.stopPurge)
 		close(h.stopAlertWatcher)
+		close(h.stopAutoBuy)
 		if h.ipBanGate != nil {
 			h.ipBanGate.close()
 		}
@@ -641,6 +647,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.serveUsagePage(w, r)
 	case (path == "/usage" || path == "/usage/" || path == "/v1/usage") && r.Method == "POST":
 		h.apiUsageSelfService(w, r)
+	// 市场 Key 补货回调。必须放在 /admin/api/ 密码闸门之外：市场服务器没有管理员
+	// 密码，它用共享密钥对请求体签名，走 HMAC 校验（见 handleAutoBuyWebhook）。
+	case path == autoBuyWebhookPath || path == autoBuyWebhookPath+"/":
+		h.handleAutoBuyWebhook(w, r)
 	// Session login/logout must be reachable WITHOUT a prior session (they sit
 	// before the password gate in handleAdminAPI).
 	case path == "/admin/api/login":
@@ -2454,6 +2464,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		var realInputTokens int
 		var truncated bool
 		var upstreamStopReason string
+		var cacheRead, cacheWrite int
 		var rawContentBuilder strings.Builder
 		var rawReasoningBuilder strings.Builder
 		var textBuffer string
@@ -2734,6 +2745,10 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			OnStopReason: func(reason string) {
 				upstreamStopReason = reason
 			},
+			OnCacheTokens: func(read, write int) {
+				cacheRead = read
+				cacheWrite = write
+			},
 		}
 
 		safeP := payload
@@ -2777,10 +2792,12 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		}
 
 		h.recordSuccessForApiKey(apiKeyID, requestUsage{
-			Input:    inputTokens,
-			Output:   outputTokens,
-			Credits:  credits,
-			ClientIP: pc.clientIP(),
+			Input:      inputTokens,
+			Output:     outputTokens,
+			CacheRead:  cacheRead,
+			CacheWrite: cacheWrite,
+			Credits:    credits,
+			ClientIP:   pc.clientIP(),
 		}, model, account, "openai", startedAt)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
@@ -2880,6 +2897,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		var realInputTokens int
 		var truncated bool
 		var upstreamStopReason string
+		var cacheRead, cacheWrite int
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -2889,11 +2907,12 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 					content += text
 				}
 			},
-			OnToolUse:   func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
-			OnComplete:  func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
-			OnCredits:   func(c float64) { credits = c },
-			OnTruncated:  func() { truncated = true },
-			OnStopReason: func(reason string) { upstreamStopReason = reason },
+			OnToolUse:     func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
+			OnComplete:    func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
+			OnCredits:     func(c float64) { credits = c },
+			OnTruncated:   func() { truncated = true },
+			OnStopReason:  func(reason string) { upstreamStopReason = reason },
+			OnCacheTokens: func(read, write int) { cacheRead = read; cacheWrite = write },
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
@@ -2931,10 +2950,12 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
 		h.recordSuccessForApiKey(apiKeyID, requestUsage{
-			Input:    inputTokens,
-			Output:   outputTokens,
-			Credits:  credits,
-			ClientIP: pc.clientIP(),
+			Input:      inputTokens,
+			Output:     outputTokens,
+			CacheRead:  cacheRead,
+			CacheWrite: cacheWrite,
+			Credits:    credits,
+			ClientIP:   pc.clientIP(),
 		}, model, account, "openai", startedAt)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
@@ -3329,6 +3350,19 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetAuditLog(w, r)
 	case path == "/maintenance" && r.Method == "POST":
 		h.apiSetMaintenanceMode(w, r)
+
+	// 市场 Key 自动购买。注意 inbound webhook 不在此处：它由 HMAC 而非管理员密码
+	// 鉴权，见 ServeHTTP 中的 autoBuyWebhookPath。
+	case path == "/autobuy/config" && r.Method == "GET":
+		h.apiGetAutoBuyConfig(w, r)
+	case path == "/autobuy/config" && r.Method == "PUT":
+		h.apiSetAutoBuyConfig(w, r)
+	case path == "/autobuy/status" && r.Method == "GET":
+		h.apiGetAutoBuyStatus(w, r)
+	case path == "/autobuy/logs" && r.Method == "GET":
+		h.apiGetAutoBuyLogs(w, r)
+	case path == "/autobuy/buy" && r.Method == "POST":
+		h.apiAutoBuyManual(w, r)
 	case path == "/credit-topups" && r.Method == "GET":
 		h.salesTopupsAdmin(w, r)
 	default:

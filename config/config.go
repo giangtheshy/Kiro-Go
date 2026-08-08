@@ -455,6 +455,12 @@ type Config struct {
 	// instead of forwarding to Kiro. Admin endpoints and /health are unaffected.
 	MaintenanceMode    bool   `json:"maintenanceMode,omitempty"`
 	MaintenanceMessage string `json:"maintenanceMessage,omitempty"`
+
+	// AutoBuy configures unattended purchasing of Kiro keys from the kiro-market
+	// API. A pointer so an absent key in an older config.json stays absent rather
+	// than materialising a zero-valued block that reads like a configured feature.
+	// See config/autobuy.go.
+	AutoBuy *AutoBuyConfig `json:"autoBuy,omitempty"`
 }
 
 // PooledProxy is one outbound proxy in the shared pool, carrying persisted
