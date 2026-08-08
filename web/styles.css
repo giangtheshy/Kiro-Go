@@ -983,24 +983,28 @@ label:has(> .switch) > span {
 .header-nav {
   display: flex;
   align-items: center;
-  /* `safe center` keeps the strip centred while it fits, but falls back to
-     start-alignment once it overflows so the first tab stays reachable. */
   justify-content: center;
-  justify-content: safe center;
   margin-left: 0;
   min-width: 0;
-  overflow-x: auto;
-  overscroll-behavior-x: contain;
-  scrollbar-width: none;
-}
-.header-nav::-webkit-scrollbar {
-  display: none;
+  /* Deliberately NOT a scroll container. It used to be `overflow-x: auto` with
+     the scrollbar hidden, which silently clipped the last tabs: the strip needs
+     more width than this column ever gets, so the rightmost tabs sat outside the
+     visible box with no scrollbar to reveal them. The strip wraps instead (see
+     .tabs), so every tab stays reachable at any width. */
+  overflow: visible;
 }
 .tabs {
   display: flex;
   align-items: center;
-  flex: 0 0 auto;
+  /* Shrinkable and wrappable so an extra tab pushes onto a second row rather
+     than off the edge. Without min-width:0 a flex item refuses to shrink below
+     its content and overflows the grid column instead of wrapping. */
+  flex: 1 1 auto;
+  min-width: 0;
+  flex-wrap: wrap;
+  justify-content: center;
   gap: 0;
+  row-gap: 0.25rem;
   background: transparent;
   border: 0;
   border-radius: 0;
@@ -1012,11 +1016,14 @@ label:has(> .switch) > span {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 0.35rem;
+  /* Tightened from 0.35rem/0.625rem: ten tabs at the old spacing needed more
+     width than the header column can grant, and the labels are the last thing
+     that should be sacrificed. Buys ~75px across the strip. */
+  gap: 0.25rem;
   min-width: 0;
   white-space: nowrap;
   height: 2.25rem;
-  padding: 0 0.625rem;
+  padding: 0 0.4375rem;
   font-size: 0.875rem;
   font-weight: 500;
   color: var(--muted-foreground);
@@ -1043,8 +1050,10 @@ label:has(> .switch) > span {
 .tab.active::after {
   content: "";
   position: absolute;
-  left: 0.625rem;
-  right: 0.625rem;
+  /* Matches .tab's horizontal padding so the underline spans the label exactly;
+     these two move together. */
+  left: 0.4375rem;
+  right: 0.4375rem;
   bottom: -1px;
   height: 2px;
   border-radius: 2px 2px 0 0;
@@ -1287,14 +1296,20 @@ label:has(> .switch) > span {
   border-bottom: 1px solid var(--glass-border);
 }
 .app-header-inner {
-  max-width: 1200px;
+  /* Wider than the 1200px content column on purpose. Brand + actions + gaps +
+     padding cost a fixed ~475px, so a 1200px shell left the tab strip only
+     ~725px — less than the 10 tabs need in any language, at every screen size.
+     1440px gives the strip enough room to stay on one row on a normal desktop. */
+  max-width: 1440px;
   margin: 0 auto;
   padding: 0 2rem;
-  height: 4rem;
+  /* min-height, not height: the tab strip wraps to a second row on narrow
+     laptops, and a fixed height would push that row outside the header. */
+  min-height: 4rem;
   display: grid;
   /* Brand and actions size to their content; the nav track absorbs whatever is
-     left and scrolls. With a 1fr brand/actions split the tab strip would instead
-     push the right-hand controls out of the header at narrow desktop widths. */
+     left. With a 1fr brand/actions split the tab strip would instead push the
+     right-hand controls out of the header at narrow desktop widths. */
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 1rem;
