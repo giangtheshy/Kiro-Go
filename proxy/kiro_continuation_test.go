@@ -269,3 +269,75 @@ func TestBuildContinuationPayloadDoesNotMutateOriginal(t *testing.T) {
 		t.Fatal("toolResults belong to the turn now in history and must be dropped")
 	}
 }
+
+// Moving the interrupted turn into history must strip its structured tool blocks.
+// Upstream accepts at most one active tool turn — the last history assistant's
+// toolUses answered by the CURRENT message's toolResults. The resume's assistant
+// entry is the partial answer and carries no toolUses, so leaving the results
+// structured presents an unanswered tool turn and the whole request is rejected.
+func TestBuildContinuationPayloadNarratesToolResultsIntoHistory(t *testing.T) {
+	original := &KiroPayload{}
+	original.ConversationState.History = []KiroHistoryMessage{{
+		AssistantResponseMessage: &KiroAssistantResponseMessage{
+			ToolUses: []KiroToolUse{{ToolUseID: "tool_1", Name: "read_file"}},
+		},
+	}}
+	original.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
+		ModelID: "claude-sonnet-4.5",
+		Origin:  "AI_EDITOR",
+		UserInputMessageContext: &UserInputMessageContext{
+			Tools: []KiroToolWrapper{{}},
+			ToolResults: []KiroToolResult{{
+				ToolUseID: "tool_1",
+				Content:   []KiroResultContent{{Text: "SENTINEL_TOOL_OUTPUT"}},
+			}},
+		},
+	}
+
+	resume := buildContinuationPayload(original, longEnoughToResume)
+	if resume == nil {
+		t.Fatal("expected a resume payload")
+	}
+
+	for i, h := range resume.ConversationState.History {
+		if h.UserInputMessage == nil {
+			continue
+		}
+		if ctx := h.UserInputMessage.UserInputMessageContext; ctx != nil {
+			t.Fatalf("history[%d] must not carry a tool context, got tools=%d toolResults=%d",
+				i, len(ctx.Tools), len(ctx.ToolResults))
+		}
+	}
+
+	// The output the model was reasoning over when it was cut off has to survive
+	// as prose, otherwise the resume reasons from nothing.
+	var narrated bool
+	for _, h := range resume.ConversationState.History {
+		if h.UserInputMessage != nil && strings.Contains(h.UserInputMessage.Content, "SENTINEL_TOOL_OUTPUT") {
+			narrated = true
+		}
+	}
+	if !narrated {
+		t.Fatal("tool output must be narrated into the history turn, not dropped")
+	}
+}
+
+// The tool specs are read off the same context that gets cleared for history, so
+// this pins that they are captured first. Losing them silently hands the model an
+// empty toolset on resume — it then cannot issue the call it was cut off before
+// and ends the turn with prose, which is the exact bug the resume exists to avoid.
+func TestBuildContinuationPayloadKeepsToolSpecsWhenResultsPresent(t *testing.T) {
+	original := &KiroPayload{}
+	original.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
+		UserInputMessageContext: &UserInputMessageContext{
+			Tools:       []KiroToolWrapper{{}, {}},
+			ToolResults: []KiroToolResult{{ToolUseID: "tool_1"}},
+		},
+	}
+
+	resume := buildContinuationPayload(original, longEnoughToResume)
+	cur := resume.ConversationState.CurrentMessage.UserInputMessage
+	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.Tools) != 2 {
+		t.Fatalf("tool specs must survive the history clear, got %+v", cur.UserInputMessageContext)
+	}
+}

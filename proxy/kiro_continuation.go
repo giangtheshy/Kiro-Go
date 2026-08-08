@@ -196,6 +196,38 @@ func buildContinuationPayload(payload *KiroPayload, delivered string) *KiroPaylo
 	history = append(history, payload.ConversationState.History...)
 
 	interrupted := payload.ConversationState.CurrentMessage.UserInputMessage
+
+	// Capture the tool specs BEFORE the context is cleared below. The resume turn
+	// still needs them so the model can issue the call it was cut off before, and
+	// reading them after the clear would silently hand it an empty toolset.
+	var resumeTools []KiroToolWrapper
+	if ctx := interrupted.UserInputMessageContext; ctx != nil {
+		resumeTools = ctx.Tools
+	}
+
+	// Moving the interrupted turn into history must not carry its structured tool
+	// blocks with it. Upstream accepts at most ONE active tool turn — the last
+	// history assistant's toolUses answered by the CURRENT message's toolResults —
+	// and the resume turn's assistant (the partial answer) has no toolUses at all.
+	// Leaving the results structured would present an unanswered tool turn and get
+	// the whole request rejected. sanitizeKiroHistory solves this for the normal
+	// path by narrating results into the message text; do the same here so the
+	// model still sees the tool output it was reasoning over when it was cut off.
+	if ctx := interrupted.UserInputMessageContext; ctx != nil && len(ctx.ToolResults) > 0 {
+		names := make(map[string]string, len(ctx.ToolResults))
+		for _, h := range payload.ConversationState.History {
+			if h.AssistantResponseMessage == nil {
+				continue
+			}
+			for _, tu := range h.AssistantResponseMessage.ToolUses {
+				names[tu.ToolUseID] = tu.Name
+			}
+		}
+		interrupted.Content = joinHistoryText(interrupted.Content, narrateToolResults(ctx.ToolResults, names))
+	}
+	// History never carries tool specs or results, only prose.
+	interrupted.UserInputMessageContext = nil
+
 	history = append(history,
 		KiroHistoryMessage{UserInputMessage: &interrupted},
 		KiroHistoryMessage{AssistantResponseMessage: &KiroAssistantResponseMessage{Content: delivered}},
@@ -203,17 +235,17 @@ func buildContinuationPayload(payload *KiroPayload, delivered string) *KiroPaylo
 	cs.History = history
 
 	// The resume turn carries the instruction and nothing else. Tool specs are
-	// preserved so the model can still issue the call it was cut off before, but
-	// toolResults are dropped: they belong to the turn now in history, and
-	// re-sending them would open a second active tool turn, which the upstream
-	// rejects.
+	// preserved (captured above) so the model can still issue the call it was cut
+	// off before, but toolResults are not re-sent: they now live in history as
+	// narrated text, and sending them again would open a second active tool turn,
+	// which the upstream rejects.
 	resumeMsg := KiroUserInputMessage{
 		Content: continuationInstruction,
 		ModelID: interrupted.ModelID,
 		Origin:  interrupted.Origin,
 	}
-	if src := interrupted.UserInputMessageContext; src != nil && len(src.Tools) > 0 {
-		resumeMsg.UserInputMessageContext = &UserInputMessageContext{Tools: src.Tools}
+	if len(resumeTools) > 0 {
+		resumeMsg.UserInputMessageContext = &UserInputMessageContext{Tools: resumeTools}
 	}
 	cs.CurrentMessage.UserInputMessage = resumeMsg
 

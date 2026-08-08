@@ -307,6 +307,12 @@ type Config struct {
 	// Defaults to true. Set to false to only use the preferred endpoint.
 	EndpointFallback *bool `json:"endpointFallback,omitempty"`
 
+	// AgenticContinuation controls whether a "keep working" directive is appended
+	// to tool-results turns. Defaults to true. Kiro has no system-prompt field, so
+	// an agentic client's "continue until done" instructions lose their steering
+	// weight and the model tends to summarize the tool output and end the turn.
+	AgenticContinuation *bool `json:"agenticContinuation,omitempty"`
+
 	// StreamContinuation controls whether a turn cut off mid-generation is
 	// transparently resumed by replaying the delivered text back to the model and
 	// asking it to continue. Defaults to true. Each resume costs an extra upstream
@@ -1253,10 +1259,13 @@ func UpdateEndpointFallback(enabled bool) error {
 // GetStreamContinuation returns whether a turn cut off mid-generation is
 // transparently resumed. Defaults to true: without it, every upstream mid-stream
 // drop surfaces to the user as an answer that stops in the middle of a sentence.
+// The cfg == nil guard is not defensive padding: these getters are reached from
+// the translator, which runs in unit tests that never call Init(). Without it the
+// first tool-results turn in such a test panics on a nil dereference.
 func GetStreamContinuation() bool {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
-	if cfg.StreamContinuation == nil {
+	if cfg == nil || cfg.StreamContinuation == nil {
 		return true
 	}
 	return *cfg.StreamContinuation
@@ -1267,6 +1276,27 @@ func UpdateStreamContinuation(enabled bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.StreamContinuation = &enabled
+	return Save()
+}
+
+// GetAgenticContinuation returns whether the agentic-continuation directive is
+// re-anchored onto tool-results turns. Defaults to true: Kiro has no
+// system-prompt field, so without this steer an agentic client's "keep going"
+// instructions lose their weight and the model summarizes and stops mid-task.
+func GetAgenticContinuation() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.AgenticContinuation == nil {
+		return true
+	}
+	return *cfg.AgenticContinuation
+}
+
+// UpdateAgenticContinuation sets the agentic-continuation switch and persists it.
+func UpdateAgenticContinuation(enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.AgenticContinuation = &enabled
 	return Save()
 }
 

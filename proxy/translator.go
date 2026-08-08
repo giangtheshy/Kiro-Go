@@ -371,6 +371,10 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	// 转换工具
 	kiroTools, toolNameMap := convertClaudeTools(req.Tools)
 
+	// Re-anchor the "keep working" steer onto a tool-results turn. Applied after
+	// the tool conversion because it must only fire while tools remain callable.
+	finalContent = applyAgenticContinuation(finalContent, len(currentToolResults) > 0, len(kiroTools) > 0)
+
 	// 构建 payload
 	payload := &KiroPayload{}
 	payload.ToolNameMap = toolNameMap
@@ -1396,6 +1400,10 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	// 转换工具
 	kiroTools := convertOpenAITools(req.Tools)
 
+	// Same steer as the Claude path (see applyAgenticContinuation): a tool-results
+	// turn otherwise tends to end with a summary instead of the next tool call.
+	finalContent = applyAgenticContinuation(finalContent, len(currentToolResults) > 0, len(kiroTools) > 0)
+
 	// 构建 payload
 	payload := &KiroPayload{}
 	payload.ConversationState.ChatTriggerType = "MANUAL"
@@ -2022,6 +2030,35 @@ func truncateCurrentMessage(payload *KiroPayload) {
 		}
 		cur.Content = cur.Content[:budget]
 	}
+}
+
+// agenticContinuationDirective re-anchors a "keep working" steer onto a
+// tool-results turn.
+//
+// Kiro's payload has no system-prompt field, so an agentic client's system
+// instructions ("keep going until the task is done") are demoted into buried
+// history and lose their steering weight. The model then reads the tool output,
+// writes a summary of what it found, and ends the turn — the "runs the diagnosis
+// then stops" failure. Nothing is broken at the transport layer: the model
+// genuinely decided to stop, so the proxy faithfully reports end_turn and the
+// user has to type "continue" to get the next step.
+//
+// Phrased to still permit stopping once the task is genuinely complete, so it
+// cannot force an endless loop. Kept short because it costs tokens on every
+// single tool turn.
+const agenticContinuationDirective = "\n\n[Continue the task: take the next action yourself by calling the appropriate tools rather than only describing what should be done. Stop only when the task is fully complete.]"
+
+// applyAgenticContinuation appends agenticContinuationDirective to a
+// tool-results turn's content. All three guards matter: without tool results
+// this is an ordinary chat turn and the steer would be noise; without tools
+// still available the model has nothing to continue WITH, so the directive would
+// ask for the impossible; and the config switch lets an operator trade the extra
+// tokens back.
+func applyAgenticContinuation(content string, hasToolResults, toolsWillBeSent bool) string {
+	if !hasToolResults || !toolsWillBeSent || !config.GetAgenticContinuation() {
+		return content
+	}
+	return content + agenticContinuationDirective
 }
 
 func buildToolResultsContinuation(toolResults []KiroToolResult) string {
