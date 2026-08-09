@@ -13,7 +13,9 @@ package config
 import (
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -69,6 +71,23 @@ type Account struct {
 
 	// Per-account outbound proxy (falls back to global ProxyURL if empty)
 	ProxyURL string `json:"proxyURL,omitempty"`
+
+	// ApiEndpoint pins this account to ONE absolute streaming URL, bypassing the
+	// kiroEndpoints list and region rewriting entirely. Set it for a third-party
+	// relay that speaks the Kiro protocol but lives at its own address.
+	//
+	// Deliberately a full URL rather than a host: a relay need not mount the call
+	// at /generateAssistantResponse, and a host-only field would silently append
+	// the wrong path. Deliberately generic rather than named after any one vendor,
+	// since nothing here depends on which relay it is.
+	ApiEndpoint string `json:"apiEndpoint,omitempty"`
+
+	// ApiHost overrides the Host header (and TLS SNI stays on the URL's own host).
+	// That split is the whole point: a relay can be reached over its real,
+	// publicly-trusted certificate while still being routed by an internal vhost
+	// name that has no public DNS or certificate of its own — so no custom CA has
+	// to be installed anywhere.
+	ApiHost string `json:"apiHost,omitempty"`
 
 	// Priority weight for load balancing (higher = more requests)
 	Weight int `json:"weight,omitempty"` // 0 or 1 = normal, 2+ = higher priority
@@ -139,6 +158,44 @@ func (a *Account) IsApiKeyCredential() bool {
 	}
 	method := strings.ToLower(a.AuthMethod)
 	return method == "api_key" || method == "apikey"
+}
+
+// IsRelayCredential reports whether this account points at a third-party relay
+// rather than at AWS.
+//
+// Keyed on ApiEndpoint alone, not on AuthMethod: the endpoint override IS the
+// thing that changes behaviour, and tying the check to an auth method would
+// leave a relay silently talking to AWS if the method were ever edited.
+//
+// Callers use this to skip the REST surface (GetUserInfo, ListAvailableModels,
+// ListAvailableProfiles). A relay generally implements only the streaming call,
+// so probing the rest produces a burst of 404s on every refresh cycle.
+func (a *Account) IsRelayCredential() bool {
+	return strings.TrimSpace(a.ApiEndpoint) != ""
+}
+
+// ValidateApiEndpoint checks a relay endpoint override. An empty value is valid
+// and means "no override".
+//
+// The URL must be absolute. A relative one would be joined against nothing and
+// fail at request time with a confusing transport error, long after the operator
+// left the form that could have told them.
+func ValidateApiEndpoint(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid API endpoint: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return errors.New("API endpoint must start with http:// or https://")
+	}
+	if u.Host == "" {
+		return errors.New("API endpoint must include a host")
+	}
+	return nil
 }
 
 // EffectiveAuthRegion returns the effective auth region for this account,
@@ -499,7 +556,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.2.9"
+const Version = "1.3.0"
 
 var (
 	cfg     *Config
@@ -1360,6 +1417,11 @@ func UpdateKeepToolHistory(enabled bool) error {
 func GetProxyURL() string {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
+	// nil-guarded like GetRequireProxy below: any caller reached before Init would
+	// otherwise panic here rather than fall back to "no proxy configured".
+	if cfg == nil {
+		return ""
+	}
 	return cfg.ProxyURL
 }
 

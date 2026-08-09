@@ -647,8 +647,33 @@ func isOverUsageLimit(acc config.Account) bool {
 // isQuotaBlocked reports whether an over-quota account should be skipped:
 // the per-account upstream Overages switch (OverageStatus=ENABLED) and the
 // global allowOverUsage setting are the two ways to keep it routable.
+//
+// An enabled Overages switch is not by itself enough. It only says overage
+// spending is PERMITTED, not that any allowance is LEFT: once CurrentOverages
+// reaches OverageCap the upstream rejects every request with
+// OVERAGE_REQUEST_LIMIT_EXCEEDED. Treating such an account as usable made it win
+// selection on the first attempt of every request and burn one of the three
+// retry attempts on a guaranteed 402.
 func isQuotaBlocked(acc config.Account, allowOverUsage bool) bool {
-	return isOverUsageLimit(acc) && !isUpstreamOverageEnabled(acc) && !allowOverUsage
+	if !isOverUsageLimit(acc) {
+		return false
+	}
+	if allowOverUsage {
+		return false
+	}
+	if isUpstreamOverageEnabled(acc) {
+		return isOverageCapExhausted(acc)
+	}
+	return true
+}
+
+// isOverageCapExhausted reports whether the account has spent its whole overage
+// allowance. A zero or missing cap is NOT read as "no allowance": the field is
+// only populated once getUsageLimits has reported it, so treating an unfetched
+// cap as exhausted would sideline healthy accounts on a cold start. The upstream
+// 402 remains the backstop for that case.
+func isOverageCapExhausted(acc config.Account) bool {
+	return acc.OverageCap > 0 && acc.CurrentOverages >= acc.OverageCap
 }
 
 // isUpstreamOverageEnabled reports whether the upstream Overages switch is ON for this account.

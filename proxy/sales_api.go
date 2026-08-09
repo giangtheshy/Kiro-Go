@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"kiro-go/config"
 	"kiro-go/logger"
 	"net/http"
@@ -63,6 +64,10 @@ func (h *Handler) handleSalesAPI(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimPrefix(path, "/keys/")
 		id = strings.TrimSuffix(id, "/enabled")
 		h.salesSetKeyEnabled(w, r, id)
+	case strings.HasSuffix(path, "/reclaim") && r.Method == http.MethodPost:
+		id := strings.TrimPrefix(path, "/keys/")
+		id = strings.TrimSuffix(id, "/reclaim")
+		h.salesReclaimCredits(w, r, id)
 
 	// bulk-grant BEFORE the generic /:id routes so "bulk-grant" isn't treated as a key ID.
 	case path == "/keys/bulk-grant" && r.Method == http.MethodPost:
@@ -344,6 +349,10 @@ func salesTopUpErrorCode(err error) (int, string) {
 		return http.StatusNotFound, "KEY_NOT_FOUND"
 	case errors.Is(err, config.ErrKeyUnlimited):
 		return http.StatusConflict, "KEY_UNLIMITED"
+	// Reclaim-only. Lives in this shared table so the reclaim endpoint inherits the
+	// same envelope and the same SAVE_FAILED / INTERNAL fallbacks as the top-up path.
+	case errors.Is(err, config.ErrKeyNotExpired):
+		return http.StatusConflict, "KEY_NOT_EXPIRED"
 	case strings.Contains(err.Error(), "could not persist"):
 		// The increment was rolled back in memory but the disk write failed;
 		// the caller may safely retry with the SAME idempotency key.
@@ -448,6 +457,69 @@ func (h *Handler) salesExtendKey(w http.ResponseWriter, r *http.Request, id stri
 	}
 
 	json.NewEncoder(w).Encode(salesTopUpResponse{OK: true, AddCreditsResult: res})
+}
+
+// salesReclaimResponse inlines ReclaimResult next to the `ok` flag, matching the
+// shape of salesTopUpResponse.
+type salesReclaimResponse struct {
+	OK bool `json:"ok"`
+	config.ReclaimResult
+}
+
+// salesReclaimCredits handles POST /keys/:id/reclaim — drop an EXPIRED key's unspent
+// credits so the seller can put them back on the shelf, WITHOUT deleting the key.
+//
+// The key keeps its ID, its plaintext value, and its eligibility for a paid top-up
+// that revives it. This is the difference from DELETE /keys/:id, and the reason the
+// endpoint exists: the pool only ever returns a key's plaintext once, at creation, so
+// deleting is irreversible for the customer while reclaiming is not.
+//
+// minExpiredSeconds lets the caller demand the key has been expired for a while
+// already (the bot sends its 3-hour grace). Absent or 0 means "expired at all is
+// enough". The floor is enforced in config.ReclaimAPIKeyCredits, not here, so a
+// second caller cannot bypass it by omitting the field.
+//
+// No idempotency key: this converges on a computed target rather than applying an
+// increment, so a repeat call is a no-op that reports alreadyReclaimed=true. A caller
+// that lost the response may simply retry.
+func (h *Handler) salesReclaimCredits(w http.ResponseWriter, r *http.Request, id string) {
+	var body struct {
+		MinExpiredSeconds int64 `json:"minExpiredSeconds"`
+	}
+	// An empty body is valid — it means "no extra age requirement". Only malformed
+	// JSON is rejected.
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(salesErrorResp("INVALID_JSON", "invalid JSON"))
+			return
+		}
+	}
+
+	res, err := config.ReclaimAPIKeyCredits(id, body.MinExpiredSeconds)
+	if err != nil {
+		writeSalesTopUpError(w, err)
+		return
+	}
+
+	// A no-op reclaim writes no audit line: the trail would otherwise fill with
+	// identical entries every time the caller's sweep revisits the same key.
+	if !res.AlreadyReclaimed {
+		config.RecordAudit(config.AuditEntry{
+			Action: config.AuditKeyReclaim,
+			Actor:  config.AuditActorSales,
+			Target: id,
+			Detail: "reclaimed=" + strconv.FormatFloat(res.Reclaimed, 'f', -1, 64) +
+				" limit=" + strconv.FormatFloat(res.PreviousCreditLimit, 'f', -1, 64) +
+				"→" + strconv.FormatFloat(res.CreditLimit, 'f', -1, 64) +
+				" used=" + strconv.FormatFloat(res.CreditsUsed, 'f', -1, 64),
+			IP: h.resolveClientIP(r),
+		})
+		logger.Infof("[Sales] reclaimed %g unspent credits from expired key %s (limit %g→%g)",
+			res.Reclaimed, id, res.PreviousCreditLimit, res.CreditLimit)
+	}
+
+	json.NewEncoder(w).Encode(salesReclaimResponse{OK: true, ReclaimResult: res})
 }
 
 // --- bulk grant ---

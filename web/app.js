@@ -64,6 +64,18 @@
       return '';
     }
   }
+  // Short label for a relay badge: the host that is actually dialled, which is what
+  // identifies the third party. apiHost is only a routing header and can be a name
+  // with no DNS of its own, so it makes a poor label — it is shown in the account
+  // detail view instead, where there is room to explain what it is.
+  function relayHostLabel(a) {
+    if (!a || !a.apiEndpoint) return '';
+    try {
+      return new URL(a.apiEndpoint).host;
+    } catch (e) {
+      return a.apiEndpoint;
+    }
+  }
   async function copyText(input) {
     const isPromise = input && typeof input.then === 'function';
     if (isPromise && typeof ClipboardItem !== 'undefined' && navigator.clipboard && navigator.clipboard.write) {
@@ -861,6 +873,13 @@
       const weight = a.weight || 0;
       const weightBadge = weight >= 2 ? '<span class="badge badge-warning">' + escapeHtml(t('accounts.weightShort')) + ':' + weight + '</span>' : '';
       const overageBadge = renderOverageBadge(a);
+      // A relay routes prompts through a third party, so it is worth seeing in the
+      // list rather than only after opening the account. Shows the host actually
+      // dialled, which is the part an operator needs to recognise.
+      const relayBadge = a.isRelay
+        ? '<span class="badge badge-warning" title="' + escapeAttr(a.apiEndpoint || '') + '">' +
+          escapeHtml(t('accounts.relayShort')) + ': ' + escapeHtml(relayHostLabel(a)) + '</span>'
+        : '';
       let proxyBadge = '';
       const maskedProxy = maskProxyForDisplay(a.proxyURL);
       if (maskedProxy) {
@@ -893,6 +912,7 @@
         getTrialBadge(a) +
         weightBadge +
         overageBadge +
+        relayBadge +
         proxyBadge +
         '<span class="badge badge-info">' + escapeHtml(formatAuthMethod(a.provider || a.authMethod)) + '</span>' +
         getStatusBadge(a) +
@@ -1145,6 +1165,20 @@
       '<button class="btn btn-sm btn-primary" data-detail-action="savePriority" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
       '</div>' +
 
+      // Only shown for an account that already IS a relay. Offering these fields on
+      // every account would invite turning an ordinary AWS account into a relay by
+      // accident, which silently reroutes its traffic to a third party.
+      (a.isRelay
+        ? '<div class="detail-section"><h4>' + escapeHtml(t('detail.relay')) + '</h4>' +
+          '<p class="warn-block">' + escapeHtml(t('relay.privacyWarn')) + '</p>' +
+          '<div class="form-group"><label>' + escapeHtml(t('relay.endpointLabel')) + '</label>' +
+          '<input type="text" id="relayEndpointInput" class="font-mono" value="' + escapeAttr(a.apiEndpoint || '') + '" /></div>' +
+          '<div class="form-group"><label>' + escapeHtml(t('relay.hostLabel')) + '</label>' +
+          '<input type="text" id="relayHostInput" class="font-mono" value="' + escapeAttr(a.apiHost || '') + '" /></div>' +
+          '<button class="btn btn-sm btn-primary" data-detail-action="saveRelay" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
+          '</div>'
+        : '') +
+
       '<div class="detail-section">' +
       '<h4>' + escapeHtml(t('detail.overage')) +
       ' <button class="btn btn-sm btn-outline" data-detail-action="refreshOverage" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.overageRefresh')) + '</button>' +
@@ -1253,6 +1287,15 @@
   async function savePriority(id) {
     const priority = Math.max(0, parseInt($('priorityInput').value, 10) || 0);
     await putAccount(id, { priority }, t('detail.saved'));
+  }
+  async function saveRelay(id) {
+    const apiEndpoint = $('relayEndpointInput').value.trim();
+    // Blocked rather than saved as empty: clearing the endpoint would turn this
+    // back into an ordinary AWS account, which cannot work with a relay-issued key
+    // and would fail every request until someone noticed why.
+    if (!apiEndpoint) return toastWarning(t('relay.endpointRequired'));
+    if (!/^https?:\/\/[^/]+/i.test(apiEndpoint)) return toastWarning(t('relay.endpointInvalid'));
+    await putAccount(id, { apiEndpoint, apiHost: $('relayHostInput').value.trim() }, t('detail.saved'));
   }
   function renderOverageBadge(a) {
     const status = (a.overageStatus || '').toUpperCase();
@@ -2646,6 +2689,7 @@
     else if (type === 'cookie') modalCookie(title, body);
     else if (type === 'apikey') modalApiKey(title, body);
     else if (type === 'apikeybatch') modalApiKeyBatch(title, body);
+    else if (type === 'relay') modalRelay(title, body);
     else if (type === 'kiro') modalKiro(title, body);
     if (!modal.classList.contains('active')) openDialog('addModal');
     enhanceCustomSelects(body);
@@ -2672,6 +2716,7 @@
       methodCard('cookie', t('modal.cookieTitle'), t('modal.cookieDesc')) +
       methodCard('apikey', t('modal.apikeyTitle'), t('modal.apikeyDesc')) +
       methodCard('apikeybatch', t('modal.apikeyBatchTitle'), t('modal.apikeyBatchDesc')) +
+      methodCard('relay', t('modal.relayTitle'), t('modal.relayDesc')) +
       '</div>' +
       '<div class="modal-footer"><button class="btn btn-secondary" data-close-add="1" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>';
   }
@@ -2935,6 +2980,52 @@
       '</div>' +
       '<div id="apikeyBatchResults" class="mt-3"></div>';
     $('importApikeyBatchBtn').addEventListener('click', importApiKeysBatch);
+  }
+  function modalRelay(title, body) {
+    title.textContent = t('modal.relayTitle');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('relay.desc')) + '</p>' +
+      '<p class="warn-block">' + escapeHtml(t('relay.privacyWarn')) + '</p>' +
+      '<div class="form-group"><label>' + escapeHtml(t('relay.keyLabel')) + '</label>' +
+      '<input type="password" id="relayKey" placeholder="' + escapeAttr(t('relay.keyPlaceholder')) + '" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('relay.endpointLabel')) + '</label>' +
+      '<input type="text" id="relayEndpoint" class="font-mono" placeholder="https://example.com/generateAssistantResponse" />' +
+      '<small>' + escapeHtml(t('relay.endpointHint')) + '</small></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('relay.hostLabel')) + '</label>' +
+      '<input type="text" id="relayHost" class="font-mono" placeholder="' + escapeAttr(t('relay.hostPlaceholder')) + '" />' +
+      '<small>' + escapeHtml(t('relay.hostHint')) + '</small></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('relay.nickname')) + '</label>' +
+      '<input type="text" id="relayNickname" placeholder="' + escapeAttr(t('relay.nicknamePlaceholder')) + '" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('relay.priorityLabel')) + '</label>' +
+      '<input type="number" id="relayPriority" min="0" max="99" value="99" />' +
+      '<small>' + escapeHtml(t('relay.priorityHint')) + '</small></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="importRelayBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
+      '</div>';
+    $('importRelayBtn').addEventListener('click', importRelay);
+  }
+  async function importRelay() {
+    const key = $('relayKey').value.trim();
+    if (!key) return toastWarning(t('relay.keyRequired'));
+    const endpoint = $('relayEndpoint').value.trim();
+    if (!endpoint) return toastWarning(t('relay.endpointRequired'));
+    if (!/^https?:\/\/[^/]+/i.test(endpoint)) return toastWarning(t('relay.endpointInvalid'));
+    const payload = {
+      authMethod: 'api_key',
+      kiroApiKey: key,
+      apiEndpoint: endpoint,
+      apiHost: $('relayHost').value.trim(),
+      nickname: $('relayNickname').value.trim() || '',
+      priority: Math.max(0, parseInt($('relayPriority').value, 10) || 0),
+      enabled: true
+    };
+    const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
+    const d = await res.json();
+    if (d.success) {
+      closeModal(); loadAccounts(); loadStats();
+      toastPrimary(t('relay.success') + ': ' + (d.account?.nickname || d.account?.id));
+    } else toastError(t('common.failed') + ': ' + (d.error || ''));
   }
   function modalKiro(title, body) {
     title.textContent = t('modal.kiroTitle');
@@ -5006,6 +5097,17 @@
       secretField.value = '';
       secretField.placeholder = cfg.hasWebhookSecret ? t('autobuy.secretStored') : '';
     }
+    const tgTokenField = $('autobuyTgToken');
+    if (tgTokenField) {
+      tgTokenField.value = '';
+      tgTokenField.placeholder = cfg.hasTelegramBotToken ? t('autobuy.secretStored') : '123456:ABC-DEF…';
+    }
+
+    // The chat id is not a secret, so it comes back in full and is shown as-is.
+    autobuySetText('autobuyTgChatId', cfg.telegramChatId || '');
+    autobuySetText('autobuyTgApiBase', cfg.telegramApiBase || '');
+    autobuySetCheck('autobuyNotifyPoolExhausted', cfg.notifyPoolExhausted);
+    autobuySetNum('autobuyPoolAlertRepeat', cfg.poolAlertRepeat);
 
     const zones = cfg.zones || {};
     const us = zones.us || {};
@@ -5046,6 +5148,13 @@
       webhookSecret: autobuyText('autobuyWebhookSecret'),
       marketBaseUrl: autobuyText('autobuyBaseUrl'),
       notifyWebhook: autobuyText('autobuyNotifyWebhook'),
+      // Blank token means unchanged, EXCEPT when the chat id is also cleared —
+      // that pair is how the server is told to switch Telegram off.
+      telegramBotToken: autobuyText('autobuyTgToken'),
+      telegramChatId: autobuyText('autobuyTgChatId'),
+      telegramApiBase: autobuyText('autobuyTgApiBase'),
+      notifyPoolExhausted: autobuyCheck('autobuyNotifyPoolExhausted'),
+      poolAlertRepeat: autobuyNum('autobuyPoolAlertRepeat'),
       defaultRegion: autobuyText('autobuyRegion'),
       zones: {
         us: {
@@ -5281,8 +5390,53 @@
       triggerAutobuyBuy(false);
     });
 
+    const testNotify = $('autobuyTestNotifyBtn');
+    if (testNotify) testNotify.addEventListener('click', testAutobuyNotify);
+
     const urlField = $('autobuyWebhookUrl');
     if (urlField) urlField.addEventListener('focus', () => urlField.select());
+  }
+
+  // testAutobuyNotify sends a real message through each configured channel.
+  //
+  // It posts whatever is currently in the form rather than saving first, so a
+  // freshly pasted token can be verified before it is committed. Blank fields fall
+  // back to the stored values on the server.
+  async function testAutobuyNotify() {
+    const btn = $('autobuyTestNotifyBtn');
+    if (btn) btn.disabled = true;
+    try {
+      const res = await api('/autobuy/notify-test', {
+        method: 'POST',
+        body: JSON.stringify({
+          telegramBotToken: autobuyText('autobuyTgToken'),
+          telegramChatId: autobuyText('autobuyTgChatId'),
+          telegramApiBase: autobuyText('autobuyTgApiBase'),
+          notifyWebhook: autobuyText('autobuyNotifyWebhook')
+        })
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toastError(d.error || t('autobuy.testNotifyFailed'));
+        return;
+      }
+      const results = d.results || {};
+      // Report each channel separately, with the upstream error verbatim: "chat
+      // not found" and "Unauthorized" need different fixes.
+      const failures = Object.keys(results)
+        .filter(k => results[k] && results[k].ok === false)
+        .map(k => k + ': ' + (results[k].error || 'failed'));
+      if (failures.length) {
+        toastError(failures.join(' | '));
+        return;
+      }
+      const sent = Object.keys(results).join(', ');
+      toastPrimary(t('autobuy.testNotifySent') + (sent ? ' (' + sent + ')' : ''));
+    } catch (e) {
+      toastError(t('autobuy.testNotifyFailed'));
+    } finally {
+      if (btn) btn.disabled = false;
+    }
   }
 
   // isKnownTab guards against a hand-edited ?tab= value pointing at a panel that
@@ -5519,6 +5673,7 @@
       if (a === 'saveMachineId') saveMachineId(id);
       else if (a === 'saveWeight') saveWeight(id);
       else if (a === 'savePriority') savePriority(id);
+      else if (a === 'saveRelay') saveRelay(id);
       else if (a === 'toggleOverage') toggleOverageSwitch(id, b);
       else if (a === 'refreshOverage') refreshAccountOverage(id);
       else if (a === 'saveProxyURL') saveProxyURL(id);

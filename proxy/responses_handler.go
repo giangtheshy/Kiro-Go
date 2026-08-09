@@ -219,6 +219,12 @@ func (h *Handler) handleResponsesNonStream(
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
+			// A refusal is final and was already billed: the upstream read the
+			// conversation before declining, so rotating pays another account for
+			// the identical verdict. See isTerminalRequestError.
+			if isTerminalRequestError(err) {
+				break
+			}
 			continue
 		}
 
@@ -688,6 +694,12 @@ func (h *Handler) handleResponsesStream(
 				lastErr = err
 				excluded[account.ID] = true
 				h.handleAccountFailure(account, err)
+				// A refusal is final and was already billed: the upstream read the
+				// conversation before declining, so rotating pays another account for
+				// the identical verdict. See isTerminalRequestError.
+				if isTerminalRequestError(err) {
+					break
+				}
 				continue
 			}
 			send("response.failed", map[string]interface{}{

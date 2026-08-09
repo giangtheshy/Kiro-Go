@@ -53,6 +53,17 @@ const AutoBuyLogKept = 200
 // AutoBuyLogKept: the map is serialised into config.json.
 const autoBuySeenEventsKept = 500
 
+// DefaultTelegramApiBase is the official Telegram Bot API root.
+const DefaultTelegramApiBase = "https://api.telegram.org"
+
+// Bounds for the pool-exhaustion alert repeat count. The ceiling exists because
+// each repeat is a real message: a typo of 300 would get the bot rate-limited
+// exactly when the operator needs to hear from it.
+const (
+	DefaultPoolAlertRepeat = 3
+	MaxPoolAlertRepeat     = 10
+)
+
 // AutoBuyZoneRule is the per-zone purchasing policy.
 //
 // Price ceilings are per-zone rather than global because the two zones are priced
@@ -124,8 +135,34 @@ type AutoBuyConfig struct {
 	WebhookSecret string `json:"webhookSecret,omitempty"`
 
 	// NotifyWebhook receives a POST when a purchase succeeds or hits a terminal
-	// error. This is the only channel that reaches a sleeping operator.
+	// error. One of the two channels that reach a sleeping operator.
 	NotifyWebhook string `json:"notifyWebhook,omitempty"`
+
+	// TelegramBotToken and TelegramChatID drive the Telegram channel. The token is
+	// a secret with full control of the bot, so it is masked on read and treated
+	// like MarketApiKey: blank on save means "keep the stored one".
+	//
+	// Both are required together. A token without a chat id (or the reverse) would
+	// silently deliver nothing, and the moment that matters is the moment nobody
+	// is watching — so validation refuses the half-configured state rather than
+	// accepting it and staying quiet.
+	TelegramBotToken string `json:"telegramBotToken,omitempty"`
+	TelegramChatID   string `json:"telegramChatId,omitempty"`
+
+	// TelegramApiBase overrides the Telegram API root for networks where
+	// api.telegram.org is blocked and traffic goes through a relay. Empty means
+	// the official host.
+	TelegramApiBase string `json:"telegramApiBase,omitempty"`
+
+	// NotifyPoolExhausted alerts when no pool account can serve a request at all.
+	// Distinct from the purchase notices: this fires on the proxy going dark,
+	// which can happen with auto-buy switched off entirely.
+	NotifyPoolExhausted bool `json:"notifyPoolExhausted,omitempty"`
+
+	// PoolAlertRepeat is how many times the exhaustion alert is sent. Telegram
+	// drops a message occasionally and this is the one alert that must land, so
+	// the default repeats. 0 → DefaultPoolAlertRepeat.
+	PoolAlertRepeat int `json:"poolAlertRepeat,omitempty"`
 
 	// Zones is keyed by AutoBuyZone* constants.
 	Zones map[string]*AutoBuyZoneRule `json:"zones,omitempty"`
@@ -279,6 +316,35 @@ func (a *AutoBuyConfig) EffectiveRegion() string {
 		return "us-east-1"
 	}
 	return strings.TrimSpace(a.DefaultRegion)
+}
+
+// EffectiveTelegramApiBase returns the Telegram API root with any trailing slash
+// removed, so callers can join paths without a double slash.
+func (a *AutoBuyConfig) EffectiveTelegramApiBase() string {
+	if a == nil || strings.TrimSpace(a.TelegramApiBase) == "" {
+		return DefaultTelegramApiBase
+	}
+	return strings.TrimRight(strings.TrimSpace(a.TelegramApiBase), "/")
+}
+
+// TelegramConfigured reports whether both halves of the Telegram channel are
+// present. Either one alone delivers nothing, so callers check the pair.
+func (a *AutoBuyConfig) TelegramConfigured() bool {
+	if a == nil {
+		return false
+	}
+	return strings.TrimSpace(a.TelegramBotToken) != "" && strings.TrimSpace(a.TelegramChatID) != ""
+}
+
+// EffectivePoolAlertRepeat clamps the repeat count into [1, MaxPoolAlertRepeat].
+func (a *AutoBuyConfig) EffectivePoolAlertRepeat() int {
+	if a == nil || a.PoolAlertRepeat <= 0 {
+		return DefaultPoolAlertRepeat
+	}
+	if a.PoolAlertRepeat > MaxPoolAlertRepeat {
+		return MaxPoolAlertRepeat
+	}
+	return a.PoolAlertRepeat
 }
 
 func normalizeZone(zone string) string {
@@ -455,6 +521,19 @@ func ValidateAutoBuyConfig(a *AutoBuyConfig) error {
 			return errors.New("webhookSecret is required when autoBuy is enabled: without it any caller who finds the webhook URL can trigger a purchase")
 		}
 	}
+
+	// The Telegram pair is checked here rather than in validateAutoBuyShape for
+	// the same reason as the credentials above: the panel receives a masked token,
+	// so a legitimate save carries a blank token alongside a filled chat id. Only
+	// the merged object knows whether a token actually exists.
+	hasToken := strings.TrimSpace(a.TelegramBotToken) != ""
+	hasChat := strings.TrimSpace(a.TelegramChatID) != ""
+	if hasToken != hasChat {
+		if hasToken {
+			return errors.New("telegramChatId is required alongside telegramBotToken: a bot with no chat to post to delivers nothing")
+		}
+		return errors.New("telegramBotToken is required alongside telegramChatId")
+	}
 	return nil
 }
 
@@ -479,6 +558,14 @@ func validateAutoBuyShape(a *AutoBuyConfig) error {
 		if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
 			return errors.New("notifyWebhook must be an absolute http(s) URL")
 		}
+	}
+	if u := strings.TrimSpace(a.TelegramApiBase); u != "" {
+		if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+			return errors.New("telegramApiBase must be an absolute http(s) URL")
+		}
+	}
+	if a.PoolAlertRepeat < 0 {
+		return errors.New("poolAlertRepeat cannot be negative")
 	}
 	for zone, rule := range a.Zones {
 		if !IsValidZone(zone) {
@@ -571,6 +658,14 @@ func SetAutoBuyConfig(in *AutoBuyConfig) error {
 		}
 		if strings.TrimSpace(next.WebhookSecret) == "" {
 			next.WebhookSecret = prev.WebhookSecret
+		}
+		// The Telegram token follows the same "blank means unchanged" rule, with one
+		// exception: blanking BOTH fields is how the channel gets turned off. Without
+		// that carve-out the stored token would come back every time, and clearing
+		// the chat id alone would then fail the paired check — leaving no way to
+		// disable Telegram short of hand-editing config.json.
+		if strings.TrimSpace(next.TelegramBotToken) == "" && strings.TrimSpace(next.TelegramChatID) != "" {
+			next.TelegramBotToken = prev.TelegramBotToken
 		}
 	}
 

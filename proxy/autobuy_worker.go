@@ -1,11 +1,9 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"strings"
 	"time"
 
@@ -75,7 +73,7 @@ func (h *Handler) backgroundAutoBuy() {
 	case <-h.stopAutoBuy:
 		return
 	}
-	h.runAutoBuySweep()
+	h.runAutoBuyTick()
 
 	// The interval is re-read each tick so an operator changing it does not have
 	// to restart the process for it to take effect.
@@ -83,11 +81,21 @@ func (h *Handler) backgroundAutoBuy() {
 		interval := config.GetAutoBuyConfig().EffectivePollInterval()
 		select {
 		case <-time.After(interval):
-			h.runAutoBuySweep()
+			h.runAutoBuyTick()
 		case <-h.stopAutoBuy:
 			return
 		}
 	}
+}
+
+// runAutoBuyTick is one pass of the background loop.
+//
+// The pool-health check runs before the buying sweep and outside its enabled
+// gate: an operator can want the "everything is down" alert without wanting
+// unattended purchasing, and those two switches are independent.
+func (h *Handler) runAutoBuyTick() {
+	h.checkPoolExhausted()
+	h.runAutoBuySweep()
 }
 
 // runAutoBuySweep evaluates every zone once.
@@ -496,7 +504,11 @@ func logAutoBuySkip(trigger, zone string, s *autoBuySkip) {
 	logger.Infof("[AutoBuy] zone %s skipped (%s): %s", zone, trigger, s.Reason)
 }
 
-// autoBuyNotice is the payload posted to the operator's notify webhook.
+// autoBuyNotice is the webhook payload for a purchase or a terminal error.
+//
+// It is kept as a struct, rather than assembled as a map at each call site,
+// because this is a compatibility surface: anything already consuming the webhook
+// depends on these exact field names and on which of them are omitted when zero.
 type autoBuyNotice struct {
 	Event     string `json:"event"` // "purchase" | "error"
 	Zone      string `json:"zone,omitempty"`
@@ -513,35 +525,81 @@ type autoBuyNotice struct {
 	TimeUnix  int64  `json:"timeUnix"`
 }
 
-// notifyAutoBuy posts a notice to the configured webhook. Fire-and-forget: a
-// notification failure must never affect a purchase that already happened.
-func (h *Handler) notifyAutoBuy(cfg *config.AutoBuyConfig, notice autoBuyNotice) {
+// fields converts the notice to the map the notifier sends, preserving the
+// struct's omitempty behaviour exactly.
+//
+// The round trip through JSON is deliberate: hand-copying the fields into a map
+// would reintroduce the omitempty rules by hand, and any drift there silently
+// changes the payload someone's integration is parsing. Event and TimeUnix come
+// out as zero values here and are overwritten by the sender.
+func (n autoBuyNotice) fields() map[string]any {
+	raw, err := json.Marshal(n)
+	if err != nil {
+		logger.Warnf("[AutoBuy] could not encode notification: %v", err)
+		return nil
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		logger.Warnf("[AutoBuy] could not convert notification: %v", err)
+		return nil
+	}
+	return out
+}
+
+// notifyAutoBuy sends a purchase or error notice to every configured channel.
+func (h *Handler) notifyAutoBuy(cfg *config.AutoBuyConfig, n autoBuyNotice) {
 	if cfg == nil {
 		return
 	}
-	url := strings.TrimSpace(cfg.NotifyWebhook)
-	if url == "" {
-		return
-	}
-	notice.TimeUnix = time.Now().Unix()
-
-	safeGo(func() {
-		body, err := json.Marshal(notice)
-		if err != nil {
-			logger.Warnf("[AutoBuy] could not marshal notification: %v", err)
-			return
-		}
-		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
-		if err != nil {
-			logger.Warnf("[AutoBuy] could not build notification request: %v", err)
-			return
-		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
-		if err != nil {
-			logger.Warnf("[AutoBuy] notification POST failed: %v", err)
-			return
-		}
-		resp.Body.Close()
+	h.notify(cfg, notice{
+		Kind:   n.Event,
+		Title:  autoBuyNoticeTitle(n),
+		Lines:  autoBuyNoticeLines(n),
+		Fields: n.fields(),
 	})
+}
+
+// autoBuyNoticeTitle renders the Telegram headline.
+func autoBuyNoticeTitle(n autoBuyNotice) string {
+	zone := strings.ToUpper(n.Zone)
+	if n.Event == noticeKindError {
+		if zone != "" {
+			return fmt.Sprintf("⛔ Kiro-Go auto-buy failed (%s)", zone)
+		}
+		return "⛔ Kiro-Go auto-buy failed"
+	}
+	return fmt.Sprintf("🛒 Kiro-Go bought %d key(s) in %s", n.Purchased, zone)
+}
+
+// autoBuyNoticeLines renders the Telegram detail lines.
+func autoBuyNoticeLines(n autoBuyNotice) []string {
+	var lines []string
+	if n.Event == noticeKindError {
+		if n.Code != "" {
+			lines = append(lines, "Code: "+n.Code)
+		}
+		if n.Error != "" {
+			lines = append(lines, "Error: "+n.Error)
+		}
+		// Say plainly that this one does not resolve on its own — that is the whole
+		// reason a terminal error is worth waking someone for.
+		lines = append(lines, "Retrying will not help; auto-buy stays idle until this is resolved.")
+		if n.Trigger != "" {
+			lines = append(lines, "Trigger: "+n.Trigger)
+		}
+		return lines
+	}
+
+	lines = append(lines, fmt.Sprintf("Cost: %d credits (%d each)", n.Credits, n.UnitPrice))
+	lines = append(lines, fmt.Sprintf("Imported: %d, skipped: %d", n.Imported, n.Skipped))
+	if n.Balance > 0 {
+		lines = append(lines, fmt.Sprintf("Market balance left: %d", n.Balance))
+	}
+	if n.OrderID != "" {
+		lines = append(lines, "Order: "+n.OrderID)
+	}
+	if n.Trigger != "" {
+		lines = append(lines, "Trigger: "+n.Trigger)
+	}
+	return lines
 }

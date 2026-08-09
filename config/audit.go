@@ -28,6 +28,7 @@ const (
 	AuditKeyDisable    = "key.disable"
 	AuditKeyResetUsage = "key.reset-usage"
 	AuditKeyBulkGrant  = "key.bulk-grant"
+	AuditKeyReclaim    = "key.reclaim"
 	AuditIPBan         = "ip.ban"
 	AuditIPUnban       = "ip.unban"
 	AuditIPBanClear    = "ip.ban-clear"

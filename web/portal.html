@@ -46,6 +46,15 @@
       --p-good: var(--info);
       --p-warn: var(--warning);
       --p-crit: var(--destructive);
+      /* Status-strip palette. Fixed hex rather than the theme tokens: these three
+         colours carry a meaning the customer reads at a glance ("is it up?"), so
+         they must stay green/amber/red in both themes instead of following an
+         accent that a theme is free to change. Same greens/ambers as the ledger's
+         in/out arrows so the two panels read as one design. */
+      --sw-ok: #22c55e;
+      --sw-warn: #f59e0b;
+      --sw-bad: #ef4444;
+      --sw-none: rgba(127, 127, 127, 0.22);
       max-width: 34rem;
       margin: 0 auto;
       padding: clamp(1.75rem, 4vw, 3.25rem) 1rem 4rem;
@@ -214,6 +223,44 @@
     @media (min-width: 1024px) {
       .p-dash { grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr); gap: 1.5rem; }
       .p-zone-top { grid-column: 1 / -1; }
+      /* Same span as the status strip: the dashboard is two columns at this
+         width, and without this the banner would sit in the left track only —
+         half the width of what it is warning about. */
+      .p-pool-warn { grid-column: 1 / -1; }
+    }
+
+    /* Pool-refill banner. Amber, not red: nothing is broken and the customer has
+       nothing to fix, they just have to wait. Deliberately louder than the rest
+       of the dashboard (thick left rule, filled background) because it is the one
+       element that explains why every number below it is standing still. */
+    .p-pool-warn {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.75rem;
+      padding: 0.875rem 1rem;
+      border: 1px solid rgba(245, 158, 11, 0.32);
+      border-left: 3px solid var(--sw-warn);
+      border-radius: var(--radius-md);
+      background: rgba(245, 158, 11, 0.1);
+      color: var(--foreground);
+    }
+    .p-pool-warn > i {
+      color: var(--sw-warn);
+      font-size: 1.125rem;
+      /* Optical alignment with the first line of text rather than the box. */
+      margin-top: 0.0625rem;
+      flex: none;
+    }
+    .p-pool-warn-text { display: grid; gap: 0.1875rem; min-width: 0; }
+    .p-pool-warn-text strong {
+      font-size: 0.8125rem;
+      font-weight: 650;
+      letter-spacing: -0.01em;
+    }
+    .p-pool-warn-text span {
+      font-size: 0.75rem;
+      line-height: 1.5;
+      color: var(--muted-foreground);
     }
     .p-col { display: grid; gap: 1.25rem; align-content: start; }
     @media (min-width: 1024px) { .p-col { gap: 1.5rem; } }
@@ -526,6 +573,73 @@
     .p-ledger-table tbody tr:hover td { background: rgba(127, 127, 127, 0.06); }
     /* Failed requests still bill nothing but should not read as a normal spend. */
     .p-ledger-table tbody tr.err td.model { color: var(--p-crit); }
+
+    /* ---- Last-error panel ----
+       Sits at the bottom of the status card and only appears when there is
+       something to say. The whole point is that a customer hitting failures can
+       read WHAT failed and quote it to the operator, so the message is shown
+       verbatim in a monospace block rather than summarised into a friendly
+       sentence that loses the identifying detail. */
+    .p-err-box {
+      margin-top: 0.875rem;
+      padding-top: 0.875rem;
+      border-top: 1px dashed var(--p-line);
+    }
+    .p-err-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 0.5rem;
+      margin-bottom: 0.5rem;
+    }
+    .p-err-head .lbl {
+      font-size: 0.6875rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--sw-bad);
+      font-weight: 600;
+    }
+    .p-err-head .when {
+      font-family: var(--font-mono);
+      font-size: 0.6875rem;
+      color: var(--muted-foreground);
+    }
+    .p-err-msg {
+      font-family: var(--font-mono);
+      font-size: 0.6875rem;
+      line-height: 1.5;
+      color: var(--p-crit);
+      background: rgba(239, 68, 68, 0.07);
+      border: 1px solid rgba(239, 68, 68, 0.22);
+      border-radius: var(--radius-sm);
+      padding: 0.5rem 0.625rem;
+      /* The upstream message is one long line with no spaces in places (URLs,
+         JSON). Wrap anywhere rather than forcing a horizontal scrollbar, and
+         keep newlines the upstream sent. */
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      max-height: 9rem;
+      overflow-y: auto;
+    }
+    .p-err-meta {
+      margin-top: 0.5rem;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.375rem 0.75rem;
+      font-size: 0.6875rem;
+      color: var(--muted-foreground);
+    }
+    .p-err-meta .code {
+      font-family: var(--font-mono);
+      color: var(--sw-bad);
+      font-weight: 600;
+    }
+    .p-err-hint {
+      margin-top: 0.5rem;
+      font-size: 0.6875rem;
+      line-height: 1.5;
+      color: var(--muted-foreground);
+    }
     .p-ledger-empty {
       padding: 1.5rem 0.5rem;
       text-align: center;
@@ -544,6 +658,74 @@
     .p-ledger-foot .k { color: var(--muted-foreground); text-transform: uppercase; letter-spacing: 0.04em; }
     .p-ledger-foot .dots { flex: 1; border-bottom: 1px dotted var(--p-line); transform: translateY(-0.2rem); }
     .p-ledger-foot .v { font-weight: 600; }
+
+    /* ---- Service status strip — one segment per 10-minute window ---- */
+    .p-status-span {
+      font-family: var(--font-mono);
+      font-size: 0.6875rem;
+      color: var(--muted-foreground);
+      white-space: nowrap;
+    }
+    .p-status-rows { display: grid; gap: 0.4rem; }
+    .p-status-row {
+      display: grid;
+      /* The model name gets a fixed track so every strip starts at the same x —
+         a ragged left edge makes the segments impossible to compare by eye. */
+      grid-template-columns: minmax(5.5rem, 7.5rem) minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .p-status-row .name {
+      font-family: var(--font-mono);
+      font-size: 0.6875rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    /* The bars live in a flex row with no wrap: 144 segments must stay one line,
+       shrinking to fit rather than spilling onto a second row. */
+    .p-status-bars { display: flex; gap: 1px; align-items: stretch; height: 1.5rem; }
+    .p-status-bars i {
+      flex: 1 1 0;
+      min-width: 0;
+      border-radius: 1px;
+      background: var(--sw-none);
+    }
+    .p-status-bars i.ok { background: var(--sw-ok); }
+    .p-status-bars i.warn { background: var(--sw-warn); }
+    .p-status-bars i.bad { background: var(--sw-bad); }
+    .p-status-row .uptime {
+      font-family: var(--font-mono);
+      font-size: 0.6875rem;
+      font-variant-numeric: tabular-nums;
+      color: var(--muted-foreground);
+      min-width: 3rem;
+      text-align: right;
+    }
+    .p-status-row .uptime.ok { color: var(--sw-ok); }
+    .p-status-row .uptime.warn { color: var(--sw-warn); }
+    .p-status-row .uptime.bad { color: var(--sw-bad); }
+    .p-status-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      margin-top: 0.75rem;
+      padding-top: 0.6rem;
+      border-top: 1px dotted var(--p-line);
+      font-size: 0.6875rem;
+      color: var(--muted-foreground);
+    }
+    .p-status-legend > span { display: inline-flex; align-items: center; gap: 0.3rem; }
+    .p-status-legend .sw {
+      width: 0.55rem;
+      height: 0.55rem;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    .p-status-legend .sw.ok { background: var(--sw-ok); }
+    .p-status-legend .sw.warn { background: var(--sw-warn); }
+    .p-status-legend .sw.bad { background: var(--sw-bad); }
+    .p-status-legend .sw.none { background: var(--sw-none); }
 
     /* ---- Connect block — how the customer points their client here ---- */
     .p-connect-head {
@@ -675,6 +857,19 @@
 
     <div class="p-dash" id="dashboard" style="display:none;">
 
+      <!-- Pool-refill banner. Sits above everything because it explains why the
+           numbers below are not moving; placed inside the ledger or the status
+           card it would compete with the very data it is explaining. Hidden
+           unless the pool is genuinely empty, so it never becomes wallpaper the
+           customer learns to ignore. -->
+      <div class="p-pool-warn" id="poolWarn" style="display:none;" role="status" aria-live="polite">
+        <i class="fa-solid fa-triangle-exclamation"></i>
+        <div class="p-pool-warn-text">
+          <strong data-t="poolWarnTitle"></strong>
+          <span data-t="poolWarnBody"></span>
+        </div>
+      </div>
+
       <!-- Zone 1 — full-width status strip. -->
       <section class="p-card p-zone-top" id="resultCard">
         <div class="p-perf"></div>
@@ -738,6 +933,34 @@
 
       <!-- Zone 2 left — short, static content. -->
       <div class="p-col">
+        <section class="p-card" id="statusBlock" style="display:none;">
+          <div class="p-card-body">
+            <div class="p-ledger-head">
+              <h3 data-t="statusTitle"></h3>
+              <span class="p-status-span" data-t="statusWindow"></span>
+            </div>
+            <div class="p-status-rows" id="statusRows"></div>
+            <div class="p-status-legend">
+              <span><i class="sw ok"></i><span data-t="statusOk"></span></span>
+              <span><i class="sw warn"></i><span data-t="statusWarn"></span></span>
+              <span><i class="sw bad"></i><span data-t="statusBad"></span></span>
+              <span><i class="sw none"></i><span data-t="statusNone"></span></span>
+            </div>
+
+            <!-- Last-error panel. Hidden until a failure is actually seen, so a
+                 healthy account never shows an empty "no errors" box. -->
+            <div class="p-err-box" id="errBox" style="display:none;">
+              <div class="p-err-head">
+                <span class="lbl" data-t="errTitle"></span>
+                <span class="when" id="errWhen"></span>
+              </div>
+              <div class="p-err-msg" id="errMsg"></div>
+              <div class="p-err-meta" id="errMeta"></div>
+              <div class="p-err-hint" id="errHint"></div>
+            </div>
+          </div>
+        </section>
+
         <section class="p-card" id="byModelBlock" style="display:none;">
           <div class="p-card-body">
             <div class="p-ledger-head">
@@ -884,7 +1107,21 @@
           connBaseUrl: 'Base URL',
           connClaude: 'Claude',
           connOpenai: 'OpenAI',
-          copied: 'Đã sao chép'
+          copied: 'Đã sao chép',
+          statusTitle: 'Trạng thái model',
+          statusWindow: '24 giờ qua · mỗi đốt 10 phút',
+          statusOk: 'Bình thường (>95%)',
+          statusWarn: 'Suy giảm (80–95%)',
+          statusBad: 'Lỗi nhiều (<80%)',
+          statusNone: 'Không có dữ liệu',
+          errTitle: 'Lỗi gần nhất',
+          errCount: '{0} lỗi trong 1 giờ qua',
+          errModel: 'Model: {0}',
+          errHintPool: 'Toàn bộ tài khoản đang không khả dụng. Vui lòng thử lại sau ít phút; nếu kéo dài hãy báo quản trị viên.',
+          errHintKiro: 'Hãy gửi nguyên văn thông báo lỗi này cho quản trị viên để được xử lý.',
+          errHintRefusal: 'Nhà cung cấp đã từ chối chính nội dung của yêu cầu này, nên thử lại y như cũ sẽ nhận lại đúng lỗi này. Hãy đổi nội dung hoặc bắt đầu hội thoại mới. Quản trị viên không xử lý được lỗi này.',
+          poolWarnTitle: 'Hệ thống đang nạp thêm tài khoản',
+          poolWarnBody: 'Hiện chưa có tài khoản nào khả dụng nên yêu cầu sẽ tạm thời bị lỗi. Quá trình nạp có thể mất khoảng 10 phút, vui lòng đợi rồi thử lại. Bạn không cần làm gì thêm và không bị trừ credits cho các yêu cầu lỗi.'
         },
         en: {
           brandTag: 'Customer portal',
@@ -935,7 +1172,21 @@
           connBaseUrl: 'Base URL',
           connClaude: 'Claude',
           connOpenai: 'OpenAI',
-          copied: 'Copied'
+          copied: 'Copied',
+          statusTitle: 'Service status',
+          statusWindow: 'Last 24 hours · 10 min per segment',
+          statusOk: 'Available (>95%)',
+          statusWarn: 'Degraded (80–95%)',
+          statusBad: 'Unavailable (<80%)',
+          statusNone: 'No data',
+          errTitle: 'Last error',
+          errCount: '{0} error(s) in the last hour',
+          errModel: 'Model: {0}',
+          errHintPool: 'No upstream account is currently available. Please retry in a few minutes; if it persists, contact the operator.',
+          errHintKiro: 'Send this message verbatim to the operator so they can act on it.',
+          errHintRefusal: 'The provider rejected the content of this request itself, so retrying it unchanged returns the same error. Change the content or start a new conversation. The operator cannot fix this one.',
+          poolWarnTitle: 'Upstream accounts are being topped up',
+          poolWarnBody: 'No account is available right now, so requests will fail temporarily. Topping up can take around 10 minutes — please wait and try again. There is nothing you need to do, and failed requests are not charged.'
         }
       };
 
@@ -953,6 +1204,17 @@
       var lang = (localStorage.getItem('kiro_lang') === 'en') ? 'en' : 'vi';
       function t(k) { return (I18N[lang] && I18N[lang][k]) || I18N.vi[k] || k; }
 
+      // tf is t() with positional {0}, {1}, … substitution. Needed because a
+      // couple of strings interleave numbers with translated text, and the
+      // word order around them differs per language — so the number cannot just
+      // be concatenated onto a fixed prefix.
+      function tf(k) {
+        var args = Array.prototype.slice.call(arguments, 1);
+        return String(t(k)).replace(/\{(\d+)\}/g, function (m, i) {
+          return args[i] == null ? m : String(args[i]);
+        });
+      }
+
       function applyLang() {
         document.documentElement.lang = lang;
         document.querySelectorAll('[data-t]').forEach(function (el) {
@@ -967,6 +1229,8 @@
         setLive($('liveInd').dataset.state);
         if (lastData) renderResult(lastData);
         if (lastLogs) renderLedger(lastLogs);
+        // The strip's tooltips are translated, so repaint from the cached payload.
+        if (lastStatus) renderStatus(lastStatus);
       }
 
       // ---- Theme (system / light / dark) ----
@@ -1017,6 +1281,9 @@
 
       var lastData = null;
       var lastLogs = null;
+      // Last good status payload, kept so a language switch can repaint the strip
+      // (the tooltips and the legend are translated) without refetching.
+      var lastStatus = null;
 
       function setGauge(headVal, wrap, fill, used, limit) {
         if (!limit || limit <= 0) {
@@ -1130,6 +1397,168 @@
         }).join('');
       }
 
+      // ---- Service status strip ----
+      // Thresholds come from the server so the strip and the legend can never
+      // disagree with the backend's own definition of healthy.
+      var statusThresholds = { good: 0.95, warn: 0.80 };
+
+      // segClass maps one bucket's success ratio onto a colour. null (no traffic)
+      // is deliberately NOT red: a quiet window says nothing about availability,
+      // and painting it as an outage would make an idle model look broken.
+      function segClass(ratio) {
+        if (ratio == null) return '';
+        if (ratio > statusThresholds.good) return 'ok';
+        if (ratio >= statusThresholds.warn) return 'warn';
+        return 'bad';
+      }
+
+      function fmtPct(ratio) {
+        if (ratio == null) return '—';
+        return (ratio * 100).toFixed(1) + '%';
+      }
+
+      // segTitle is the per-segment tooltip. It carries the window's clock time so
+      // a customer reporting a problem can say when, not just "earlier".
+      function segTitle(point, endUnix) {
+        var when = fmtTime(endUnix);
+        if (point.ratio == null) return when + ' · ' + t('statusNone');
+        return when + ' · ' + fmtPct(point.ratio) + ' (' + fmtNum(point.total || 0) + ')';
+      }
+
+      // ---- Last-error panel ----
+      // ERR_WINDOW_SEC bounds the "N errors in the last hour" count. Errors older
+      // than this are not counted: a customer who had a bad hour yesterday should
+      // not read a stale tally as a current outage.
+      var ERR_WINDOW_SEC = 3600;
+
+      // isPoolError recognises the deliberately-opaque upstream-exhaustion message.
+      // Provider failures are collapsed into it server-side, so this is exactly the
+      // case where there is no detail to show and none should be invented — the
+      // customer is told to wait and retry instead of being handed a message that
+      // says nothing actionable.
+      function isPoolError(e) {
+        if (e.statusCode === 503) return true;
+        return String(e.error || '').toLowerCase().indexOf('no available accounts') >= 0;
+      }
+
+      // isRefusalError recognises a verdict on the request itself rather than a
+      // fault in the service. It gets its own hint because the advice is the
+      // opposite of every other case: reporting it to the operator wastes both
+      // sides' time, since no change on the operator's end will make the same
+      // request pass. The customer has to change the request.
+      function isRefusalError(e) {
+        var msg = String(e.error || '').toLowerCase();
+        return msg.indexOf('upstream refused the request') >= 0 ||
+          msg.indexOf('content filter') >= 0 ||
+          msg.indexOf('blocked by content policy') >= 0;
+      }
+
+      // renderError paints the most recent failure, or hides the panel when the
+      // recent history is clean. It reads the ledger rather than a dedicated
+      // endpoint: the ledger already carries every field needed and is already
+      // kept live by the SSE stream, so the panel cannot disagree with the rows
+      // shown right next to it.
+      function renderError(logs) {
+        var box = $('errBox');
+        if (!box) return;
+        logs = Array.isArray(logs) ? logs : [];
+
+        var latest = null;
+        var recent = 0;
+        var cutoff = Math.floor(Date.now() / 1000) - ERR_WINDOW_SEC;
+        for (var i = 0; i < logs.length; i++) {
+          if (logs[i].status !== 'error') continue;
+          if (!latest) latest = logs[i];
+          if ((logs[i].time || 0) >= cutoff) recent++;
+        }
+
+        var block = $('statusBlock');
+        if (!latest) {
+          box.style.display = 'none';
+          // Hide the whole card again if the strip has nothing either, otherwise an
+          // empty bordered box is left behind.
+          if (block && !$('statusRows').innerHTML) block.style.display = 'none';
+          return;
+        }
+        // The panel lives inside the status card, which starts hidden and is only
+        // revealed by renderStatus. Reveal it here too: the two run independently
+        // (one polls /v1/key/status, the other reacts to the ledger), so whichever
+        // has something to show must not depend on the other having run first.
+        if (block) block.style.display = '';
+
+        var pool = isPoolError(latest);
+        $('errWhen').textContent = fmtTime(latest.time);
+        // textContent, not innerHTML: the message is upstream-controlled text and
+        // must never be parsed as markup.
+        $('errMsg').textContent = latest.error || ('HTTP ' + (latest.statusCode || '?'));
+
+        var meta = [];
+        if (latest.statusCode) meta.push('<span class="code">HTTP ' + escapeHtml(String(latest.statusCode)) + '</span>');
+        if (latest.model) meta.push(escapeHtml(tf('errModel', latest.model)));
+        if (recent > 1) meta.push(escapeHtml(tf('errCount', fmtNum(recent))));
+        $('errMeta').innerHTML = meta.join('');
+
+        // Pool exhaustion is checked first: it is deliberately opaque, so there is
+        // nothing in its message for the refusal matcher to read anyway.
+        $('errHint').textContent = pool
+          ? t('errHintPool')
+          : (isRefusalError(latest) ? t('errHintRefusal') : t('errHintKiro'));
+        box.style.display = '';
+      }
+
+      // renderPoolWarn shows the refill banner while no upstream can serve a
+      // request. Absent poolAvailable (an older server, or a failed poll) the
+      // banner stays hidden: a missing field is not evidence of an outage, and
+      // guessing one would cry wolf.
+      function renderPoolWarn(d) {
+        var warn = $('poolWarn');
+        if (!warn) return;
+        var known = d && typeof d.poolAvailable === 'boolean';
+        warn.style.display = (known && !d.poolAvailable) ? '' : 'none';
+      }
+
+      function renderStatus(d) {
+        var block = $('statusBlock');
+        var rows = $('statusRows');
+        // Painted before the early return below. An empty pool serves no
+        // requests, so it produces no per-model history — meaning the one moment
+        // the banner matters most is exactly the moment this function bails out.
+        renderPoolWarn(d);
+        var models = (d && Array.isArray(d.models)) ? d.models : [];
+        if (!models.length) {
+          // Keep the card visible when there is an error to report: the strip and
+          // the error panel share this card, and hiding it would take the
+          // explanation away at exactly the moment it is needed.
+          rows.innerHTML = '';
+          block.style.display = ($('errBox') && $('errBox').style.display !== 'none') ? '' : 'none';
+          return;
+        }
+        if (typeof d.goodRatio === 'number') statusThresholds.good = d.goodRatio;
+        if (typeof d.warnRatio === 'number') statusThresholds.warn = d.warnRatio;
+
+        var bucket = d.bucketSeconds || 600;
+        // The newest segment ends at the server's clock, not the browser's: a
+        // customer with a skewed clock would otherwise see mislabelled windows.
+        var newestEnd = d.now || Math.floor(Date.now() / 1000);
+
+        rows.innerHTML = models.map(function (m) {
+          var points = Array.isArray(m.points) ? m.points : [];
+          var bars = points.map(function (p, i) {
+            var endUnix = newestEnd - (points.length - 1 - i) * bucket;
+            var cls = segClass(p.ratio);
+            return '<i' + (cls ? ' class="' + cls + '"' : '') +
+              ' title="' + escapeAttr(segTitle(p, endUnix)) + '"></i>';
+          }).join('');
+          var upCls = segClass(m.uptime);
+          return '<div class="p-status-row">' +
+            '<span class="name" title="' + escapeAttr(m.model || '') + '">' + escapeHtml(m.model || '—') + '</span>' +
+            '<span class="p-status-bars">' + bars + '</span>' +
+            '<span class="uptime' + (upCls ? ' ' + upCls : '') + '">' + fmtPct(m.uptime) + '</span>' +
+            '</div>';
+        }).join('');
+        block.style.display = '';
+      }
+
       function ledgerCells(e) {
         return '<td class="time">' + fmtTime(e.time) + '</td>' +
           '<td class="model" title="' + escapeAttr(e.model || '') + '">' + escapeHtml(e.model || '—') + '</td>' +
@@ -1149,6 +1578,9 @@
           empty.textContent = t('ledgerEmpty');
           empty.style.display = '';
           $('ledgerFoot').style.display = 'none';
+          // Also clear the error panel: this branch runs on logout, and a stale
+          // failure left on screen would belong to the key that just signed out.
+          renderError([]);
           return;
         }
         empty.style.display = 'none';
@@ -1156,6 +1588,7 @@
           return '<tr' + (e.status === 'error' ? ' class="err"' : '') + '>' + ledgerCells(e) + '</tr>';
         }).join('');
         updateLedgerFoot();
+        renderError(logs);
       }
 
       function updateLedgerFoot() {
@@ -1222,8 +1655,13 @@
 
       function logout() {
         closeStream();
+        stopStatusPoll();
         forgetKey();
         lastData = null;
+        // Drop the cached strip too: it was fetched with the key being signed out
+        // of, so leaving it on screen would show one customer's view to the next.
+        lastStatus = null;
+        renderStatus(null);
         $('keyInput').value = '';
         $('rememberKey').checked = false;
         renderLedger([]);
@@ -1336,7 +1774,13 @@
           outputTokens: outTok,
           totalTokens: inTok + outTok,
           credits: raw.credits || 0,
-          status: raw.status || ''
+          status: raw.status || '',
+          // Carried through so the error panel can explain a live failure. The
+          // stream's keyLogEntry has no statusCode field, so it stays undefined
+          // here and the panel falls back to the message alone — a refresh then
+          // fills it in from /v1/key/logs.
+          error: raw.error || '',
+          statusCode: raw.statusCode || 0
         };
 
         if (!Array.isArray(lastLogs)) lastLogs = [];
@@ -1351,6 +1795,9 @@
         body.insertBefore(tr, body.firstChild);
         while (body.rows.length > LEDGER_CAP) body.deleteRow(body.rows.length - 1);
         updateLedgerFoot();
+        // Repaint from the whole cached list rather than from this one entry, so a
+        // successful request does not clear a failure that is still the latest one.
+        renderError(lastLogs);
 
         // Increment the summary from the streamed values rather than refetching.
         if (lastData) {
@@ -1363,6 +1810,38 @@
       }
 
       // ---- Fetches ----
+      // The status strip is polled rather than streamed: it changes once per
+      // 10-minute bucket, so an SSE channel would sit idle almost all the time.
+      // One request every two minutes is enough for the newest segment to fill in
+      // shortly after its window opens.
+      var STATUS_POLL_MS = 120000;
+      var statusTimer = null;
+
+      async function fetchStatus() {
+        var key = currentKey();
+        if (!key) return;
+        try {
+          var res = await fetch('/v1/key/status', {
+            method: 'GET',
+            headers: { 'Authorization': 'Bearer ' + key }
+          });
+          if (!res.ok) return; // keep the last good strip rather than blanking it
+          lastStatus = await res.json();
+          renderStatus(lastStatus);
+        } catch (e) {
+          /* transient: the next poll retries */
+        }
+      }
+
+      function startStatusPoll() {
+        if (statusTimer) clearInterval(statusTimer);
+        statusTimer = setInterval(fetchStatus, STATUS_POLL_MS);
+      }
+
+      function stopStatusPoll() {
+        if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
+      }
+
       async function fetchLedger() {
         var key = currentKey();
         if (!key) return;
@@ -1402,6 +1881,8 @@
           setAuthed(true);
           renderResult(d);
           fetchLedger();
+          fetchStatus();
+          startStatusPoll();
           openStream();
         } catch (e) {
           flash(t('failed'));
@@ -1422,6 +1903,8 @@
           if (res.ok) renderResult(await res.json());
         } catch (e) { /* keep the last good render */ }
         await fetchLedger();
+        await fetchStatus();
+        if (!statusTimer) startStatusPoll();
         if (!es) openStream();
       }
 

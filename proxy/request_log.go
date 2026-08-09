@@ -170,6 +170,12 @@ func logRequest(e RequestLogEntry) {
 	// exceed the recorded prompt size, which must not render as a negative column.
 	e.UncachedInputTokens = maxInt(e.InputTokens-e.CacheReadTokens-e.CacheWriteTokens, 0)
 	requestLog.add(e)
+
+	// Feed the per-model availability strip from here rather than from the two
+	// record*ForApiKey callers: this is the one point every served request passes
+	// through, success and failure alike, so the two counters cannot drift apart
+	// when a new serving path is added.
+	modelHealth.record(e.Model, e.Status != "error", time.Unix(e.Time, 0))
 }
 
 // apiGetRequestLogs GET /admin/api/request-logs - returns the recent per-request feed.
@@ -375,6 +381,18 @@ type apiKeySelfLogEntry struct {
 	OutputTokens int     `json:"outputTokens"`
 	TotalTokens  int     `json:"totalTokens"`
 	Credits      float64 `json:"credits"`
+	// Status and Error let the portal explain a failed request instead of showing
+	// a row of zeros. Without them a customer whose requests are all failing sees
+	// a ledger full of "0 / 0" and has nothing to report to the operator.
+	//
+	// The live SSE stream already carried both fields, so before this the two
+	// views disagreed: an error was visible while the tab stayed open and vanished
+	// on reload.
+	Status string `json:"status,omitempty"`
+	Error  string `json:"error,omitempty"`
+	// StatusCode is the HTTP status the client received, so "402" vs "503" is
+	// distinguishable without parsing the message.
+	StatusCode int `json:"statusCode,omitempty"`
 }
 
 // apiKeySelfLogs GET /v1/key/logs — public self-service usage history, scoped to the
@@ -417,6 +435,14 @@ func (h *Handler) apiKeySelfLogs(w http.ResponseWriter, r *http.Request) {
 			OutputTokens: e.OutputTokens,
 			TotalTokens:  e.TotalTokens,
 			Credits:      e.Credits,
+			Status:       e.Status,
+			// The upstream message travels verbatim. A provider failure is already
+			// collapsed to "No available accounts" where it is raised
+			// (errNoUpstreamAvailable), so which vendor sits behind the proxy still
+			// cannot be inferred from here; a Kiro failure keeps its detail because
+			// that detail is what the customer has to relay to the operator.
+			Error:      e.Error,
+			StatusCode: e.StatusCode,
 		})
 		if len(out) >= limit {
 			break

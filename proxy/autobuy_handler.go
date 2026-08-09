@@ -56,7 +56,11 @@ type autoBuyConfigView struct {
 	WebhookSecret    string `json:"webhookSecret"`
 	HasMarketApiKey  bool   `json:"hasMarketApiKey"`
 	HasWebhookSecret bool   `json:"hasWebhookSecret"`
-	WebhookPath      string `json:"webhookPath"`
+	// TelegramBotToken is masked like the two secrets above. The chat id is not a
+	// secret and is returned in full, so the panel can show which chat is targeted.
+	TelegramBotToken    string `json:"telegramBotToken"`
+	HasTelegramBotToken bool   `json:"hasTelegramBotToken"`
+	WebhookPath         string `json:"webhookPath"`
 	// BuyLog and SeenEvents are served by their own endpoint; repeating them in
 	// every config read would send the whole history on each poll.
 	BuyLog     []config.AutoBuyLogEntry `json:"buyLog,omitempty"`
@@ -65,14 +69,16 @@ type autoBuyConfigView struct {
 
 func toAutoBuyConfigView(c *config.AutoBuyConfig) autoBuyConfigView {
 	v := autoBuyConfigView{
-		AutoBuyConfig:    c,
-		HasMarketApiKey:  strings.TrimSpace(c.MarketApiKey) != "",
-		HasWebhookSecret: strings.TrimSpace(c.WebhookSecret) != "",
-		WebhookPath:      autoBuyWebhookPath,
+		AutoBuyConfig:       c,
+		HasMarketApiKey:     strings.TrimSpace(c.MarketApiKey) != "",
+		HasWebhookSecret:    strings.TrimSpace(c.WebhookSecret) != "",
+		HasTelegramBotToken: strings.TrimSpace(c.TelegramBotToken) != "",
+		WebhookPath:         autoBuyWebhookPath,
 	}
 	// Blank the embedded copies so the raw values never reach the browser.
 	v.AutoBuyConfig.MarketApiKey = ""
 	v.AutoBuyConfig.WebhookSecret = ""
+	v.AutoBuyConfig.TelegramBotToken = ""
 	v.AutoBuyConfig.BuyLog = nil
 	v.AutoBuyConfig.SeenEvents = nil
 	return v
@@ -284,6 +290,104 @@ func (h *Handler) apiAutoBuyManual(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "entry": entry})
+}
+
+// apiAutoBuyNotifyTest handles POST /admin/api/autobuy/notify-test.
+//
+// It sends a real message through every channel the request describes and reports
+// each one's outcome separately. Testing before saving is the useful case — an
+// operator pasting a fresh token wants to know it works before committing it — so
+// credentials supplied in the body take precedence over the stored ones, and a
+// blank field falls back to what is stored.
+func (h *Handler) apiAutoBuyNotifyTest(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		TelegramBotToken string `json:"telegramBotToken"`
+		TelegramChatID   string `json:"telegramChatId"`
+		TelegramApiBase  string `json:"telegramApiBase"`
+		NotifyWebhook    string `json:"notifyWebhook"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&body); err != nil && err != io.EOF {
+		writeAutoBuyError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+
+	stored := config.GetAutoBuyConfig()
+
+	token := strings.TrimSpace(body.TelegramBotToken)
+	if token == "" {
+		token = strings.TrimSpace(stored.TelegramBotToken)
+	}
+	chatID := strings.TrimSpace(body.TelegramChatID)
+	if chatID == "" {
+		chatID = strings.TrimSpace(stored.TelegramChatID)
+	}
+	apiBase := strings.TrimSpace(body.TelegramApiBase)
+	if apiBase == "" {
+		apiBase = stored.EffectiveTelegramApiBase()
+	}
+	webhook := strings.TrimSpace(body.NotifyWebhook)
+	if webhook == "" {
+		webhook = strings.TrimSpace(stored.NotifyWebhook)
+	}
+
+	n := notice{
+		Kind:  noticeKindTest,
+		Title: "✅ Kiro-Go notification test",
+		Lines: []string{
+			"If you can read this, alerts will reach you here.",
+			"Sent from the admin panel at " + time.Now().Format("2006-01-02 15:04:05 -0700") + ".",
+		},
+		Fields: map[string]any{"test": true},
+	}
+
+	results := map[string]any{}
+	anyChannel := false
+
+	if webhook != "" {
+		anyChannel = true
+		// Synchronous, unlike the fire-and-forget production path: the whole point
+		// of a test is to report the result back to the caller.
+		if err := postNotifyWebhook(webhook, n.webhookPayload()); err != nil {
+			results["webhook"] = map[string]any{"ok": false, "error": err.Error()}
+		} else {
+			results["webhook"] = map[string]any{"ok": true}
+		}
+	}
+
+	if token != "" && chatID != "" {
+		anyChannel = true
+		if err := sendTelegram(apiBase, token, chatID, n.telegramText()); err != nil {
+			// Telegram's own description is passed through: "chat not found" and
+			// "Unauthorized" need different fixes, and a generic failure message
+			// would leave the operator guessing which one they are looking at.
+			results["telegram"] = map[string]any{"ok": false, "error": err.Error()}
+		} else {
+			results["telegram"] = map[string]any{"ok": true}
+		}
+	} else if token != "" || chatID != "" {
+		anyChannel = true
+		results["telegram"] = map[string]any{
+			"ok":    false,
+			"error": "both the bot token and the chat id are required",
+		}
+	}
+
+	if !anyChannel {
+		writeAutoBuyError(w, http.StatusBadRequest, "no notification channel is configured")
+		return
+	}
+
+	allOK := true
+	for _, v := range results {
+		if m, ok := v.(map[string]any); ok {
+			if ok2, _ := m["ok"].(bool); !ok2 {
+				allOK = false
+			}
+		}
+	}
+
+	logger.Infof("[Notify] test dispatched from the admin panel (allOK=%v)", allOK)
+	json.NewEncoder(w).Encode(map[string]any{"ok": allOK, "results": results})
 }
 
 // verifyMarketSignature checks the HMAC over the raw body.

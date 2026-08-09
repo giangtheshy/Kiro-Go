@@ -2503,6 +2503,67 @@ func currentMessageModelID(payload *KiroPayload) string {
 	return payload.ConversationState.CurrentMessage.UserInputMessage.ModelID
 }
 
+// describePayloadShape summarizes where a payload's bytes actually live.
+//
+// A total size alone cannot explain an upstream that accepts a request and then
+// returns an empty stream: 190KB spread across a long history is ordinary, while
+// the same 190KB concentrated in one message, one tool result or one tool schema
+// is not. This reports the distribution so the outlier is visible in a log line,
+// which is the only lead available when the upstream states no reason.
+func describePayloadShape(payload *KiroPayload) string {
+	if payload == nil {
+		return "nil"
+	}
+	cur := payload.ConversationState.CurrentMessage.UserInputMessage
+
+	toolCount, toolBytes, maxToolName, maxToolBytes := 0, 0, "", 0
+	resultCount, resultBytes, maxResultBytes := 0, 0, 0
+	if ctx := cur.UserInputMessageContext; ctx != nil {
+		toolCount = len(ctx.Tools)
+		for _, tool := range ctx.Tools {
+			size := len(canonicalizeCacheValue(tool))
+			toolBytes += size
+			if size > maxToolBytes {
+				maxToolBytes = size
+				maxToolName = tool.ToolSpecification.Name
+			}
+		}
+		resultCount = len(ctx.ToolResults)
+		for _, tr := range ctx.ToolResults {
+			size := 0
+			for _, c := range tr.Content {
+				size += len(c.Text)
+			}
+			resultBytes += size
+			if size > maxResultBytes {
+				maxResultBytes = size
+			}
+		}
+	}
+
+	imageBytes := 0
+	for _, img := range cur.Images {
+		imageBytes += len(img.Source.Bytes)
+	}
+
+	histBytes, maxHistBytes := 0, 0
+	for _, h := range payload.ConversationState.History {
+		size := historyEntryByteSize(h)
+		histBytes += size
+		if size > maxHistBytes {
+			maxHistBytes = size
+		}
+	}
+
+	return fmt.Sprintf(
+		"curContent=%dB curImages=%d/%dB tools=%d/%dB maxTool=%q/%dB toolResults=%d/%dB maxResult=%dB history=%d/%dB maxHist=%dB",
+		len(cur.Content), len(cur.Images), imageBytes,
+		toolCount, toolBytes, maxToolName, maxToolBytes,
+		resultCount, resultBytes, maxResultBytes,
+		len(payload.ConversationState.History), histBytes, maxHistBytes,
+	)
+}
+
 // truncateCurrentMessage hard-truncates the current message content as a last
 // resort when even the minimal retained history plus current message exceeds the
 // limit.

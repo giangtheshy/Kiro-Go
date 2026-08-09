@@ -58,6 +58,33 @@ var errCorruptKiroStream = errors.New("corrupt upstream event stream")
 // — the turn is already paid for, so re-running it would be charged twice.
 var errEmptyMeteredKiroTurn = errors.New("upstream billed a turn that produced no content")
 
+// errKiroUpstreamRefusal means the upstream stated a reason for producing no
+// output, in an event frame the dispatch switch has no case for (content-safety
+// refusals and invalidStateEvent arrive this way, under HTTP 200).
+//
+// Distinct from an empty stream because the correct handling is the opposite: an
+// empty stream is retried, a stated refusal is not. The same payload earns the
+// same verdict on every attempt and every account, so retrying only delays the
+// explanation and rotating only spreads the failure across the pool.
+var errKiroUpstreamRefusal = errors.New("upstream refused the request")
+
+// refusalError carries the upstream's own wording as the error message while
+// still unwrapping to errKiroUpstreamRefusal.
+//
+// Wrapping with fmt.Errorf("%w …") would prefix the sentinel's text, producing
+// "upstream refused the request from CodeWhisperer: content filtered by upstream
+// (CYBER): …" — the word "upstream" three times before the sentence that
+// actually helps. The client sees this string verbatim, so it is worth the extra
+// type to let the upstream's advice lead. The endpoint name is not lost; it stays
+// in the log line beside the raw frame.
+type refusalError struct{ msg string }
+
+func (e *refusalError) Error() string { return e.msg }
+
+// Unwrap is what keeps errors.Is(err, errKiroUpstreamRefusal) working for every
+// caller that classifies by sentinel rather than by string.
+func (e *refusalError) Unwrap() error { return errKiroUpstreamRefusal }
+
 // kiroStreamTimeout bounds the ENTIRE streaming request, including reading the
 // response body (http.Client.Timeout is documented to cover the body read). It was
 // 5 minutes, which silently truncated long generations: a high thinking budget on
@@ -514,20 +541,68 @@ func setPayloadProfileArnForAccount(payload *KiroPayload, account *config.Accoun
 }
 
 // getSortedEndpoints returns endpoints ordered by user preference, with optional fallback.
+// indexOfEndpoint resolves a kiroEndpoints entry by its Name, returning -1 when
+// no entry carries that name. Callers must handle -1: adding or renaming an
+// endpoint must never silently select the wrong one by index.
+func indexOfEndpoint(name string) int {
+	for i, ep := range kiroEndpoints {
+		if ep.Name == name {
+			return i
+		}
+	}
+	return -1
+}
+
+// relayEndpointFor builds the single endpoint a relay account is pinned to, or
+// returns false when the account is an ordinary AWS one.
+//
+// Exactly one endpoint, and never a fallback: the other entries are AWS hosts
+// that a relay has nothing to do with, so trying them could only fail — and each
+// attempt is a billed turn on the way there. AmzTarget is left empty because
+// that header selects an AWS service operation; a relay routes on the URL path.
+func relayEndpointFor(account *config.Account) (kiroEndpoint, bool) {
+	if account == nil || !account.IsRelayCredential() {
+		return kiroEndpoint{}, false
+	}
+	return kiroEndpoint{
+		URL:       strings.TrimSpace(account.ApiEndpoint),
+		Origin:    "AI_EDITOR",
+		AmzTarget: "",
+		Name:      "Relay",
+	}, true
+}
+
 func getSortedEndpoints(preferred string) []kiroEndpoint {
 	fallback := config.GetEndpointFallback()
 
+	// Indices are resolved by NAME, not hardcoded. They were hardcoded 0/1/2 from
+	// when kiroEndpoints held three entries; inserting "Kiro Runtime" at index 1
+	// silently shifted them, so "codewhisperer" selected Kiro Runtime and
+	// "amazonq" selected CodeWhisperer. An operator picking an endpoint in the
+	// panel got a different one, and the endpoint named in an error message was
+	// not the one the setting asked for.
 	var primary int
 	switch preferred {
 	case "kiro":
-		primary = 0
+		primary = indexOfEndpoint("Kiro IDE")
 	case "codewhisperer":
-		primary = 1
+		primary = indexOfEndpoint("CodeWhisperer")
 	case "amazonq":
-		primary = 2
+		primary = indexOfEndpoint("AmazonQ")
 	default:
-		// "auto": Kiro first, then fallback to others
-		return []kiroEndpoint{kiroEndpoints[0], kiroEndpoints[1], kiroEndpoints[2]}
+		// "auto": every endpoint in declared order. The old form listed [0],[1],[2]
+		// explicitly, which meant the last entry (AmazonQ) was never reachable in
+		// auto mode no matter how many endpoints were declared.
+		out := make([]kiroEndpoint, len(kiroEndpoints))
+		copy(out, kiroEndpoints)
+		return out
+	}
+	if primary < 0 {
+		// An unknown name cannot be honoured; auto order is the safe reading of
+		// "the operator wants this to work" rather than serving nothing.
+		out := make([]kiroEndpoint, len(kiroEndpoints))
+		copy(out, kiroEndpoints)
+		return out
 	}
 
 	if !fallback {
@@ -640,7 +715,10 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		return proxyErr
 	}
 
-	if payload != nil && strings.TrimSpace(payload.ProfileArn) == "" {
+	// A relay authenticates by API key and has no ListAvailableProfiles endpoint, so
+	// resolution would probe every candidate region — several requests per turn, all
+	// 404 — before giving up. Skipped outright: the relay does not need the ARN.
+	if payload != nil && strings.TrimSpace(payload.ProfileArn) == "" && !account.IsRelayCredential() {
 		if profileArn, err := ResolveProfileArn(account); err == nil {
 			payload.ProfileArn = profileArn
 		} else if isProfileArnResolutionSoftError(err) {
@@ -650,8 +728,12 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		}
 	}
 
-	// Build endpoint list ordered by configuration.
+	// Build endpoint list ordered by configuration. A relay account overrides the
+	// list entirely — see relayEndpointFor for why it is one entry with no fallback.
 	endpoints := getSortedEndpoints(config.GetPreferredEndpoint())
+	if relay, ok := relayEndpointFor(account); ok {
+		endpoints = []kiroEndpoint{relay}
+	}
 
 	// OUTER proxy-swap loop: the inner loop tries each endpoint over the current
 	// proxy. Only a proxy/dial TRANSPORT failure (not an HTTP status) rotates us
@@ -683,7 +765,13 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
 
 			// Target the account's region; endpoint URLs are declared for us-east-1.
-			epURL := regionalizeURL(ep.URL, account)
+			// A relay URL is absolute and operator-supplied, so it is used verbatim:
+			// rewriting it would rebuild an AWS host out of an address that only
+			// coincidentally resembles one.
+			epURL := ep.URL
+			if !account.IsRelayCredential() {
+				epURL = regionalizeURL(ep.URL, account)
+			}
 			reqBody, _ := json.Marshal(payload)
 
 			// Propagate the client's request context so a client disconnect
@@ -701,6 +789,13 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			host := ""
 			if parsedURL, parseErr := url.Parse(epURL); parseErr == nil {
 				host = parsedURL.Host
+			}
+			// A relay may be routed by a vhost name that differs from the host we
+			// dial. Overriding only the Host header leaves the TLS SNI on the URL's
+			// own host, so the connection still validates against the relay's real
+			// certificate — which is what removes any need for a custom CA.
+			if relayHost := strings.TrimSpace(account.ApiHost); relayHost != "" {
+				host = relayHost
 			}
 			headerValues := buildStreamingHeaderValues(account, host)
 
@@ -733,9 +828,21 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			reachedUpstream = true
 
 			if resp.StatusCode == 429 {
+				// The body is read, not discarded. 429 is not always a quota verdict:
+				// a relay answers it for a rejected credential too, stating
+				// "invalid api key" right here. Dropping the body reported that dead
+				// key as "quota exhausted" — so the account was cooled down and
+				// retried forever instead of being flagged as needing a new key.
+				errBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBodyBytes))
 				resp.Body.Close()
-				logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
-				lastErr = fmt.Errorf("quota exhausted on %s", ep.Name)
+				detail := strings.TrimSpace(string(errBody))
+				if detail == "" {
+					logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
+					lastErr = fmt.Errorf("quota exhausted on %s", ep.Name)
+					continue
+				}
+				logger.Warnf("[KiroAPI] Endpoint %s returned 429: %s", ep.Name, maskSecrets(detail))
+				lastErr = fmt.Errorf("HTTP 429 from %s: %s", ep.Name, detail)
 				continue
 			}
 
@@ -761,7 +868,13 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			if poolKey != "" {
 				config.MarkProxyHealthy(poolKey)
 			}
-			outcome, parseErr := parseEventStreamTracked(resp.Body, callback)
+			// Counted so an empty stream can say whether the upstream sent no
+			// bytes at all or sent frames that carried nothing usable. Those
+			// have different causes and the distinction is invisible otherwise.
+			counter := &countingReader{r: resp.Body}
+			outcome, parseErr := parseEventStreamTracked(counter, callback)
+			responseBytes := counter.n
+			requestID := resp.Header.Get("X-Amzn-Requestid")
 			resp.Body.Close()
 
 			if parseErr != nil {
@@ -787,7 +900,52 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			// endpoint is safe and usually succeeds — these blips clear within
 			// seconds. Bounded so a real outage cannot spin here forever.
 			if !outcome.Metered && !outcome.Emitted {
+				// Whatever the upstream said about this turn. It said nothing the
+				// client could see, but it usually said something SOMEWHERE — a
+				// content-safety verdict rides in metadataEvent, other refusals
+				// in event types this switch has no case for. Reporting "no
+				// output, no metering" while holding that text is what left both
+				// operators and customers with nothing to act on.
+				reason := describeUnknownEvents(outcome)
+
+				// A stated refusal is final: the same request earns the same
+				// verdict on every attempt and every account, so retrying only
+				// delays the explanation and rotating spreads one conversation's
+				// failure across the pool.
+				if looksLikeUpstreamRefusal(reason) {
+					logger.Warnf(
+						"[KiroAPI] Endpoint %s refused the turn in-band: respBytes=%d requestId=%q payload=%dKB history=%d shape=%s reason=%s",
+						ep.Name, responseBytes, requestID,
+						payloadByteSize(payload)/1024,
+						len(payload.ConversationState.History),
+						describePayloadShape(payload), reason,
+					)
+					// The formatted form goes to the client; the log above keeps
+					// the raw frame so nothing is lost for diagnosis.
+					return &refusalError{msg: formatUpstreamRefusal(reason)}
+				}
+
+				// Not recognisably a refusal, so it stays retryable. The reason is
+				// still appended when there is one: the upstream payload shape for
+				// a filtered turn is not documented, so the matcher above WILL miss
+				// forms it has not seen — and when it does, the customer must still
+				// receive the upstream's own words rather than a bare "no output,
+				// no metering" that explains nothing.
 				lastErr = fmt.Errorf("empty stream from %s (no output, no metering)", ep.Name)
+				if reason != "" {
+					lastErr = fmt.Errorf("empty stream from %s (no output, no metering): %s", ep.Name, reason)
+				}
+				// Logged in full on every attempt: a run of these is the only
+				// lead there is, and the shape of the payload is what
+				// distinguishes "ordinary 190KB across a long history" from
+				// "190KB in one tool result".
+				logger.Warnf(
+					"[KiroAPI] Endpoint %s empty stream: respBytes=%d requestId=%q events=%v reason=%q payload=%dKB history=%d shape=%s",
+					ep.Name, responseBytes, requestID, outcome.UnknownEvents, reason,
+					payloadByteSize(payload)/1024,
+					len(payload.ConversationState.History),
+					describePayloadShape(payload),
+				)
 				if emptyStreamRetries < maxEmptyStreamRetries {
 					emptyStreamRetries++
 					logger.Warnf("[KiroAPI] Endpoint %s returned an empty stream, retrying (%d/%d)", ep.Name, emptyStreamRetries, maxEmptyStreamRetries)
@@ -811,7 +969,31 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			// The turn is NOT retried against the same endpoint: it was already
 			// billed, so re-running it here would pay twice for one turn.
 			if !outcome.Emitted {
-				logger.Warnf("[KiroAPI] Endpoint %s billed a turn that produced no content", ep.Name)
+				// The upstream's own account of why, when it gave one. A refusal
+				// is BILLED — it read the conversation before deciding it would
+				// not answer — so a content-safety verdict lands here rather than
+				// on the unmetered path above, and this is where its text has to
+				// be recovered. Without it the client received "billed a turn that
+				// produced no content", which describes the accounting and not the
+				// cause.
+				reason := describeUnknownEvents(outcome)
+				if looksLikeUpstreamRefusal(reason) {
+					logger.Warnf(
+						"[KiroAPI] Endpoint %s refused the turn (billed, no content): requestId=%q payload=%dKB history=%d reason=%s",
+						ep.Name, requestID,
+						payloadByteSize(payload)/1024,
+						len(payload.ConversationState.History), reason,
+					)
+					return &refusalError{msg: formatUpstreamRefusal(reason)}
+				}
+				logger.Warnf("[KiroAPI] Endpoint %s billed a turn that produced no content: requestId=%q reason=%q shape=%s",
+					ep.Name, requestID, reason, describePayloadShape(payload))
+				if reason != "" {
+					// Same reasoning as the empty-stream path: the matcher above
+					// only knows the refusal forms it has seen, so an unrecognised
+					// reason must still reach the client verbatim.
+					return fmt.Errorf("%w from %s: %s", errEmptyMeteredKiroTurn, ep.Name, reason)
+				}
 				return fmt.Errorf("%w from %s", errEmptyMeteredKiroTurn, ep.Name)
 			}
 
@@ -821,7 +1003,15 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			// the only correct move is to tell the handler to withhold the
 			// "finished" signal.
 			if !outcome.Metered {
-				logger.Warnf("[KiroAPI] Endpoint %s stream ended without metering after partial output", ep.Name)
+				// The reason is logged but NOT turned into an error, even when it
+				// reads as a refusal. Content is already on the wire: the HTTP
+				// status is long since sent and replacing the answer is no longer
+				// possible, so the only correct move remains withholding the
+				// "finished" signal. Operators still need the distinction in the
+				// log — "upstream refused mid-answer" and "the connection dropped"
+				// look identical to the client but call for different action.
+				logger.Warnf("[KiroAPI] Endpoint %s stream ended without metering after partial output: requestId=%q reason=%q",
+					ep.Name, requestID, describeUnknownEvents(outcome))
 				if callback != nil && callback.OnTruncated != nil {
 					callback.OnTruncated()
 				}
@@ -882,6 +1072,197 @@ type StreamOutcome struct {
 	// stop_reason cannot know: Kiro applies its own output limit independent of
 	// the client's max_tokens.
 	StopReason string
+	// MetadataPayload is the last metadataEvent body, verbatim.
+	//
+	// Kept whole because stopReason is not the only thing that frame carries. A
+	// content-safety refusal states its category and its advice to the user
+	// there ("(CYBER): The selected model cannot continue this conversation…"),
+	// and reading only stopReason threw all of it away. Worse, matching
+	// metadataEvent at all stops the frame from reaching the default branch
+	// below, so the reason was not recovered as an unknown payload either — the
+	// turn was reported as "empty stream (no output, no metering)" while the
+	// explanation sat in a field nobody read.
+	//
+	// Only surfaced when the turn produced nothing usable: every normal turn
+	// ends with a metadataEvent, so quoting it unconditionally would attach a
+	// "reason" to healthy requests.
+	MetadataPayload string
+	// UnknownEvents lists :event-type values the dispatch switch has no case
+	// for, and UnknownPayloads keeps their bodies.
+	//
+	// These exist because "the stream delivered nothing" and "the stream
+	// delivered a refusal nobody read" are the same thing to a switch that only
+	// handles the happy path. Upstream reports several failures as ordinary
+	// event frames under HTTP 200 — invalidStateEvent and content-safety
+	// refusals among them — and those carry :message-type=event, so the
+	// exception check above does not catch them either. Dropping them silently
+	// is what turns a stated reason into "empty stream (no output, no
+	// metering)": the explanation arrived and was thrown away.
+	//
+	// Capped, because a pathological stream must not be able to grow this
+	// without bound or flood a log line.
+	UnknownEvents   []string
+	UnknownPayloads []string
+}
+
+// maxTrackedUnknownEvents bounds how many unrecognised frames are retained.
+// More than a handful adds no diagnostic value: the informative frame is
+// usually among the first few, but it is often NOT the first (initial-response
+// leads, the reason follows), which is why this is not 1.
+// maxUpstreamErrorBodyBytes caps how much of a 429 body is folded into an error.
+// The interesting part of these replies is a short JSON message; a cap keeps a
+// misconfigured relay from pasting a full HTML page into the log and the
+// client-facing error.
+const maxUpstreamErrorBodyBytes = 512
+
+const maxTrackedUnknownEvents = 8
+
+// maxUnknownPayloadSnippet caps each retained frame body. Enough to carry a
+// reason string and its surrounding JSON, short enough to keep a log line and
+// an error message readable.
+const maxUnknownPayloadSnippet = 300
+
+// countingReader tallies bytes read through it, so the endpoint loop can report
+// how much a stream actually delivered when it delivered no content. A
+// zero-length body and a body full of frames that carried nothing usable are
+// indistinguishable from the outcome alone, and they have different causes.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// isBenignUnknownEvent reports whether an unrecognised :event-type is a normal
+// part of every stream rather than a possible explanation for a failed one.
+//
+// Only frames that are known to be structural belong here. Anything genuinely
+// unrecognised must keep its body: the whole point of retaining unknown frames
+// is that the informative one is, by definition, one this code does not know
+// about yet.
+func isBenignUnknownEvent(eventType string) bool {
+	switch eventType {
+	case "initial-response":
+		// Opens every event stream, carries no reason.
+		return true
+	default:
+		return false
+	}
+}
+
+// describeUnknownEvents renders everything the upstream said about a turn that
+// produced nothing, returning "" when it said nothing at all.
+//
+// metadataEvent is included and comes first. It is the frame that actually
+// carries a content-safety verdict ("(CYBER): The selected model cannot continue
+// this conversation…"), and it is a RECOGNISED event type — so it never appears
+// among the unknown payloads. Reading only those was why the reason was lost and
+// the turn was reported as an unexplained empty stream.
+//
+// Callers must only use this for a turn that delivered nothing: every healthy
+// turn ends with a metadataEvent too, so quoting one from a working request would
+// attach an explanation to something that needs none.
+func describeUnknownEvents(outcome StreamOutcome) string {
+	parts := make([]string, 0, len(outcome.UnknownPayloads)+1)
+	if outcome.MetadataPayload != "" {
+		parts = append(parts, "metadataEvent="+outcome.MetadataPayload)
+	}
+	parts = append(parts, outcome.UnknownPayloads...)
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, " | ")
+}
+
+// refusalMessageKeys are the fields an upstream reason frame might carry its
+// human-readable text in, most specific first. The wire shape for a filtered turn
+// is not documented, so several spellings are tried rather than betting on one.
+var refusalMessageKeys = []string{
+	"message", "errorMessage", "error_message", "reasonText",
+	"description", "detail", "text",
+}
+
+// refusalCodeKeys are the fields that might carry the machine-readable category
+// ("CYBER", "CONTENT_FILTER", ...). Surfaced alongside the message because it is
+// the part an operator can correlate across reports.
+var refusalCodeKeys = []string{
+	"filterType", "filter_type", "filterReason", "filter_reason",
+	"blockReason", "block_reason", "category", "reason", "code", "stopReason",
+}
+
+// formatUpstreamRefusal turns a raw reason frame into something a customer can
+// read, e.g.
+//
+//	content filtered by upstream (CYBER): The selected model cannot continue
+//	this conversation. Please select a different model, or start a new
+//	conversation, …
+//
+// The raw form is a JSON blob prefixed by its event type. Handing that to a
+// customer is barely better than handing them nothing: the upstream already
+// wrote a sentence explaining what to do, and it is buried in a field. When no
+// readable text can be found the raw blob is returned unchanged — losing the
+// detail would be worse than showing it ugly.
+func formatUpstreamRefusal(reason string) string {
+	for _, segment := range strings.Split(reason, " | ") {
+		idx := strings.Index(segment, "={")
+		if idx < 0 {
+			continue
+		}
+		var body map[string]interface{}
+		if err := json.Unmarshal([]byte(segment[idx+1:]), &body); err != nil {
+			// Truncated by maxUnknownPayloadSnippet, most likely. The raw
+			// fallback below still carries it.
+			continue
+		}
+		message := firstStringField(body, refusalMessageKeys...)
+		if message == "" {
+			continue
+		}
+		if code := firstStringField(body, refusalCodeKeys...); code != "" {
+			return fmt.Sprintf("content filtered by upstream (%s): %s", code, message)
+		}
+		return "content filtered by upstream: " + message
+	}
+	return reason
+}
+
+// looksLikeUpstreamRefusal reports whether what the upstream said is a verdict on
+// the request rather than a transient failure. It decides retry vs no-retry, so
+// the two error classes are worth keeping apart:
+//
+//	a refusal    — the same request earns the same answer on every attempt and
+//	               every account, so retrying only delays the explanation and
+//	               rotating spreads one conversation's failure across the pool.
+//	anything else — possibly transient, so the existing retry path still applies.
+//
+// Deliberately keyword-based and deliberately NOT triggered by the mere presence
+// of a metadataEvent: that frame ends every healthy turn, so treating it as
+// evidence would make the first empty stream of any cause look like a refusal and
+// answer 400 to a request that a retry would have served.
+//
+// The exact upstream payload shape for a filtered turn is not documented, so a
+// miss here is expected and handled: an unmatched reason still reaches the client
+// verbatim through the empty-stream path, it just keeps being retried first.
+func looksLikeUpstreamRefusal(reason string) bool {
+	if reason == "" {
+		return false
+	}
+	lower := strings.ToLower(reason)
+	for _, marker := range []string{
+		"content_filter", "contentfilter", "content filter", "filtered",
+		"cyber", "guardrail", "policy", "blocked",
+		"cannot continue this conversation", "invalidstate",
+		"safety", "violat",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // parseEventStream decodes an AWS binary Event Stream response body, discarding
@@ -1044,6 +1425,45 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (Stre
 				if callback.OnStopReason != nil {
 					callback.OnStopReason(outcome.StopReason)
 				}
+			}
+			// The whole frame is retained, not just stopReason. See
+			// StreamOutcome.MetadataPayload: a content-safety refusal states its
+			// category and its advice here, and matching this case is precisely
+			// what stops the frame from reaching the default branch that would
+			// otherwise have preserved it.
+			if snippet := strings.TrimSpace(string(payloadBytes)); snippet != "" {
+				if len(snippet) > maxUnknownPayloadSnippet {
+					snippet = snippet[:maxUnknownPayloadSnippet]
+				}
+				outcome.MetadataPayload = snippet
+			}
+		default:
+			// Retained rather than dropped. See StreamOutcome.UnknownEvents: a
+			// refusal delivered as a normal event frame under HTTP 200 is
+			// otherwise thrown away, and the turn is then reported as an
+			// unexplained empty stream. Keeping the body is what lets the
+			// endpoint loop quote the upstream's own words back to the client.
+			label := eventType
+			if label == "" {
+				// A frame with no :event-type header at all. Naming it beats an
+				// anonymous "=..." entry in the log.
+				label = "<no-event-type>"
+			}
+			if len(outcome.UnknownEvents) < maxTrackedUnknownEvents {
+				outcome.UnknownEvents = append(outcome.UnknownEvents, label)
+			}
+			// Bodies are kept only for frames that could carry a reason.
+			// initial-response opens every single stream, so retaining its body
+			// would put a payload in front of the informative one on every
+			// failure and make the customer-facing message start with noise.
+			// The name is still recorded above, and responseBytes already
+			// distinguishes "zero bytes" from "stream opened then closed".
+			if !isBenignUnknownEvent(label) && len(outcome.UnknownPayloads) < maxTrackedUnknownEvents {
+				snippet := strings.TrimSpace(string(payloadBytes))
+				if len(snippet) > maxUnknownPayloadSnippet {
+					snippet = snippet[:maxUnknownPayloadSnippet]
+				}
+				outcome.UnknownPayloads = append(outcome.UnknownPayloads, label+"="+snippet)
 			}
 		}
 	}

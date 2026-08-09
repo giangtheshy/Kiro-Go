@@ -925,6 +925,51 @@
           </div>
 
           <div class="form-group">
+            <label data-i18n="autobuy.telegramTitle"></label>
+            <small data-i18n="autobuy.telegramHint"></small>
+          </div>
+
+          <div class="form-group">
+            <label for="autobuyTgToken" data-i18n="autobuy.telegramToken"></label>
+            <input type="password" id="autobuyTgToken" autocomplete="off" />
+            <small data-i18n="autobuy.telegramTokenHint"></small>
+          </div>
+
+          <div class="form-group">
+            <label for="autobuyTgChatId" data-i18n="autobuy.telegramChatId"></label>
+            <input type="text" id="autobuyTgChatId" placeholder="123456789" />
+            <small data-i18n="autobuy.telegramChatIdHint"></small>
+          </div>
+
+          <div class="form-group">
+            <label for="autobuyTgApiBase" data-i18n="autobuy.telegramApiBase"></label>
+            <input type="text" id="autobuyTgApiBase" placeholder="https://api.telegram.org" />
+            <small data-i18n="autobuy.telegramApiBaseHint"></small>
+          </div>
+
+          <div class="form-group">
+            <label class="flex items-center gap-2">
+              <span class="switch"><input type="checkbox" id="autobuyNotifyPoolExhausted" /><span
+                  class="slider"></span></span>
+              <span data-i18n="autobuy.notifyPoolExhausted"></span>
+            </label>
+            <small data-i18n="autobuy.notifyPoolExhaustedHint"></small>
+          </div>
+
+          <div class="form-group">
+            <label for="autobuyPoolAlertRepeat" data-i18n="autobuy.poolAlertRepeat"></label>
+            <input type="number" id="autobuyPoolAlertRepeat" min="1" max="10" step="1" />
+            <small data-i18n="autobuy.poolAlertRepeatHint"></small>
+          </div>
+
+          <div class="form-group">
+            <button class="btn btn-outline btn-sm" id="autobuyTestNotifyBtn" type="button"><i
+                class="fa-solid fa-paper-plane" aria-hidden="true"></i><span class="btn-text"
+                data-i18n="autobuy.testNotify"></span></button>
+            <small data-i18n="autobuy.testNotifyHint"></small>
+          </div>
+
+          <div class="form-group">
             <label data-i18n="autobuy.zonesTitle"></label>
             <small data-i18n="autobuy.zonesHint"></small>
           </div>

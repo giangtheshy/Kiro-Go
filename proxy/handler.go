@@ -3,6 +3,7 @@ package proxy
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"kiro-go/auth"
@@ -68,6 +69,9 @@ type Handler struct {
 	stopAlertWatcher chan struct{}
 	// stopAutoBuy stops the unattended market key buyer. See proxy/autobuy_worker.go.
 	stopAutoBuy chan struct{}
+	// poolAlert latches the "no usable account left" alert so it fires on the
+	// transition into exhaustion rather than on every check. See proxy/pool_alert.go.
+	poolAlert poolAlertState
 	// providerCursor drives weighted round-robin across external providers that
 	// share a routing tier. See proxy/upstream_router.go.
 	providerCursor uint64
@@ -393,6 +397,15 @@ func (h *Handler) refreshAllAccounts() {
 			}
 		}
 
+		// A relay generally implements only the streaming call, so GetUserInfo is a
+		// 404 there. Skipping it keeps this loop from logging a warning per relay
+		// account on every cycle — noise that would bury real refresh failures.
+		// The cost is that subscription and usage figures stay empty for these
+		// accounts; credits are still accumulated from each turn's meteringEvent.
+		if account.IsRelayCredential() {
+			continue
+		}
+
 		// 刷新账户信息
 		info, err := RefreshAccountInfo(account)
 		if err != nil {
@@ -620,6 +633,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.apiKeySelfInfo(w, r)
 	case path == "/v1/key/logs" || path == "/key/logs":
 		h.apiKeySelfLogs(w, r)
+	case path == "/v1/key/status" || path == "/key/status":
+		h.apiKeyModelHealth(w, r)
 	case path == "/v1/key/stream-ticket" && r.Method == "POST":
 		h.apiKeyStreamTicket(w, r)
 	case path == "/v1/key/logs/stream" && r.Method == "GET":
@@ -955,6 +970,16 @@ func (h *Handler) refreshModelsCache() {
 func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
 	if err := h.ensureValidToken(account); err != nil {
 		return fmt.Errorf("token refresh failed: %w", err)
+	}
+	// A relay serves only the streaming call, so ListAvailableModels 404s there.
+	// Leaving the model list unset is the right outcome rather than a gap: the pool
+	// treats an account with no list as supporting every model (see
+	// accountHasModel), which is the same optimistic routing used at cold start.
+	// Hardcoding a relay's inventory here would instead go stale the moment the
+	// operator of that relay changed it.
+	if account.IsRelayCredential() {
+		logger.Debugf("[ModelsCache] Skipped model listing for relay account %s", accountEmailForLog(account))
+		return nil
 	}
 	models, err := ListAvailableModels(account)
 	if err != nil {
@@ -1746,6 +1771,13 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
+			// A refusal is the upstream's verdict on the conversation, so every
+			// other account returns it too — and each attempt is billed, because
+			// the upstream read the conversation before declining. Stop and let
+			// the customer read what it said. See isTerminalRequestError.
+			if isTerminalRequestError(err) {
+				break
+			}
 			if !messageStarted {
 				continue
 			}
@@ -2184,6 +2216,12 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
+			// A refusal is final and was already billed: the upstream read the
+			// conversation before declining, so rotating pays another account for
+			// the identical verdict. See isTerminalRequestError.
+			if isTerminalRequestError(err) {
+				break
+			}
 			continue
 		}
 
@@ -2760,6 +2798,12 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
+			// Same as the Claude stream path: a refusal is final and billed, so
+			// rotating pays for the identical verdict again. See
+			// isTerminalRequestError.
+			if isTerminalRequestError(err) {
+				break
+			}
 			if !responseStarted {
 				continue
 			}
@@ -2923,6 +2967,12 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
+			// A refusal is final and was already billed: the upstream read the
+			// conversation before declining, so rotating pays another account for
+			// the identical verdict. See isTerminalRequestError.
+			if isTerminalRequestError(err) {
+				break
+			}
 			continue
 		}
 
@@ -3363,6 +3413,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetAutoBuyLogs(w, r)
 	case path == "/autobuy/buy" && r.Method == "POST":
 		h.apiAutoBuyManual(w, r)
+	case path == "/autobuy/notify-test" && r.Method == "POST":
+		h.apiAutoBuyNotifyTest(w, r)
 	case path == "/credit-topups" && r.Method == "GET":
 		h.salesTopupsAdmin(w, r)
 	default:
@@ -3411,6 +3463,9 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"currentOverages":   a.CurrentOverages,
 			"overageCheckedAt":  a.OverageCheckedAt,
 			"proxyURL":          a.ProxyURL,
+			"apiEndpoint":       a.ApiEndpoint,
+			"apiHost":           a.ApiHost,
+			"isRelay":           a.IsRelayCredential(),
 			"subscriptionType":  a.SubscriptionType,
 			"subscriptionTitle": a.SubscriptionTitle,
 			"daysRemaining":     a.DaysRemaining,
@@ -3462,6 +3517,14 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 		account.ExpiresAt = 0
 		account.AccessToken = account.KiroApiKey // Set accessToken to kiroApiKey for pool compatibility
 		// Don't call RefreshToken for API-key accounts
+	}
+
+	account.ApiEndpoint = strings.TrimSpace(account.ApiEndpoint)
+	account.ApiHost = strings.TrimSpace(account.ApiHost)
+	if err := config.ValidateApiEndpoint(account.ApiEndpoint); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
 	}
 
 	if err := config.AddAccount(account); err != nil {
@@ -3535,6 +3598,18 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	}
 	if v, ok := updates["proxyURL"].(string); ok {
 		existing.ProxyURL = v
+	}
+	if v, ok := updates["apiEndpoint"].(string); ok {
+		trimmed := strings.TrimSpace(v)
+		if err := config.ValidateApiEndpoint(trimmed); err != nil {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		existing.ApiEndpoint = trimmed
+	}
+	if v, ok := updates["apiHost"].(string); ok {
+		existing.ApiHost = strings.TrimSpace(v)
 	}
 
 	if err := config.UpdateAccount(id, *existing); err != nil {
@@ -3733,6 +3808,13 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 			}
 			// 刷新账户信息
 			info, err := RefreshAccountInfo(account)
+			if errors.Is(err, ErrAccountInfoUnsupported) {
+				// Nothing to refresh rather than a refresh that failed. Counting it
+				// as a failure would report "1 failed" to an operator who selected a
+				// relay account, with nothing actually wrong.
+				successCount++
+				continue
+			}
 			if err != nil {
 				failCount++
 				continue
@@ -4172,12 +4254,24 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 			Region:      req.Region,
 			AuthRegion:  req.AuthRegion,
 			ApiRegion:   req.ApiRegion,
+			ApiEndpoint: strings.TrimSpace(req.ApiEndpoint),
+			ApiHost:     strings.TrimSpace(req.ApiHost),
 			ExpiresAt:   0,
 			Enabled:     true,
 			MachineId:   config.GenerateMachineId(),
 		}
+		if req.Priority > 0 {
+			account.Priority = req.Priority
+		}
+		if err := config.ValidateApiEndpoint(account.ApiEndpoint); err != nil {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
 
-		// Best-effort: fetch account info to populate email/usage.
+		// Best-effort: fetch account info to populate email/usage. A relay returns
+		// ErrAccountInfoUnsupported here, which this best-effort form already
+		// tolerates — the account is created with usage fields left empty.
 		if info, infoErr := RefreshAccountInfo(&account); infoErr == nil && info != nil {
 			account.Email = info.Email
 			account.UserId = info.UserId
@@ -4249,6 +4343,14 @@ type credentialImportPayload struct {
 	IdPClientID  string `json:"idpClientId"`
 	Scopes       string `json:"scopes"`
 	LoginHint    string `json:"loginHint"`
+
+	// Relay overrides. Only meaningful alongside an API key — see
+	// config.Account.ApiEndpoint. Priority is accepted here so a relay can be
+	// filed into a high tier at creation time, rather than serving live traffic
+	// from tier 0 in the window between being added and being edited.
+	ApiEndpoint string `json:"apiEndpoint"`
+	ApiHost     string `json:"apiHost"`
+	Priority    int    `json:"priority"`
 }
 
 // importOAuthCredential performs the refresh-token based credential import
@@ -4847,6 +4949,17 @@ func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id s
 
 	// 获取账户信息
 	info, err := RefreshAccountInfo(account)
+	if errors.Is(err, ErrAccountInfoUnsupported) {
+		// Answered as success: the operator pressed refresh and nothing is broken,
+		// there is simply no usage endpoint to read on a relay. Falling through would
+		// hit the token-error branch below, which matches the bare substring
+		// "invalid" and would try a token refresh this credential has no use for.
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": "Relay account has no usage endpoint to refresh",
+		})
+		return
+	}
 	if err != nil {
 		// 检查是否为封禁相关错误
 		errMsg := err.Error()

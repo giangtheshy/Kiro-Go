@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"kiro-go/auth"
@@ -551,7 +552,23 @@ func setKiroHeaders(req *http.Request, account *config.Account) {
 }
 
 // RefreshAccountInfo 刷新账户信息（使用量、订阅等）
+// ErrAccountInfoUnsupported reports that this account has no usage/subscription
+// REST surface to read, so there is nothing to refresh — as opposed to a refresh
+// that was attempted and failed.
+//
+// Callers should treat it as a no-op, not an error worth logging at warn level.
+var ErrAccountInfoUnsupported = errors.New("account info refresh unsupported for this credential")
+
 func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
+	// Guarded here rather than at each call site: there are seven of them, and the
+	// next one added would quietly reintroduce the problem. It is not merely noise
+	// either — GetUsageLimits answers 404 on a relay, and the token-error branch
+	// below matches the bare substring "invalid", so a relay whose 404 body happened
+	// to contain that word would be misread as having an expired token.
+	if account != nil && account.IsRelayCredential() {
+		return nil, ErrAccountInfoUnsupported
+	}
+
 	info := &config.AccountInfo{
 		LastRefresh: time.Now().Unix(),
 	}

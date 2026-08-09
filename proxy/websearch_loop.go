@@ -78,6 +78,12 @@ func (h *Handler) callUpstreamForWebSearch(req *ClaudeRequest, thinking bool, ap
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
+			// A refusal is final and was already billed: the upstream read the
+			// conversation before declining, so rotating pays another account for
+			// the identical verdict. See isTerminalRequestError.
+			if isTerminalRequestError(err) {
+				break
+			}
 			continue
 		}
 

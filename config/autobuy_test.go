@@ -637,3 +637,190 @@ func TestGetAutoBuyConfigRollsTheDayOnRead(t *testing.T) {
 		t.Fatalf("DayStamp should be today, got %q", got.DayStamp)
 	}
 }
+
+// --- Telegram channel + pool alert ---
+
+// Either half of the Telegram pair alone delivers nothing, so a half-configured
+// channel is refused rather than accepted and left silently broken.
+func TestTelegramRequiresBothTokenAndChatID(t *testing.T) {
+	newAutoBuyTestConfig(t)
+
+	onlyToken := enabledAutoBuy()
+	onlyToken.TelegramBotToken = "123456:ABC"
+	if err := SetAutoBuyConfig(onlyToken); err == nil {
+		t.Fatal("a bot token with no chat id should be refused")
+	}
+
+	newAutoBuyTestConfig(t)
+	onlyChat := enabledAutoBuy()
+	onlyChat.TelegramChatID = "42"
+	if err := SetAutoBuyConfig(onlyChat); err == nil {
+		t.Fatal("a chat id with no bot token should be refused")
+	}
+
+	newAutoBuyTestConfig(t)
+	both := enabledAutoBuy()
+	both.TelegramBotToken = "123456:ABC"
+	both.TelegramChatID = "42"
+	mustSetAutoBuy(t, both)
+}
+
+// The panel never receives the stored token, so a save carrying a blank token but
+// a filled chat id means "keep the token I already gave you".
+func TestBlankTelegramTokenKeepsTheStoredOne(t *testing.T) {
+	newAutoBuyTestConfig(t)
+	initial := enabledAutoBuy()
+	initial.TelegramBotToken = "123456:ABC"
+	initial.TelegramChatID = "42"
+	mustSetAutoBuy(t, initial)
+
+	resave := enabledAutoBuy()
+	resave.TelegramBotToken = ""
+	resave.TelegramChatID = "42"
+	mustSetAutoBuy(t, resave)
+
+	cfgLock.RLock()
+	got := cfg.AutoBuy.TelegramBotToken
+	cfgLock.RUnlock()
+	if got != "123456:ABC" {
+		t.Fatalf("stored token should survive a blank submit, got %q", got)
+	}
+}
+
+// Clearing both fields is the only way to switch Telegram off. Without this
+// carve-out the stored token would be resurrected on every save and the paired
+// check would then reject the very submit meant to disable the channel.
+func TestClearingBothTelegramFieldsDisablesTheChannel(t *testing.T) {
+	newAutoBuyTestConfig(t)
+	initial := enabledAutoBuy()
+	initial.TelegramBotToken = "123456:ABC"
+	initial.TelegramChatID = "42"
+	mustSetAutoBuy(t, initial)
+
+	off := enabledAutoBuy()
+	off.TelegramBotToken = ""
+	off.TelegramChatID = ""
+	mustSetAutoBuy(t, off)
+
+	got := GetAutoBuyConfig()
+	if got.TelegramConfigured() {
+		t.Fatal("clearing both fields should turn the Telegram channel off")
+	}
+	cfgLock.RLock()
+	stored := cfg.AutoBuy.TelegramBotToken
+	cfgLock.RUnlock()
+	if stored != "" {
+		t.Fatalf("the token should be cleared, not carried over, got %q", stored)
+	}
+}
+
+func TestTelegramConfiguredNeedsBothHalves(t *testing.T) {
+	cases := []struct {
+		name  string
+		token string
+		chat  string
+		want  bool
+	}{
+		{"both set", "123456:ABC", "42", true},
+		{"token only", "123456:ABC", "", false},
+		{"chat only", "", "42", false},
+		{"neither", "", "", false},
+		{"whitespace only", "   ", "  ", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &AutoBuyConfig{TelegramBotToken: tc.token, TelegramChatID: tc.chat}
+			if got := a.TelegramConfigured(); got != tc.want {
+				t.Fatalf("TelegramConfigured() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	var nilCfg *AutoBuyConfig
+	if nilCfg.TelegramConfigured() {
+		t.Fatal("a nil config must not report a configured channel")
+	}
+}
+
+func TestEffectiveTelegramApiBaseTrimsAndDefaults(t *testing.T) {
+	var nilCfg *AutoBuyConfig
+	if got := nilCfg.EffectiveTelegramApiBase(); got != DefaultTelegramApiBase {
+		t.Fatalf("nil config: want %q, got %q", DefaultTelegramApiBase, got)
+	}
+	if got := (&AutoBuyConfig{}).EffectiveTelegramApiBase(); got != DefaultTelegramApiBase {
+		t.Fatalf("empty: want %q, got %q", DefaultTelegramApiBase, got)
+	}
+	// A trailing slash would produce "//bot<token>" once a path is joined.
+	got := (&AutoBuyConfig{TelegramApiBase: "  https://tg.example.com/  "}).EffectiveTelegramApiBase()
+	if got != "https://tg.example.com" {
+		t.Fatalf("want the trimmed base, got %q", got)
+	}
+}
+
+func TestEffectivePoolAlertRepeatClamps(t *testing.T) {
+	cases := []struct {
+		in   int
+		want int
+	}{
+		{0, DefaultPoolAlertRepeat},
+		{-5, DefaultPoolAlertRepeat},
+		{1, 1},
+		{3, 3},
+		{MaxPoolAlertRepeat, MaxPoolAlertRepeat},
+		// A typo of 300 would get the bot rate-limited exactly when it matters.
+		{300, MaxPoolAlertRepeat},
+	}
+	for _, tc := range cases {
+		a := &AutoBuyConfig{PoolAlertRepeat: tc.in}
+		if got := a.EffectivePoolAlertRepeat(); got != tc.want {
+			t.Fatalf("PoolAlertRepeat %d: want %d, got %d", tc.in, tc.want, got)
+		}
+	}
+	var nilCfg *AutoBuyConfig
+	if got := nilCfg.EffectivePoolAlertRepeat(); got != DefaultPoolAlertRepeat {
+		t.Fatalf("nil config: want %d, got %d", DefaultPoolAlertRepeat, got)
+	}
+}
+
+func TestValidateRejectsBadTelegramApiBaseAndNegativeRepeat(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*AutoBuyConfig)
+	}{
+		{"relative api base", func(c *AutoBuyConfig) { c.TelegramApiBase = "tg.example.com" }},
+		{"negative repeat", func(c *AutoBuyConfig) { c.PoolAlertRepeat = -1 }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := enabledAutoBuy()
+			tc.mutate(c)
+			if err := ValidateAutoBuyConfig(c); err == nil {
+				t.Fatal("expected validation to refuse this configuration")
+			}
+		})
+	}
+}
+
+// The pool alert is independent of buying: an operator can want the "everything is
+// down" warning without wanting unattended purchases.
+func TestPoolAlertSettingsPersistWithAutoBuyDisabled(t *testing.T) {
+	newAutoBuyTestConfig(t)
+	c := &AutoBuyConfig{
+		Enabled:             false,
+		NotifyPoolExhausted: true,
+		PoolAlertRepeat:     5,
+		TelegramBotToken:    "123456:ABC",
+		TelegramChatID:      "-1001234567890",
+	}
+	mustSetAutoBuy(t, c)
+
+	got := GetAutoBuyConfig()
+	if !got.NotifyPoolExhausted {
+		t.Fatal("NotifyPoolExhausted should persist without autoBuy being enabled")
+	}
+	if got.EffectivePoolAlertRepeat() != 5 {
+		t.Fatalf("repeat: want 5, got %d", got.EffectivePoolAlertRepeat())
+	}
+	if !got.TelegramConfigured() {
+		t.Fatal("the Telegram pair should be usable with autoBuy disabled")
+	}
+}

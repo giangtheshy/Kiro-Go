@@ -325,3 +325,75 @@ func TestReloadDropsOverQuotaAccountWhenAllowOverUsageDisabled(t *testing.T) {
 		t.Fatalf("expected over-quota account to be dropped, got %q", got.ID)
 	}
 }
+
+// An enabled Overages switch says spending is permitted, not that allowance is
+// left. Once the cap is spent the upstream answers 402 on every request, so the
+// account must leave the selection pool rather than win the first attempt.
+func TestOverageEnabledButCapExhaustedIsSkipped(t *testing.T) {
+	p := &AccountPool{}
+	p.accounts = []config.Account{{
+		ID:              "spent",
+		UsageCurrent:    10,
+		UsageLimit:      10,
+		OverageStatus:   "ENABLED",
+		OverageCap:      20,
+		CurrentOverages: 20,
+	}}
+
+	if acc := p.GetNext(); acc != nil {
+		t.Fatalf("expected nil when the overage cap is exhausted, got %q", acc.ID)
+	}
+}
+
+func TestOverageEnabledUnderCapStaysSelectable(t *testing.T) {
+	p := &AccountPool{}
+	p.accounts = []config.Account{{
+		ID:              "room",
+		UsageCurrent:    10,
+		UsageLimit:      10,
+		OverageStatus:   "ENABLED",
+		OverageCap:      20,
+		CurrentOverages: 5,
+	}}
+
+	acc := p.GetNext()
+	if acc == nil || acc.ID != "room" {
+		t.Fatalf("expected an account with overage headroom to stay selectable, got %v", acc)
+	}
+}
+
+// A zero cap means "not fetched yet", not "no allowance". Sidelining those on a
+// cold start would take healthy accounts out of rotation before the first
+// getUsageLimits round trip populates the field.
+func TestOverageEnabledWithUnknownCapStaysSelectable(t *testing.T) {
+	p := &AccountPool{}
+	p.accounts = []config.Account{{
+		ID:            "unknown-cap",
+		UsageCurrent:  10,
+		UsageLimit:    10,
+		OverageStatus: "ENABLED",
+	}}
+
+	acc := p.GetNext()
+	if acc == nil || acc.ID != "unknown-cap" {
+		t.Fatalf("expected account with unfetched cap to stay selectable, got %v", acc)
+	}
+}
+
+// allowOverUsage is the operator's explicit override and outranks the cap check.
+func TestAllowOverUsageOutranksExhaustedCap(t *testing.T) {
+	spent := config.Account{
+		ID:              "spent",
+		UsageCurrent:    10,
+		UsageLimit:      10,
+		OverageStatus:   "ENABLED",
+		OverageCap:      20,
+		CurrentOverages: 20,
+	}
+	if !isQuotaBlocked(spent, false) {
+		t.Fatal("expected exhausted cap to block when allowOverUsage is off")
+	}
+	if isQuotaBlocked(spent, true) {
+		t.Fatal("expected allowOverUsage to override the cap check")
+	}
+}

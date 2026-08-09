@@ -64,7 +64,20 @@ var (
 	ErrNothingToApply      = errors.New("either addCredits or addDays must be greater than zero")
 	ErrKeyNotFound         = errors.New("api key not found")
 	ErrKeyUnlimited        = errors.New("key has an unlimited credit limit; topping it up would silently make it limited")
+	ErrKeyNotExpired       = errors.New("key has not expired yet; reclaiming credits from a live key would cut off a paying customer")
 )
+
+// ReclaimedLimitFloor is the smallest CreditLimit a reclaim may leave behind.
+//
+// It exists because CreditLimit == 0 means UNLIMITED throughout this package
+// (ApiKeyRemaining returns -1, ApiKeyOverLimit skips the check). Reclaiming from a
+// key the customer never used would compute newLimit = CreditsUsed = 0 and hand
+// them an unmetered key — the exact opposite of the intent. It would also make the
+// key permanently un-toppable, since AddAPIKeyCredits refuses ErrKeyUnlimited.
+//
+// The value is far below the cost of a single request, so a key left at this floor
+// is exhausted for every practical purpose while staying arithmetically limited.
+const ReclaimedLimitFloor = 0.01
 
 // CreditTopUp is one applied top-up, persisted so a retry with the same
 // idempotency key replays instead of applying twice. It never stores the
@@ -247,6 +260,123 @@ func AddAPIKeyCredits(keyID string, addCredits float64, addDays int, idempotency
 		AddedDays:           addDays,
 		Enabled:             entry.Enabled,
 		IdempotentReplay:    false,
+	}, nil
+}
+
+// ReclaimResult is the outcome of a credit reclaim, shaped for the JSON response.
+//
+// Reclaimed is what the caller actually gets back to resell, which is NOT always
+// PreviousCreditLimit - CreditLimit: the floor keeps a sliver behind. Callers that
+// credit their own inventory must add Reclaimed and never recompute the difference.
+type ReclaimResult struct {
+	ID                  string  `json:"id"`
+	Name                string  `json:"name,omitempty"`
+	PreviousCreditLimit float64 `json:"previousCreditLimit"`
+	CreditLimit         float64 `json:"creditLimit"`
+	CreditsUsed         float64 `json:"creditsUsed"`
+	Reclaimed           float64 `json:"reclaimed"`
+	Remaining           float64 `json:"remaining"`
+	ExpiresAt           int64   `json:"expiresAt,omitempty"`
+	Enabled             bool    `json:"enabled"`
+	AlreadyReclaimed    bool    `json:"alreadyReclaimed"`
+}
+
+// ReclaimAPIKeyCredits drops an EXPIRED key's unspent credits by lowering its limit
+// to what the customer already consumed. The key itself survives: same ID, same
+// plaintext value, still limited, still eligible for a paid top-up that revives it.
+//
+// The seller's problem this solves: an expired key keeps its whole limit reserved
+// against a finite upstream budget, so credits nobody can spend sit unsellable for
+// as long as the grace window lasts. Reclaiming returns the unspent part to
+// inventory early while leaving the customer a key they can pay to restore.
+//
+// WHY NOT SET THE LIMIT TO ZERO. Zero means UNLIMITED in this package. Writing 0
+// would hand out an unmetered key and, because AddAPIKeyCredits rejects unlimited
+// keys with ErrKeyUnlimited, would also permanently block the top-up path that makes
+// the key worth keeping. The limit lands on CreditsUsed instead, floored at
+// ReclaimedLimitFloor for a key that was never used at all.
+//
+// NO IDEMPOTENCY KEY, unlike AddAPIKeyCredits. This is not a financial increment; it
+// is convergence on a computed target. Calling it twice is a no-op that reports
+// AlreadyReclaimed=true, so a caller whose response was lost can simply call again.
+//
+// minExpiredSeconds is how long the key must have been expired ALREADY. The caller
+// owns that policy, but it is enforced here so a bug on the caller's side cannot
+// strip a key that expired seconds ago and is still inside its refund window. Pass 0
+// to require only that the key is expired.
+//
+// Deliberately NOT touched: CreditsUsed and every other counter, ExpiresAt, Enabled,
+// and the key value. Reclaiming is not a revocation — an operator who wants the key
+// gone calls DeleteApiKey.
+func ReclaimAPIKeyCredits(keyID string, minExpiredSeconds int64) (ReclaimResult, error) {
+	if minExpiredSeconds < 0 {
+		minExpiredSeconds = 0
+	}
+
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return ReclaimResult{}, errors.New("config not initialized")
+	}
+
+	idx := indexOfApiKeyLocked(keyID)
+	if idx < 0 {
+		return ReclaimResult{}, ErrKeyNotFound
+	}
+	entry := &cfg.ApiKeys[idx]
+
+	// An unlimited key has no unspent balance to measure, and lowering it to a finite
+	// number would be a downgrade the customer never agreed to.
+	if entry.CreditLimit <= 0 {
+		return ReclaimResult{}, ErrKeyUnlimited
+	}
+	// Never touch a key that can still serve traffic: its credits are not stranded,
+	// they are in use.
+	if entry.ExpiresAt <= 0 || time.Now().Unix() < entry.ExpiresAt+minExpiredSeconds {
+		return ReclaimResult{}, ErrKeyNotExpired
+	}
+
+	prevLimit := entry.CreditLimit
+	newLimit := math.Max(entry.CreditsUsed, ReclaimedLimitFloor)
+
+	// Already at or below target — including a key whose recorded usage exceeds its
+	// limit. Report success without writing: the caller's goal is already true, and a
+	// retry must not be an error.
+	if newLimit >= prevLimit {
+		return ReclaimResult{
+			ID:                  entry.ID,
+			Name:                entry.Name,
+			PreviousCreditLimit: prevLimit,
+			CreditLimit:         prevLimit,
+			CreditsUsed:         entry.CreditsUsed,
+			Reclaimed:           0,
+			Remaining:           remainingCredits(prevLimit, entry.CreditsUsed),
+			ExpiresAt:           entry.ExpiresAt,
+			Enabled:             entry.Enabled,
+			AlreadyReclaimed:    true,
+		}, nil
+	}
+
+	entry.CreditLimit = newLimit
+	// Persist before reporting success, same reasoning as AddAPIKeyCredits: a caller
+	// that books the reclaimed credits back into its inventory against a change that
+	// only exists in RAM will oversell them after the next restart.
+	if err := saveLocked(); err != nil {
+		entry.CreditLimit = prevLimit
+		return ReclaimResult{}, fmt.Errorf("could not persist the reclaimed credit limit: %w", err)
+	}
+
+	return ReclaimResult{
+		ID:                  entry.ID,
+		Name:                entry.Name,
+		PreviousCreditLimit: prevLimit,
+		CreditLimit:         newLimit,
+		CreditsUsed:         entry.CreditsUsed,
+		Reclaimed:           prevLimit - newLimit,
+		Remaining:           remainingCredits(newLimit, entry.CreditsUsed),
+		ExpiresAt:           entry.ExpiresAt,
+		Enabled:             entry.Enabled,
+		AlreadyReclaimed:    false,
 	}, nil
 }
 

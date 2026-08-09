@@ -27,6 +27,23 @@ func isQuotaErrorMessage(msg string) bool {
 	return strings.Contains(msg, "429") || strings.Contains(msg, "quota") || strings.Contains(msg, "throttl")
 }
 
+// isRelayKeyRejectedError matches a relay refusing the credential itself.
+//
+// This needs its own matcher because such a relay answers HTTP *429* for a bad
+// key, not 401 — and "429" is exactly what isQuotaErrorMessage looks for. So the
+// case MUST be ordered before the quota case in handleAccountFailure, otherwise a
+// permanently dead key is read as a temporary quota problem: cooled down, then
+// retried forever, with the real reason nowhere in the log.
+//
+// The distinction matters operationally. A quota clears on its own; a rejected
+// key never does, and the only fix is for someone to paste in a new one.
+func isRelayKeyRejectedError(msg string) bool {
+	msg = strings.ToLower(msg)
+	return strings.Contains(msg, "invalid api key") ||
+		strings.Contains(msg, "missing or invalid api key") ||
+		strings.Contains(msg, "invalid_api_key")
+}
+
 // isOverageErrorMessage matches Kiro's overage-limit rejection.
 //
 // Match on the upstream's own reason codes, NOT on a status code: the real
@@ -42,6 +59,21 @@ func isOverageErrorMessage(msg string) bool {
 		(strings.Contains(msg, "402") && strings.Contains(msg, "overage"))
 }
 
+// isEmptyStreamErrorMessage matches the "upstream answered 200 then closed the
+// stream saying nothing" failure raised by the endpoint loop in kiro.go.
+//
+// It is worth its own matcher because the shape of the failure identifies the
+// likely cause. A network blip surfaces as a transport error, and a rejected
+// request surfaces as a 4xx — an accepted request whose stream carries neither
+// output nor a metering event is the upstream refusing a payload without saying
+// why. That points at the request body, not at the account, which is why this is
+// both retried with the flattened payload and excluded from account error
+// counting.
+func isEmptyStreamErrorMessage(msg string) bool {
+	msg = strings.ToLower(msg)
+	return strings.Contains(msg, "no output, no metering")
+}
+
 // isRefusalErrorMessage matches a content-filter refusal. These must never be
 // charged to the account: the same payload is refused identically by every
 // account, so treating a refusal as an account error would walk the entire pool
@@ -52,7 +84,12 @@ func isRefusalErrorMessage(msg string) bool {
 		strings.Contains(msg, "contentfilter") ||
 		strings.Contains(msg, "content_filter") ||
 		strings.Contains(msg, "guardrail") ||
-		strings.Contains(msg, "blocked by content policy")
+		strings.Contains(msg, "blocked by content policy") ||
+		// The in-band form: upstream answered 200 and stated its reason in an
+		// event frame rather than as an HTTP error. See errKiroUpstreamRefusal.
+		// Matched here so it inherits the same treatment as every other refusal
+		// — a verdict on the payload, not a fault of the account serving it.
+		strings.Contains(msg, "upstream refused the request")
 }
 
 func isSuspensionErrorMessage(msg string) bool {
@@ -110,14 +147,38 @@ func statusForUpstreamError(err error) int {
 	if errors.Is(err, errNoUpstreamAvailable) {
 		return http.StatusServiceUnavailable
 	}
+	// Checked by sentinel, not by message. An in-band refusal deliberately
+	// carries the UPSTREAM's wording as its message (see refusalError) so the
+	// customer reads the vendor's own advice — which means there is no fixed
+	// phrase for a string matcher to look for. 400, because a refusal is a
+	// verdict on the request: answering 5xx makes clients retry a failure that
+	// can never clear, which is precisely what looked like an outage.
+	if errors.Is(err, errKiroUpstreamRefusal) {
+		return http.StatusBadRequest
+	}
 
 	msg := err.Error()
 	switch {
+	// Ahead of the quota case, same reason as in handleAccountFailure: the message
+	// contains "429". 503 rather than 429 or 401 — the credential at fault is the
+	// OPERATOR's, not the caller's. 429 would invite a retry of something that can
+	// never clear on its own, and 401 would tell the customer their own key is bad,
+	// sending them to regenerate a key that was never the problem. 503 is the
+	// truthful reading: no upstream can serve this right now.
+	case isRelayKeyRejectedError(msg):
+		return http.StatusServiceUnavailable
 	// Overage is checked BEFORE quota: the upstream reports it as
 	// ServiceQuotaExceededException, which contains "quota", so the quota case
 	// would otherwise swallow every overage error and answer 429 instead of 402.
 	case isOverageErrorMessage(msg):
 		return http.StatusPaymentRequired
+	// A refusal is a verdict on the request, so it must not answer 5xx. Clients
+	// treat 5xx as transient and retry it — which is how one refused
+	// conversation turns into a run of identical failures that never clears,
+	// exactly the symptom that looks like an outage. 400 tells the client the
+	// request itself is the problem and stops the retry loop.
+	case isRefusalErrorMessage(msg):
+		return http.StatusBadRequest
 	case isQuotaErrorMessage(msg):
 		return http.StatusTooManyRequests
 	case isAuthErrorMessage(msg):
@@ -185,25 +246,65 @@ func (h *Handler) disableAccount(account *config.Account, banStatus, banReason s
 
 	logger.Warnf("[AccountFailover] Disabled %s: %s", account.Email, banReason)
 	h.pool.Reload()
+
+	// Report immediately if that was the last usable account. Reload must come
+	// first: HealthyCount reads the pool's cooldown map, and checking before the
+	// reload would evaluate a pool that still contains the account just disabled.
+	h.checkPoolExhausted()
 }
 
+// disableAccountOverage handles an upstream overage-limit rejection by disabling
+// the account outright.
+//
+// A cooldown would be wrong here. Cooldowns exist for failures that clear on
+// their own within minutes; an exhausted overage allowance does not — it holds
+// until the billing period rolls over or the operator raises the cap. Cooling
+// down for an hour and retrying just burns one of the three retry attempts on an
+// account that is certain to answer 402 again, on every request, all period.
+//
+// The snapshot is still fetched first, on a best-effort basis, so the panel shows
+// why the account went dark (cap, rate, accumulated overages). A failed fetch
+// does not block the disable: the upstream already told us the account is
+// unusable, and that verdict does not depend on the snapshot arriving.
 func (h *Handler) disableAccountOverage(account *config.Account) {
 	if account == nil {
 		return
 	}
 
-	snap, fetchErr := FetchOverageStatus(account)
-	if fetchErr != nil {
+	if snap, fetchErr := FetchOverageStatus(account); fetchErr != nil {
 		logger.Warnf("[AccountFailover] Failed to refresh overage status for %s: %v", account.Email, fetchErr)
-		return
-	}
-	if persistErr := PersistOverageSnapshot(account.ID, snap); persistErr != nil {
+	} else if persistErr := PersistOverageSnapshot(account.ID, snap); persistErr != nil {
 		logger.Warnf("[AccountFailover] Failed to persist overage snapshot for %s: %v", account.Email, persistErr)
-		return
+	} else {
+		logger.Warnf("[AccountFailover] Refreshed overage status for %s after upstream overage limit error: %s", account.Email, snap.Status)
+		// Re-read so the disable below is applied on top of the snapshot fields
+		// rather than overwriting them with the pre-fetch copy: disableAccount
+		// persists a whole Account record, so a stale copy would silently undo the
+		// snapshot that was just written.
+		if fresh := freshAccountByID(account.ID); fresh != nil {
+			account = fresh
+		}
 	}
 
-	logger.Warnf("[AccountFailover] Refreshed overage status for %s after upstream overage limit error: %s", account.Email, snap.Status)
-	h.pool.Reload()
+	// "SUSPENDED" rather than "BANNED": nothing is wrong with the credentials, the
+	// account simply has no allowance left. The panel renders the two differently
+	// and the operator's next action is different too — top up or wait, not
+	// re-authenticate.
+	h.disableAccount(account, "SUSPENDED", "Overage limit reached - upstream rejected the request (OVERAGE_REQUEST_LIMIT_EXCEEDED)")
+}
+
+// freshAccountByID re-reads an account from config by ID, returning nil when it
+// is gone. Config is the source of truth here, not the pool: the pool holds a
+// snapshot taken at the last Reload, so it would not carry a field written
+// moments ago.
+func freshAccountByID(id string) *config.Account {
+	for _, acc := range config.GetAccounts() {
+		if acc.ID == id {
+			fresh := acc
+			return &fresh
+		}
+	}
+	return nil
 }
 
 func (h *Handler) handleAccountFailure(account *config.Account, err error) {
@@ -216,20 +317,41 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 	// A content-filter refusal is a property of the payload, not the account.
 	// Every account returns the same verdict, so recording it as an account
 	// error would cool down the whole pool over one filtered conversation.
-	if isRefusalErrorMessage(errMsg) {
+	//
+	// The sentinel is checked alongside the message matcher because an in-band
+	// refusal carries the upstream's own wording (see refusalError), leaving no
+	// fixed phrase to match on.
+	if errors.Is(err, errKiroUpstreamRefusal) || isRefusalErrorMessage(errMsg) {
 		logger.Warnf("[AccountFailover] Content refusal for %s (not counted against the account): %v", account.Email, err)
 		return
 	}
 
+	// An empty stream is a property of the payload too, and it used to fall
+	// through to the default branch and be charged to the account. That inverted
+	// the problem: one client sending a payload the upstream silently rejects
+	// would walk the whole pool into cooldown, taking down accounts that were
+	// perfectly healthy for everyone else. Log it loudly — a sustained run of
+	// these is a real signal — but do not cool the account down over it.
+	if isEmptyStreamErrorMessage(errMsg) {
+		logger.Warnf("[AccountFailover] Empty upstream stream for %s (not counted against the account; suspect the request payload): %v", account.Email, err)
+		return
+	}
+
 	switch {
+	case isRelayKeyRejectedError(errMsg):
+		// Ordered ahead of the quota case on purpose: the message contains "429",
+		// which isQuotaErrorMessage matches. See isRelayKeyRejectedError.
+		h.disableAccount(account, "BANNED", "Upstream rejected the API key - a new key is required")
 	case isProxyErrorMessage(errMsg):
 		// Proxy/dial failure — cool down and rotate; never disable the account
 		// and never fall through to a direct connection.
 		logger.Warnf("[AccountFailover] Proxy/dial failure for %s: %v", account.Email, err)
 		h.pool.RecordError(account.ID, false)
 	case isOverageErrorMessage(errMsg):
+		// No RecordError: the account is disabled outright, so it leaves the pool
+		// entirely. Recording a cooldown on top would only inflate the error count
+		// of an account that is no longer selectable anyway.
 		h.disableAccountOverage(account)
-		h.pool.RecordError(account.ID, false)
 	case isQuotaErrorMessage(errMsg):
 		h.pool.RecordError(account.ID, true)
 	case isSuspensionErrorMessage(errMsg):
@@ -281,8 +403,30 @@ func isGenericUpstreamServerError(msg string) bool {
 
 // shouldRetrySafePayload reports whether an upstream error is worth one
 // same-account retry with the flattened (safe) payload.
+// An empty stream is included because it is the silent form of the same problem
+// the other two matchers catch loudly: the upstream disliked the payload. The
+// endpoint loop already retried the identical body three times and walked every
+// endpoint, so a fourth identical attempt is pointless — but the flattened
+// history is a genuinely DIFFERENT request, and it is the only remaining lever
+// before the client sees an error.
 func shouldRetrySafePayload(msg string) bool {
-	return isMalformedPayloadError(msg) || isGenericUpstreamServerError(msg)
+	return isMalformedPayloadError(msg) ||
+		isGenericUpstreamServerError(msg) ||
+		isEmptyStreamErrorMessage(msg)
+}
+
+// isTerminalRequestError reports whether retrying an upstream failure on a
+// DIFFERENT account is pointless because the verdict belongs to the request.
+//
+// Rotation exists to route around an unhealthy account. A content-safety refusal
+// is not that: every account asks the same upstream, which reads the same
+// conversation and returns the same answer. Rotating anyway costs one billed turn
+// per account — the refusal is metered, the upstream did read the conversation —
+// and marks healthy accounts as failures on the way, for a result the client was
+// always going to get. It also delays the one thing that helps: telling the
+// customer what the upstream actually said.
+func isTerminalRequestError(err error) bool {
+	return errors.Is(err, errKiroUpstreamRefusal)
 }
 
 // callWithHistoryFallback calls CallKiroAPIWithContinuation with the richer
@@ -294,6 +438,16 @@ func callWithHistoryFallback(account *config.Account, rich, safe *KiroPayload, c
 	err := CallKiroAPIWithContinuation(account, rich, callback)
 	if err == nil {
 		return nil
+	}
+	// A stated refusal short-circuits before the string matchers below, for two
+	// reasons. It is final — the same conversation earns the same verdict from a
+	// flattened payload too, so the retry only doubles the latency before the
+	// client hears why. And its message is UPSTREAM-CONTROLLED prose (see
+	// refusalError), so feeding it to phrase matchers is unsound: a refusal that
+	// happens to contain "unexpected error when processing the request" would
+	// otherwise be mistaken for a transient 5xx.
+	if errors.Is(err, errKiroUpstreamRefusal) {
+		return err
 	}
 	if rich == safe || !shouldRetrySafePayload(err.Error()) || started() {
 		return err
