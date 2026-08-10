@@ -937,6 +937,13 @@ func (h *Handler) refreshModelsCache() {
 		}
 
 		models, err := ListAvailableModels(account)
+		if errors.Is(err, ErrModelListingUnsupported) {
+			// Nothing to list rather than a failure to list. Passing this to
+			// handleAccountFailure is what disabled healthy relay accounts on a
+			// timer — see the guard in ListAvailableModels.
+			logger.Debugf("[ModelsCache] Skipped %s: no model listing endpoint", accountEmailForLog(account))
+			continue
+		}
 		if err != nil {
 			logger.Warnf("[ModelsCache] Failed to refresh for %s: %v", account.Email, err)
 			h.handleAccountFailure(account, err)
@@ -971,17 +978,14 @@ func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
 	if err := h.ensureValidToken(account); err != nil {
 		return fmt.Errorf("token refresh failed: %w", err)
 	}
-	// A relay serves only the streaming call, so ListAvailableModels 404s there.
-	// Leaving the model list unset is the right outcome rather than a gap: the pool
-	// treats an account with no list as supporting every model (see
-	// accountHasModel), which is the same optimistic routing used at cold start.
-	// Hardcoding a relay's inventory here would instead go stale the moment the
-	// operator of that relay changed it.
-	if account.IsRelayCredential() {
+	models, err := ListAvailableModels(account)
+	if errors.Is(err, ErrModelListingUnsupported) {
+		// Relay: no model listing. accountHasModel treats an empty list as
+		// "supports every model" (see pool/account.go), which is the right
+		// optimistic routing.
 		logger.Debugf("[ModelsCache] Skipped model listing for relay account %s", accountEmailForLog(account))
 		return nil
 	}
-	models, err := ListAvailableModels(account)
 	if err != nil {
 		return err
 	}
@@ -3649,6 +3653,21 @@ func (h *Handler) apiGetAccountOverage(w http.ResponseWriter, r *http.Request, i
 	}
 
 	snap, err := FetchOverageStatus(account)
+	if errors.Is(err, ErrModelListingUnsupported) {
+		// Relay accounts have no overage endpoint. Return a stub so the panel
+		// doesn't error out — the operator can see it's a relay from the method field.
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":           true,
+			"overageStatus":     "N/A",
+			"overageCapability": "N/A",
+			"subscriptionTitle": "Relay (no overage data)",
+			"overageCap":        0,
+			"overageRate":       0,
+			"currentOverages":   0,
+			"overageCheckedAt":  0,
+		})
+		return
+	}
 	if err != nil {
 		w.WriteHeader(502)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -5112,6 +5131,15 @@ func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id
 	}
 
 	models, err := ListAvailableModels(account)
+	if errors.Is(err, ErrModelListingUnsupported) {
+		// Relay accounts have no model-listing endpoint. Return empty rather than
+		// an error — the panel will show "(no models loaded)" and the admin can
+		// proceed without needing to understand why a relay differs.
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"models": []ModelInfo{},
+		})
+		return
+	}
 	if err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})

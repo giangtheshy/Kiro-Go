@@ -138,6 +138,12 @@ func ensureRestProfileArn(account *config.Account) error {
 
 // GetUsageLimits 获取账户使用量和订阅信息
 func GetUsageLimits(account *config.Account) (*UsageLimitsResponse, error) {
+	// Same guard as ListAvailableModels: a relay key is meaningless at the real AWS
+	// host, so this call would answer 403 and trigger an auth-failure ban.
+	if account != nil && account.IsRelayCredential() {
+		return nil, ErrModelListingUnsupported
+	}
+
 	if err := ensureRestProfileArn(account); err != nil {
 		return nil, fmt.Errorf("resolve profileArn: %w", err)
 	}
@@ -206,7 +212,30 @@ func GetUserInfo(account *config.Account) (*UserInfoResponse, error) {
 }
 
 // ListAvailableModels 获取可用模型列表
+// ErrModelListingUnsupported reports that this credential has no model-listing
+// endpoint to query, so there is nothing to fetch — as opposed to a fetch that
+// was attempted and failed.
+//
+// Callers must treat it as a no-op and specifically must NOT pass it to
+// handleAccountFailure. See the guard in ListAvailableModels for what happened
+// when they did.
+var ErrModelListingUnsupported = errors.New("model listing unsupported for this credential")
+
 func ListAvailableModels(account *config.Account) ([]ModelInfo, error) {
+	// Guarded here, not at the call sites. There are three of them and the earlier
+	// fix only covered one, which produced exactly the failure this guard prevents:
+	//
+	// ListAvailableModels targets the real AWS host (kiroRestAPIBase), never the
+	// relay. A relay-issued key is meaningless there, so AWS answers
+	// 403 "The bearer token included in the request is invalid." That reaches
+	// handleAccountFailure, isAuthErrorMessage matches the 403, and a perfectly
+	// working relay account gets disabled and marked BANNED — on a timer, roughly
+	// ten seconds after startup and every thirty minutes after that, with no
+	// request from anyone needed to trigger it.
+	if account != nil && account.IsRelayCredential() {
+		return nil, ErrModelListingUnsupported
+	}
+
 	if err := ensureRestProfileArn(account); err != nil {
 		return nil, fmt.Errorf("resolve profileArn: %w", err)
 	}

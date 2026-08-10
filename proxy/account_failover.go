@@ -326,6 +326,13 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 		return
 	}
 
+	// REST operations unsupported by relay accounts (model listing, overage fetch)
+	// are not account failures. The sentinel guards all of them; checking it here
+	// closes off every path where such an error could leak into a cooldown or ban.
+	if errors.Is(err, ErrModelListingUnsupported) || errors.Is(err, ErrAccountInfoUnsupported) {
+		return
+	}
+
 	// An empty stream is a property of the payload too, and it used to fall
 	// through to the default branch and be charged to the account. That inverted
 	// the problem: one client sending a payload the upstream silently rejects

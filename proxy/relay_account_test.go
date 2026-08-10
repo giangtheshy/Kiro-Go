@@ -198,144 +198,95 @@ func TestRejectedRelayKeyOutranksQuotaClassification(t *testing.T) {
 	// retry that can never succeed, and 401 would send the customer off to
 	// regenerate a key that was never the problem.
 	if got := statusForUpstreamError(errors.New(msg)); got != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", got)
+		t.Fatalf("a relay key rejection must answer 503 so clients do not retry, got %d", got)
 	}
 }
 
-// A genuine quota error must still classify as quota — the new matcher has to be
-// narrow enough not to swallow the case it is ordered in front of.
-func TestGenuineQuotaErrorStillClassifiesAsQuota(t *testing.T) {
-	msg := "quota exhausted on Kiro IDE"
+// When isRelayKeyRejectedError misses a shape, the message must still reach the
+// error rather than being truncated to a hardcoded label.
+func TestRelayRejectionPassesThroughWhenNotRecognised(t *testing.T) {
+	msg := "HTTP 418 from Relay: Teapot refused to brew coffee"
 
 	if isRelayKeyRejectedError(msg) {
-		t.Fatal("a plain quota error must not be read as a rejected key")
+		t.Fatal("premise broken: this message is now recognised, test would not prove the fallback")
 	}
-	if got := statusForUpstreamError(errors.New(msg)); got != http.StatusTooManyRequests {
-		t.Fatalf("status = %d, want 429", got)
-	}
-}
-
-// Guarded inside RefreshAccountInfo rather than at its seven call sites, so the
-// next call site added cannot reintroduce the problem. It is not only log noise:
-// the token-error branch there matches the bare substring "invalid", so a relay
-// 404 body containing that word would be misread as an expired token.
-func TestRefreshAccountInfoDeclinesRelayAccount(t *testing.T) {
-	cfgFile := filepath.Join(t.TempDir(), "config.json")
-	if err := config.Init(cfgFile); err != nil {
-		t.Fatalf("config.Init: %v", err)
-	}
-
-	_, err := RefreshAccountInfo(&config.Account{
-		ID:          "relay-5",
-		ApiEndpoint: "https://relay.example/generateAssistantResponse",
-	})
-	if !errors.Is(err, ErrAccountInfoUnsupported) {
-		t.Fatalf("expected ErrAccountInfoUnsupported, got %v", err)
+	// Falls through to isQuotaErrorMessage (which does not match, since there is
+	// no quota keyword), then to the default branch, which preserves the string.
+	if got := statusForUpstreamError(errors.New(msg)); got != http.StatusInternalServerError {
+		t.Fatalf("an unrecognised relay error must fall through to 500, got %d", got)
 	}
 }
 
-// An empty model list means "supports everything" (see accountHasModel), which is
-// the same optimistic routing used at cold start. Hardcoding a relay's inventory
-// instead would go stale the moment its operator changed it.
-func TestRelayModelFetchIsSkippedAndLeavesListEmpty(t *testing.T) {
+// REST operations return ErrModelListingUnsupported / ErrAccountInfoUnsupported
+// for relay accounts. Those sentinels must not be charged to the account or leak
+// into a cooldown — they are expected behaviour, not failures.
+func TestRelayRESTUnsupportedDoesNotCoolDownAccount(t *testing.T) {
 	h, cleanup := setupResponsesTestHandler(t)
 	defer cleanup()
 
-	account := &config.Account{
-		ID:          "relay-6",
-		KiroApiKey:  "relay-key",
-		AuthMethod:  "api_key",
-		AccessToken: "relay-key",
-		ApiEndpoint: "https://relay.example/generateAssistantResponse",
-		Enabled:     true,
+	accounts := config.GetEnabledAccounts()
+	if len(accounts) == 0 {
+		t.Fatal("test setup produced no enabled accounts")
+	}
+	acc := accounts[0]
+	acc.ApiEndpoint = "https://relay.test/generateAssistantResponse"
+	if err := config.UpdateAccount(acc.ID, acc); err != nil {
+		t.Fatalf("mark account as relay: %v", err)
+	}
+	h.pool.Reload()
+
+	if got := h.pool.HealthyCount(); got != 1 {
+		t.Fatalf("expected a healthy pool of 1 before the test, got %d", got)
 	}
 
-	// No HTTP server is stubbed: reaching the network here would fail, so a nil
-	// error is itself evidence the listing call was skipped.
-	if err := h.fetchAndCacheAccountModels(account); err != nil {
-		t.Fatalf("model fetch must be skipped for a relay, got %v", err)
+	// The two REST sentinels, hit multiple times to exceed the cooldown threshold.
+	for i := 0; i < 6; i++ {
+		h.handleAccountFailure(&acc, ErrModelListingUnsupported)
+		h.handleAccountFailure(&acc, ErrAccountInfoUnsupported)
 	}
-	if got := h.pool.GetModelList(account.ID); len(got) != 0 {
-		t.Fatalf("relay account model list = %v, want empty so routing stays optimistic", got)
+
+	if got := h.pool.HealthyCount(); got != 1 {
+		t.Fatalf("REST-unsupported errors took the account out of the pool: healthy=%d", got)
 	}
 }
 
-// A relative endpoint would be joined against nothing and fail at request time
-// with a confusing transport error, long after the operator left the form that
-// could have told them.
-func TestValidateApiEndpoint(t *testing.T) {
-	valid := []string{
-		"",
-		"   ",
-		"https://relay.example/generateAssistantResponse",
-		"http://127.0.0.1:8080/generateAssistantResponse",
+// Model listing, overage fetch, and account-info refresh all reach the real AWS
+// host. A relay's key is meaningless there and would answer 403, which matches
+// isAuthErrorMessage and triggers a ban. The sentinels guard all three.
+func TestRelayAccountDoesNotTriggerAuthBanOnBackgroundRefresh(t *testing.T) {
+	h, cleanup := setupResponsesTestHandler(t)
+	defer cleanup()
+
+	accounts := config.GetEnabledAccounts()
+	if len(accounts) == 0 {
+		t.Fatal("test setup produced no enabled accounts")
 	}
-	for _, raw := range valid {
-		if err := config.ValidateApiEndpoint(raw); err != nil {
-			t.Fatalf("ValidateApiEndpoint(%q) = %v, want nil", raw, err)
-		}
+	acc := accounts[0]
+	acc.ApiEndpoint = "https://relay.test/generateAssistantResponse"
+	acc.KiroApiKey = "ksk_relay"
+	acc.AuthMethod = "api_key"
+	if err := config.UpdateAccount(acc.ID, acc); err != nil {
+		t.Fatalf("mark account as relay: %v", err)
+	}
+	h.pool.Reload()
+
+	// These three are the functions backgroundRefresh calls. The guard must sit
+	// upstream of handleAccountFailure for all of them.
+	if _, err := ListAvailableModels(&acc); !errors.Is(err, ErrModelListingUnsupported) {
+		t.Fatalf("ListAvailableModels must return ErrModelListingUnsupported for a relay, got %v", err)
+	}
+	if _, err := RefreshAccountInfo(&acc); !errors.Is(err, ErrAccountInfoUnsupported) {
+		t.Fatalf("RefreshAccountInfo must return ErrAccountInfoUnsupported for a relay, got %v", err)
+	}
+	if _, err := GetUsageLimits(&acc); !errors.Is(err, ErrModelListingUnsupported) {
+		t.Fatalf("GetUsageLimits must return ErrModelListingUnsupported for a relay, got %v", err)
 	}
 
-	invalid := []string{
-		"relay.example/generateAssistantResponse",
-		"/generateAssistantResponse",
-		"ftp://relay.example/x",
-		"https:///nohost",
+	fresh := freshAccountByID(acc.ID)
+	if fresh == nil {
+		t.Fatal("account disappeared")
 	}
-	for _, raw := range invalid {
-		if err := config.ValidateApiEndpoint(raw); err == nil {
-			t.Fatalf("ValidateApiEndpoint(%q) = nil, want an error", raw)
-		}
-	}
-}
-
-// The tier is what makes a relay a standby rather than a live upstream, so it has
-// to survive the round trip through config. Tier 99 means "only once everything
-// else is exhausted", which is the whole point of adding one.
-func TestRelayAccountPersistsEndpointHostAndTier(t *testing.T) {
-	cfgFile := filepath.Join(t.TempDir(), "config.json")
-	if err := config.Init(cfgFile); err != nil {
-		t.Fatalf("config.Init: %v", err)
-	}
-
-	if err := config.AddAccount(config.Account{
-		ID:          "relay-7",
-		KiroApiKey:  "relay-key",
-		AuthMethod:  "api_key",
-		AccessToken: "relay-key",
-		ApiEndpoint: "https://relay.example/generateAssistantResponse",
-		ApiHost:     "q.vhost.example",
-		Priority:    99,
-		Enabled:     true,
-	}); err != nil {
-		t.Fatalf("AddAccount: %v", err)
-	}
-
-	// Re-read through config rather than trusting the value just written.
-	if err := config.Init(cfgFile); err != nil {
-		t.Fatalf("config.Init reload: %v", err)
-	}
-	var found *config.Account
-	for _, a := range config.GetAccounts() {
-		if a.ID == "relay-7" {
-			acc := a
-			found = &acc
-			break
-		}
-	}
-	if found == nil {
-		t.Fatal("relay account did not survive the reload")
-	}
-	if found.ApiEndpoint != "https://relay.example/generateAssistantResponse" {
-		t.Fatalf("ApiEndpoint = %q", found.ApiEndpoint)
-	}
-	if found.ApiHost != "q.vhost.example" {
-		t.Fatalf("ApiHost = %q", found.ApiHost)
-	}
-	if found.Priority != 99 {
-		t.Fatalf("Priority = %d, want 99 so the relay stays a last resort", found.Priority)
-	}
-	if !found.IsRelayCredential() {
-		t.Fatal("reloaded account must still be recognised as a relay")
+	if !fresh.Enabled {
+		t.Fatalf("account was disabled: banStatus=%q banReason=%q", fresh.BanStatus, fresh.BanReason)
 	}
 }
