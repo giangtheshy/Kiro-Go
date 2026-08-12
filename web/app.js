@@ -4703,6 +4703,18 @@
         const models = (p.models || []).map(m => m.alias).join(', ');
         const statusKey = p.enabled ? 'providers.statusEnabled' : 'providers.statusDisabled';
         const statusCls = p.enabled ? 'badge-success' : 'badge-muted';
+
+        // Format token breakdown with cache info
+        let tokensDisplay = formatNumber(p.totalTokens || 0);
+        const parts = [];
+        if (p.inputTokens > 0) parts.push('in:' + formatNumber(p.inputTokens));
+        if (p.outputTokens > 0) parts.push('out:' + formatNumber(p.outputTokens));
+        if (p.cacheReadTokens > 0) parts.push('cache-r:' + formatNumber(p.cacheReadTokens));
+        if (p.cacheWriteTokens > 0) parts.push('cache-w:' + formatNumber(p.cacheWriteTokens));
+        if (parts.length > 0) {
+          tokensDisplay += '<br><span class="text-xs muted-text">(' + parts.join(', ') + ')</span>';
+        }
+
         return '<tr>' +
           '<td class="num">' + escapeHtml(String(p.priority || 0)) + '</td>' +
           '<td>' + escapeHtml(p.name || '') + '</td>' +
@@ -4711,6 +4723,7 @@
           '<td class="text-xs font-mono">' + escapeHtml(p.baseUrl || '') + '</td>' +
           '<td class="text-xs">' + escapeHtml(models) + '</td>' +
           '<td class="num">' + escapeHtml(formatNumber(p.requestCount || 0)) + '</td>' +
+          '<td class="num">' + tokensDisplay + '</td>' +
           '<td class="num">' + escapeHtml(formatNumber(p.totalCredits || 0)) + '</td>' +
           '<td><span class="badge ' + statusCls + '">' + escapeHtml(t(statusKey)) + '</span></td>' +
           '<td>' +

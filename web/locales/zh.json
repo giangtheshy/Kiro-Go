@@ -819,6 +819,7 @@
   "providers.colBaseUrl": "Base URL",
   "providers.colModels": "模型",
   "providers.colRequests": "请求数",
+  "providers.colTokens": "令牌数",
   "providers.colCredits": "积分",
   "providers.colStatus": "状态",
   "providers.colActions": "操作",

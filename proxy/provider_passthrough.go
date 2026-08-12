@@ -75,7 +75,7 @@ func (h *Handler) serveViaProvider(
 	// message: a failing provider is indistinguishable from an exhausted pool.
 	fail := func(e error) (bool, error) {
 		logger.Warnf("[Provider] %s: %v", p.Name, e)
-		config.RecordProviderUsage(p.ID, 0, 0, true)
+		config.RecordProviderUsageDetailed(p.ID, config.ProviderUsageBreakdown{}, true)
 		return false, errNoUpstreamAvailable
 	}
 
@@ -144,7 +144,13 @@ func (h *Handler) serveViaProvider(
 		Credits:    credits,
 		ClientIP:   pc.clientIP(),
 	}, model, providerAsAccount(p), providerLogEndpoint(pc.Endpoint), startedAt)
-	config.RecordProviderUsage(p.ID, int64(inTok+outTok), credits, false)
+	config.RecordProviderUsageDetailed(p.ID, config.ProviderUsageBreakdown{
+		InputTokens:      int64(usage.InputTokens),
+		OutputTokens:     int64(usage.OutputTokens),
+		CacheWriteTokens: int64(usage.CacheWrite),
+		CacheReadTokens:  int64(usage.CacheRead),
+		Credits:          credits,
+	}, false)
 	return true, nil
 }
 

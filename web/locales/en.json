@@ -819,6 +819,7 @@
   "providers.colBaseUrl": "Base URL",
   "providers.colModels": "Models",
   "providers.colRequests": "Requests",
+  "providers.colTokens": "Tokens",
   "providers.colCredits": "Credits",
   "providers.colStatus": "Status",
   "providers.colActions": "Actions",

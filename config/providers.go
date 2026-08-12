@@ -108,11 +108,15 @@ type Provider struct {
 	Pricing ProviderPricing `json:"pricing"`
 
 	// Runtime statistics, updated on the request hot path via markDirtyLocked.
-	RequestCount int64   `json:"requestCount,omitempty"`
-	ErrorCount   int64   `json:"errorCount,omitempty"`
-	TotalTokens  int64   `json:"totalTokens,omitempty"`
-	TotalCredits float64 `json:"totalCredits,omitempty"`
-	LastUsed     int64   `json:"lastUsed,omitempty"`
+	RequestCount    int64   `json:"requestCount,omitempty"`
+	ErrorCount      int64   `json:"errorCount,omitempty"`
+	TotalTokens     int64   `json:"totalTokens,omitempty"`
+	InputTokens     int64   `json:"inputTokens,omitempty"`
+	OutputTokens    int64   `json:"outputTokens,omitempty"`
+	CacheWriteTokens int64  `json:"cacheWriteTokens,omitempty"`
+	CacheReadTokens  int64  `json:"cacheReadTokens,omitempty"`
+	TotalCredits    float64 `json:"totalCredits,omitempty"`
+	LastUsed        int64   `json:"lastUsed,omitempty"`
 }
 
 // ResolveModel maps a client-requested model onto this provider's upstream model
@@ -363,10 +367,30 @@ func ResetProviderUsage(id string) error {
 	return errors.New("provider not found")
 }
 
+// ProviderUsageBreakdown carries detailed token accounting for a single provider request.
+type ProviderUsageBreakdown struct {
+	InputTokens     int64
+	OutputTokens    int64
+	CacheWriteTokens int64
+	CacheReadTokens  int64
+	Credits         float64
+}
+
 // RecordProviderUsage folds one request's outcome into the provider counters. This
 // runs on the request hot path, so it only marks the config dirty and lets the
 // background flusher persist — same contract as RecordApiKeyUsage.
+//
+// Deprecated: use RecordProviderUsageDetailed for new call sites.
 func RecordProviderUsage(id string, tokens int64, credits float64, failed bool) {
+	RecordProviderUsageDetailed(id, ProviderUsageBreakdown{
+		InputTokens:  tokens / 2, // rough split for legacy callers
+		OutputTokens: tokens / 2,
+		Credits:      credits,
+	}, failed)
+}
+
+// RecordProviderUsageDetailed updates provider stats with full token breakdown.
+func RecordProviderUsageDetailed(id string, usage ProviderUsageBreakdown, failed bool) {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	if cfg == nil {
@@ -381,11 +405,22 @@ func RecordProviderUsage(id string, tokens int64, credits float64, failed bool) 
 			p.ErrorCount++
 		} else {
 			p.RequestCount++
-			if tokens > 0 {
-				p.TotalTokens += tokens
+			if usage.InputTokens > 0 {
+				p.InputTokens += usage.InputTokens
+				p.TotalTokens += usage.InputTokens
 			}
-			if credits > 0 {
-				p.TotalCredits += credits
+			if usage.OutputTokens > 0 {
+				p.OutputTokens += usage.OutputTokens
+				p.TotalTokens += usage.OutputTokens
+			}
+			if usage.CacheWriteTokens > 0 {
+				p.CacheWriteTokens += usage.CacheWriteTokens
+			}
+			if usage.CacheReadTokens > 0 {
+				p.CacheReadTokens += usage.CacheReadTokens
+			}
+			if usage.Credits > 0 {
+				p.TotalCredits += usage.Credits
 			}
 		}
 		p.LastUsed = time.Now().Unix()

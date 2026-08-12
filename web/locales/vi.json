@@ -819,6 +819,7 @@
   "providers.colBaseUrl": "Base URL",
   "providers.colModels": "Model",
   "providers.colRequests": "Request",
+  "providers.colTokens": "Tokens",
   "providers.colCredits": "Credits",
   "providers.colStatus": "Trạng thái",
   "providers.colActions": "Thao tác",
