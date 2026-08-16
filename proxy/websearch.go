@@ -199,10 +199,7 @@ func createMcpRequest(query string) (toolUseID string, req *McpRequest) {
 	)
 
 	// Anthropic clients expect server tool ids to carry the srvtoolu_ prefix.
-	toolUseID = "srvtoolu_" + strings.ReplaceAll(uuid.New().String(), "-", "")
-	if len(toolUseID) > len("srvtoolu_")+32 {
-		toolUseID = toolUseID[:len("srvtoolu_")+32]
-	}
+	toolUseID = newServerToolUseID()
 
 	return toolUseID, &McpRequest{
 		ID:      requestID,

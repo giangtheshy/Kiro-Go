@@ -6,8 +6,6 @@ import (
 	"strings"
 
 	"kiro-go/config"
-
-	"github.com/google/uuid"
 )
 
 // This file translates a REQUEST body from one wire protocol to the other so an
@@ -425,7 +423,7 @@ func bridgeToolUseFromToolCall(tc *ToolCall) (bridgeBlock, bool) {
 	}
 	id := tc.ID
 	if id == "" {
-		id = "toolu_" + strings.ReplaceAll(uuid.New().String(), "-", "")
+		id = newToolUseID()
 	}
 	input := json.RawMessage("{}")
 	if args := strings.TrimSpace(tc.Function.Arguments); args != "" {

@@ -25,6 +25,10 @@ type passthroughCtx struct {
 	Endpoint    string       // one of the config.ProviderEndpoint* constants
 	ClientIP    string       // resolved real client IP; forwarded to request log entries
 	SafePayload *KiroPayload // flat-history fallback for callWithHistoryFallback; nil = no fallback
+	// Structured is set when the caller asked for a schema-constrained answer.
+	// The tool call that carries it must be unwrapped into a text block rather
+	// than forwarded, so the response path needs to know. nil = ordinary request.
+	Structured *structuredOutputSpec
 }
 
 // clientIP returns the resolved client IP, tolerating a nil receiver: several

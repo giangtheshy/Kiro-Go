@@ -1179,7 +1179,7 @@ func noticeOutputTokens(msg string) int {
 func (h *Handler) sendClaudeNotice(w http.ResponseWriter, model string, stream bool, msg string) {
 	outTok := noticeOutputTokens(msg)
 	if !stream {
-		resp := KiroToClaudeResponse(msg, "", false, nil, 1, outTok, model)
+		resp := KiroToClaudeResponse(msg, "", "", false, nil, 1, outTok, model)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(resp)
 		return
@@ -1190,13 +1190,13 @@ func (h *Handler) sendClaudeNotice(w http.ResponseWriter, model string, stream b
 	w.Header().Set("Connection", "keep-alive")
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		resp := KiroToClaudeResponse(msg, "", false, nil, 1, outTok, model)
+		resp := KiroToClaudeResponse(msg, "", "", false, nil, 1, outTok, model)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(resp)
 		return
 	}
 
-	msgID := "msg_" + uuid.New().String()
+	msgID := newMessageID()
 	h.sendSSE(w, flusher, "message_start", map[string]interface{}{
 		"type": "message_start",
 		"message": map[string]interface{}{
@@ -1300,6 +1300,23 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// Structured outputs are emulated with a forced tool call, so the swap has to
+	// happen before the payload is built. See structured_output.go. The schema is
+	// read from the raw body because output_config is not a field on
+	// ClaudeRequest — and adding one would not help, since the shape has changed
+	// once already between beta spellings.
+	var structured *structuredOutputSpec
+	var rawRequest map[string]interface{}
+	if json.Unmarshal(body, &rawRequest) == nil {
+		structured = parseStructuredOutput(rawRequest)
+	}
+	if structured != nil && !structured.applyToRequest(&req) {
+		// The caller has its own tools, so the schema tool cannot be forced
+		// without suppressing them. The request proceeds unconstrained.
+		logger.Warnf("[Structured] output_config.format ignored: request also declares %d tool(s)", len(req.Tools))
+		structured = nil
+	}
+
 	// 转换请求 — build rich (structured history) and safe (flat history) payloads.
 	// The rich form is tried first; if the upstream rejects the structured history
 	// with a recoverable error and nothing has been written yet, callWithHistoryFallback
@@ -1319,6 +1336,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		Stream:      req.Stream,
 		Endpoint:    config.ProviderEndpointMessages,
 		SafePayload: safePayload,
+		Structured:  structured,
 	}
 
 	// Stream or non-stream
@@ -1388,7 +1406,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	thinkingFormat := thinkingOpts.Format
 
 	startedAt := time.Now()
-	msgID := "msg_" + uuid.New().String()
+	msgID := newMessageID()
 	startInputTokens := estimatedInputTokens
 	excluded := make(map[string]bool)
 	var lastErr error
@@ -1412,6 +1430,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				"usage":         buildClaudeUsageMap(startInputTokens, 0, messageStartUsage, cacheProfile != nil),
 			},
 		})
+		// The Messages API sends a ping immediately after message_start. Clients
+		// treat it as the "stream is live" marker before the first token.
+		stream.sendPing()
 		messageStarted = true
 	}
 
@@ -1450,10 +1471,25 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		var rawThinkingBuilder strings.Builder
 		activeBlockIndex := -1
 		activeBlockType := ""
+		pendingThinkingSignature := ""
 
 		closeActiveBlock := func() {
 			if activeBlockIndex < 0 {
 				return
+			}
+			// The attestation over a thinking block travels as the last delta
+			// before the block closes, which is where a client looks for it when
+			// deciding whether the block can be replayed on the next turn.
+			if activeBlockType == "thinking" && pendingThinkingSignature != "" {
+				stream.sendEvent("content_block_delta", map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": activeBlockIndex,
+					"delta": map[string]interface{}{
+						"type":      "signature_delta",
+						"signature": pendingThinkingSignature,
+					},
+				})
+				pendingThinkingSignature = ""
 			}
 			stream.sendEvent("content_block_stop", map[string]interface{}{
 				"type":  "content_block_stop",
@@ -1478,8 +1514,12 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 					"type":  "content_block_start",
 					"index": idx,
 					"content_block": map[string]string{
-						"type":     "thinking",
-						"thinking": "",
+						"type": "thinking",
+						// Both fields are present and empty at block start; the
+						// signature is filled in by a signature_delta later, if
+						// the upstream issues one.
+						"thinking":  "",
+						"signature": "",
 					},
 				})
 			} else {
@@ -1706,6 +1746,19 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			},
 			OnToolUse: func(tu KiroToolUse) {
 				processClaudeText("", false, true)
+
+				// A schema-constrained answer arrives as a call to the synthetic
+				// tool that carried the schema upstream. The caller asked for a
+				// text block, and never saw the tool, so unwrap it here — and
+				// leave toolUses empty so the turn still ends with end_turn.
+				if pc.Structured.isStructuredCall(tu.Name) {
+					rendered := pc.Structured.renderResult(tu.Input)
+					rawContentBuilder.WriteString(rendered)
+					sendText(rendered, 0)
+					upstreamStopReason = ""
+					return
+				}
+
 				rawContentBuilder.WriteString(tu.Name)
 				if b, err := json.Marshal(tu.Input); err == nil {
 					rawContentBuilder.Write(b)
@@ -1730,19 +1783,25 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				})
 
 				inputJSON, _ := json.Marshal(tu.Input)
-				stream.sendEvent("content_block_delta", map[string]interface{}{
-					"type":  "content_block_delta",
-					"index": idx,
-					"delta": map[string]interface{}{
-						"type":         "input_json_delta",
-						"partial_json": string(inputJSON),
-					},
-				})
+				for _, fragment := range chunkToolInputJSON(string(inputJSON)) {
+					stream.sendEvent("content_block_delta", map[string]interface{}{
+						"type":  "content_block_delta",
+						"index": idx,
+						"delta": map[string]interface{}{
+							"type":         "input_json_delta",
+							"partial_json": fragment,
+						},
+					})
+				}
 
 				stream.sendEvent("content_block_stop", map[string]interface{}{
 					"type":  "content_block_stop",
 					"index": idx,
 				})
+			},
+			OnReasoningSignature: func(sig string) {
+				pendingThinkingSignature = sig
+				logger.Debugf("[Stream] upstream issued a thinking signature (%d chars)", len(sig))
 			},
 			OnComplete: func(inTok, outTok int) {
 				inputTokens = inTok
@@ -1787,8 +1846,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			}
 			h.recordFailureForApiKey(apiKeyID, "claude", model, 0, err.Error(), startedAt, pc.clientIP())
 			stream.sendEvent("error", map[string]interface{}{
-				"type":  "error",
-				"error": map[string]string{"type": "api_error", "message": err.Error()},
+				"type": "error",
+				"error": map[string]string{
+					"type":    errorTypeForClaudeStatus(statusForUpstreamError(err)),
+					"message": err.Error(),
+				},
 			})
 			return
 		}
@@ -1830,17 +1892,18 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		ensureMessageStart()
 
 		// The upstream cut the turn short. An Anthropic client decides whether a
-		// response finished from message_delta.stop_reason, so report usage but
-		// WITHHOLD stop_reason and send no message_stop: the text already
-		// delivered stands, and the client can see the turn never completed.
-		// Emitting "end_turn" here is what makes truncation invisible.
+		// response finished from message_delta.stop_reason, so send neither that
+		// nor message_stop: the text already delivered stands, and the client can
+		// see the turn never completed. Emitting "end_turn" here is what makes
+		// truncation invisible.
+		//
+		// A lone error event is also how the Messages API itself ends a stream it
+		// cannot finish. The previous shape — message_delta carrying an empty
+		// delta object — reported usage but is not a frame the upstream protocol
+		// ever produces, and clients that switch on delta.stop_reason had to
+		// special-case it.
 		if truncated {
 			logger.Warnf("[Stream] claude turn truncated mid-generation: model=%s account=%s", model, accountEmailForLog(account))
-			stream.sendEvent("message_delta", map[string]interface{}{
-				"type":  "message_delta",
-				"delta": map[string]interface{}{},
-				"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
-			})
 			stream.sendEvent("error", map[string]interface{}{
 				"type": "error",
 				"error": map[string]string{
@@ -1856,10 +1919,13 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			logger.Debugf("[Stream] claude turn truncated at max_tokens: model=%s output=%d max=%d upstream=%q", model, outputTokens, payloadMaxTokens(payload), upstreamStopReason)
 		}
 
+		// stop_sequence rides alongside stop_reason in every message_delta the
+		// Messages API emits, null unless a client stop sequence actually fired.
 		stream.sendEvent("message_delta", map[string]interface{}{
 			"type": "message_delta",
 			"delta": map[string]interface{}{
-				"stop_reason": stopReason,
+				"stop_reason":   stopReason,
+				"stop_sequence": nil,
 			},
 			"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
 		})
@@ -1878,10 +1944,10 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		if stream.committedNow() {
 			stream.sendEvent("error", map[string]interface{}{
 				"type":  "error",
-				"error": map[string]string{"type": "api_error", "message": "No available accounts"},
+				"error": map[string]string{"type": "overloaded_error", "message": "No available accounts"},
 			})
 		} else {
-			h.sendClaudeError(w, 503, "api_error", "No available accounts")
+			h.sendClaudeError(w, 503, "overloaded_error", "No available accounts")
 		}
 		return
 	}
@@ -1889,13 +1955,14 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	status := statusForUpstreamError(lastErr)
 	applyRetryAfterHeader(w, lastErr)
 	h.recordFailureForApiKey(apiKeyID, "claude", model, status, lastErr.Error(), startedAt, pc.clientIP())
+	errType := errorTypeForClaudeStatus(status)
 	if stream.committedNow() {
 		stream.sendEvent("error", map[string]interface{}{
 			"type":  "error",
-			"error": map[string]string{"type": "api_error", "message": lastErr.Error()},
+			"error": map[string]string{"type": errType, "message": lastErr.Error()},
 		})
 	} else {
-		h.sendClaudeError(w, status, "api_error", lastErr.Error())
+		h.sendClaudeError(w, status, errType, lastErr.Error())
 	}
 }
 
@@ -1905,11 +1972,16 @@ func (h *Handler) sendSSE(w http.ResponseWriter, flusher http.Flusher, event str
 	flusher.Flush()
 }
 
-// sseHeartbeatInterval is how often a ": ping" comment is emitted to keep
-// idle connections alive through nginx / Cloudflare / load balancers that
-// would otherwise time out the connection after 60-75 s of silence.
-// The comment form is spec-compliant SSE and ignored by all SSE clients.
+// sseHeartbeatInterval is how often a ping event is emitted to keep idle
+// connections alive through nginx / Cloudflare / load balancers that would
+// otherwise time out the connection after 60-75 s of silence.
 const sseHeartbeatInterval = 15 * time.Second
+
+// anthropicPingFrame is the keepalive the Messages API itself sends. An SSE
+// comment (": ping") would also hold the connection open, but it is invisible
+// to clients that parse events rather than raw bytes, and it is not what the
+// upstream protocol looks like on the wire.
+const anthropicPingFrame = "event: ping\ndata: {\"type\":\"ping\"}\n\n"
 
 // sseStream wraps a ResponseWriter with a mutex so the heartbeat goroutine
 // and the main streaming goroutine never interleave partial writes. The
@@ -1941,6 +2013,20 @@ func (s *sseStream) sendEvent(event string, data interface{}) {
 	s.sendLocked(event, data)
 }
 
+// sendPing emits one ping event. Ping is legal at any point in the stream, so
+// this is safe to call between content blocks as well as before message_start.
+func (s *sseStream) sendPing() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pingLocked()
+}
+
+func (s *sseStream) pingLocked() {
+	fmt.Fprint(s.w, anthropicPingFrame)
+	s.flusher.Flush()
+	s.committed = true
+}
+
 // committedNow reports whether any bytes have been flushed to the client.
 func (s *sseStream) committedNow() bool {
 	s.mu.Lock()
@@ -1948,9 +2034,9 @@ func (s *sseStream) committedNow() bool {
 	return s.committed
 }
 
-// startHeartbeat starts a background goroutine that emits a ": ping\n\n"
-// SSE comment every sseHeartbeatInterval. Returns a stop function that must
-// be called (once) when the stream ends; it blocks until the goroutine exits.
+// startHeartbeat starts a background goroutine that emits a ping event every
+// sseHeartbeatInterval. Returns a stop function that must be called (once)
+// when the stream ends; it blocks until the goroutine exits.
 func (s *sseStream) startHeartbeat() (stop func()) {
 	done := make(chan struct{})
 	finished := make(chan struct{})
@@ -1964,9 +2050,7 @@ func (s *sseStream) startHeartbeat() (stop func()) {
 				return
 			case <-t.C:
 				s.mu.Lock()
-				fmt.Fprint(s.w, ": ping\n\n")
-				s.flusher.Flush()
-				s.committed = true
+				s.pingLocked()
 				s.mu.Unlock()
 			}
 		}
@@ -2179,6 +2263,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 
 		var content string
 		var thinkingContent string
+		var thinkingSignature string
 		var toolUses []KiroToolUse
 		var inputTokens, outputTokens int
 		var credits float64
@@ -2194,7 +2279,17 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 					content += text
 				}
 			},
+			OnReasoningSignature: func(sig string) {
+				thinkingSignature = sig
+			},
 			OnToolUse: func(tu KiroToolUse) {
+				// See the streaming path: the synthetic structured-output tool is
+				// unwrapped into the answer text, not reported as a tool call.
+				if pc.Structured.isStructuredCall(tu.Name) {
+					content += pc.Structured.renderResult(tu.Input)
+					upstreamStopReason = ""
+					return
+				}
 				toolUses = append(toolUses, tu)
 			},
 			OnComplete: func(inTok, outTok int) {
@@ -2288,7 +2383,13 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			}
 		}
 
-		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
+		// The signature belongs to the reasoning; if the reasoning was folded into
+		// the text (the <think> / reasoning_content formats above), there is no
+		// thinking block left for it to attest to.
+		if responseThinkingContent == "" {
+			thinkingSignature = ""
+		}
+		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, thinkingSignature, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
 		// KiroToClaudeResponse cannot see max_tokens, so correct the stop_reason here
 		// rather than widening its signature (it is also used by the notice paths that
 		// have no payload). Without this a truncated answer reports "end_turn" and the
@@ -2310,14 +2411,14 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 
 	if lastErr == nil {
 		h.recordFailureForApiKey(apiKeyID, "claude", model, 503, "No available accounts", startedAt, pc.clientIP())
-		h.sendClaudeError(w, 503, "api_error", "No available accounts")
+		h.sendClaudeError(w, 503, "overloaded_error", "No available accounts")
 		return
 	}
 
 	status := statusForUpstreamError(lastErr)
 	applyRetryAfterHeader(w, lastErr)
 	h.recordFailureForApiKey(apiKeyID, "claude", model, status, lastErr.Error(), startedAt, pc.clientIP())
-	h.sendClaudeError(w, status, "api_error", lastErr.Error())
+	h.sendClaudeError(w, status, errorTypeForClaudeStatus(status), lastErr.Error())
 }
 
 func (h *Handler) sendClaudeError(w http.ResponseWriter, status int, errType, message string) {

@@ -188,6 +188,37 @@ func statusForUpstreamError(err error) int {
 	}
 }
 
+// errorTypeForClaudeStatus maps an HTTP status onto the error.type the Messages
+// API pairs it with. Answering 429 with "api_error", as every upstream-failure
+// path used to, tells an Anthropic SDK to treat a throttle as a permanent server
+// fault: it skips the backoff it reserves for rate_limit_error and surfaces the
+// wrong exception class to the caller.
+func errorTypeForClaudeStatus(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "invalid_request_error"
+	case http.StatusUnauthorized:
+		return "authentication_error"
+	case http.StatusPaymentRequired:
+		return "billing_error"
+	case http.StatusForbidden:
+		return "permission_error"
+	case http.StatusNotFound:
+		return "not_found_error"
+	case http.StatusRequestEntityTooLarge:
+		return "request_too_large"
+	case http.StatusTooManyRequests:
+		return "rate_limit_error"
+	// The upstream pool being empty is the same condition Anthropic reports as
+	// overloaded_error; it publishes that as 529, but 503 is what this proxy has
+	// always answered and clients key off the type, not the number.
+	case http.StatusServiceUnavailable, 529:
+		return "overloaded_error"
+	default:
+		return "api_error"
+	}
+}
+
 func errorTypeForOpenAIStatus(status int) string {
 	switch status {
 	case http.StatusTooManyRequests:

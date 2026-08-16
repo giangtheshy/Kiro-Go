@@ -498,6 +498,18 @@ type KiroStreamCallback struct {
 	OnCredits      func(credits float64)
 	OnContextUsage func(percentage float64)
 
+	// OnReasoningSignature fires when a reasoningContentEvent carries the
+	// encrypted attestation Anthropic issues over a thinking block. Bedrock
+	// documents this field, and a reasoning frame may arrive carrying only the
+	// signature and no text, so it is delivered separately from OnText rather
+	// than inferred from it.
+	//
+	// It is forwarded verbatim or not at all. The value is a keyed blob the
+	// client hands back on the next turn to prove the reasoning was not edited;
+	// anything synthesized here would be rejected on replay, so an absent
+	// signature stays absent.
+	OnReasoningSignature func(signature string)
+
 	// OnTruncated fires when the stream closed cleanly AFTER emitting content but
 	// without a meteringEvent — i.e. the upstream dropped the connection mid-turn.
 	// Retrying is not an option at that point (it would append a second, partial
@@ -1384,12 +1396,20 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (Stre
 				}
 			}
 		case "reasoningContentEvent":
-			if text, ok := event["text"].(string); ok && text != "" {
-				normalized := normalizeChunk(text, &lastReasoningContent)
+			// Two shapes are in circulation: a flat {text, signature}, and a
+			// nested {reasoningText: {text, signature}}. Read both.
+			reasoningText, reasoningSig := reasoningFromEvent(event)
+			if reasoningText != "" {
+				normalized := normalizeChunk(reasoningText, &lastReasoningContent)
 				if normalized != "" && callback.OnText != nil {
 					callback.OnText(normalized, true)
 					outcome.Emitted = true
 				}
+			}
+			// A signature-only frame is legal and carries no text, so this is
+			// deliberately outside the text branch.
+			if reasoningSig != "" && callback.OnReasoningSignature != nil {
+				callback.OnReasoningSignature(reasoningSig)
 			}
 		case "toolUseEvent":
 			next, emitted, err := handleToolUseEvent(event, currentToolUse, callback)
@@ -1899,13 +1919,13 @@ func handleToolUseEvent(event map[string]interface{}, current *toolUseState, cal
 			}
 		}
 	} else if name != "" && current == nil {
-		current = &toolUseState{ToolUseID: "toolu_" + uuid.New().String(), Name: name, GeneratedID: true}
+		current = &toolUseState{ToolUseID: newToolUseID(), Name: name, GeneratedID: true}
 	} else if name != "" && current != nil && current.Name != name {
 		emitted, err = finishToolUse(current, callback)
 		if err != nil {
 			return nil, emitted, err
 		}
-		current = &toolUseState{ToolUseID: "toolu_" + uuid.New().String(), Name: name, GeneratedID: true}
+		current = &toolUseState{ToolUseID: newToolUseID(), Name: name, GeneratedID: true}
 	}
 
 	if current != nil {
@@ -1962,17 +1982,49 @@ func finishToolUse(state *toolUseState, callback *KiroStreamCallback) (emitted b
 	}
 
 	if state.ToolUseID == "" {
-		state.ToolUseID = "toolu_" + uuid.New().String()
+		state.ToolUseID = newToolUseID()
 	}
 	if input == nil {
 		input = make(map[string]interface{})
 	}
+	// Normalize here rather than when the id first arrives: the accumulator
+	// compares successive frames by raw upstream id to decide whether a new call
+	// has started, and normalizing mints a fresh value on every call, so doing it
+	// earlier would make every frame look like a different tool use.
 	callback.OnToolUse(KiroToolUse{
-		ToolUseID: state.ToolUseID,
+		ToolUseID: normalizeToolUseID(state.ToolUseID),
 		Name:      state.Name,
 		Input:     input,
 	})
 	return true, nil
+}
+
+// reasoningFromEvent reads the text and the encrypted signature out of one
+// reasoningContentEvent frame.
+//
+// The upstream has shipped this event under several shapes. Flat, the payload is
+// {text, signature}; nested, it is {reasoningText: {text, signature}}; and some
+// model variants send reasoningText as a bare string. Reading whichever is
+// present costs nothing and avoids dropping reasoning on a variant we have not
+// seen — which is how the signature came to be discarded in the first place.
+func reasoningFromEvent(event map[string]interface{}) (text, signature string) {
+	text = firstStringField(event, "text", "Text")
+	signature = firstStringField(event, "signature", "Signature", "signatureBytes")
+
+	switch nested := event["reasoningText"].(type) {
+	case string:
+		if text == "" {
+			text = nested
+		}
+	case map[string]interface{}:
+		if text == "" {
+			text = firstStringField(nested, "text", "Text")
+		}
+		if signature == "" {
+			signature = firstStringField(nested, "signature", "Signature", "signatureBytes")
+		}
+	}
+	return text, signature
 }
 
 func firstStringField(m map[string]interface{}, keys ...string) string {

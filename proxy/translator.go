@@ -787,6 +787,15 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 				if img := extractImageFromClaudeBlock(block); img != nil {
 					images = append(images, *img)
 				}
+			case "document", "input_document", "file", "input_file":
+				// The upstream has no field for an attachment, so a document is
+				// flattened into the message text. See document.go.
+				if doc := documentBlockText(block); doc != "" {
+					if text != "" && !strings.HasSuffix(text, "\n") {
+						text += "\n"
+					}
+					text += doc + "\n"
+				}
 			case "tool_result":
 				toolUseID, _ := block["tool_use_id"].(string)
 				resultContent, resultImages := extractToolResultContent(block["content"])
@@ -796,10 +805,18 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 						resultContent = toolResultImagePlaceholder
 					}
 				}
+				// A failed tool call reads very differently to the model than a
+				// successful one — it should retry or change approach, not treat
+				// the error text as data. Reporting every result as "success"
+				// erased that distinction.
+				status := "success"
+				if isError, _ := block["is_error"].(bool); isError {
+					status = "error"
+				}
 				toolResults = append(toolResults, KiroToolResult{
 					ToolUseID: toolUseID,
 					Content:   []KiroResultContent{{Text: resultContent}},
-					Status:    "success",
+					Status:    status,
 				})
 			}
 		}
@@ -1121,13 +1138,19 @@ func shortenToolName(name string) string {
 
 // ==================== Kiro -> Claude 转换 ====================
 
-func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingBlock bool, toolUses []KiroToolUse, inputTokens, outputTokens int, model string) *ClaudeResponse {
+// KiroToClaudeResponse assembles the non-streaming Messages response.
+//
+// thinkingSignature is the attestation the upstream issued over the reasoning,
+// or "" when it issued none. It is never synthesized: the value only means
+// anything if Anthropic can verify it when the client replays the block.
+func KiroToClaudeResponse(content, thinkingContent, thinkingSignature string, includeEmptyThinkingBlock bool, toolUses []KiroToolUse, inputTokens, outputTokens int, model string) *ClaudeResponse {
 	blocks := make([]ClaudeContentBlock, 0)
 
 	if thinkingContent != "" || includeEmptyThinkingBlock {
 		blocks = append(blocks, ClaudeContentBlock{
-			Type:     "thinking",
-			Thinking: thinkingContent,
+			Type:      "thinking",
+			Thinking:  thinkingContent,
+			Signature: thinkingSignature,
 		})
 	}
 
@@ -1153,7 +1176,7 @@ func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingB
 	}
 
 	return &ClaudeResponse{
-		ID:         "msg_" + uuid.New().String(),
+		ID:         newMessageID(),
 		Type:       "message",
 		Role:       "assistant",
 		Content:    blocks,

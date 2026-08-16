@@ -541,7 +541,7 @@ func (u openAIStyleUsage) anthropicUsage() map[string]any {
 func newBridgeOpenAIToAnthropicStream(model string, fallbackInput int) *bridgeOpenAIToAnthropicStream {
 	return &bridgeOpenAIToAnthropicStream{
 		model:         model,
-		id:            "msg_" + uuid.New().String(),
+		id:            newMessageID(),
 		fallbackInput: fallbackInput,
 		toolBlocks:    make(map[int]int),
 	}
@@ -703,7 +703,7 @@ func (b *bridgeOpenAIToAnthropicStream) translate(line []byte) [][]byte {
 					// Anthropic requires an id on tool_use, and the client will echo it back
 					// as tool_use_id. A provider that omits it would otherwise produce a
 					// block the client cannot answer.
-					id = "toolu_" + strings.ReplaceAll(uuid.New().String(), "-", "")
+					id = newToolUseID()
 				}
 				frames, idx := b.openBlock(map[string]any{
 					"type":  "tool_use",
@@ -950,7 +950,7 @@ func bridgeOpenAIJSONToAnthropic(payload []byte, model string, fallbackInput int
 				}
 				id := tc.ID
 				if id == "" {
-					id = "toolu_" + strings.ReplaceAll(uuid.New().String(), "-", "")
+					id = newToolUseID()
 				}
 				blocks = append(blocks, map[string]any{
 					"type":  "tool_use",
@@ -970,12 +970,14 @@ func bridgeOpenAIJSONToAnthropic(payload []byte, model string, fallbackInput int
 		usageOut["input_tokens"] = fallbackInput
 	}
 
-	id := src.ID
-	if id == "" {
-		id = uuid.New().String()
+	// Reusing the upstream id keeps the two sides of the bridge correlatable in
+	// logs; only mint one when the provider sent none.
+	msgID := newMessageID()
+	if src.ID != "" {
+		msgID = "msg_" + strings.TrimPrefix(src.ID, "chatcmpl-")
 	}
 	out := map[string]any{
-		"id":            "msg_" + strings.TrimPrefix(id, "chatcmpl-"),
+		"id":            msgID,
 		"type":          "message",
 		"role":          "assistant",
 		"model":         model,
