@@ -246,6 +246,7 @@ type ClaudeResponse struct {
 	Model        string               `json:"model"`
 	StopReason   string               `json:"stop_reason"`
 	StopSequence *string              `json:"stop_sequence"`
+	StopDetails  *string              `json:"stop_details"`
 	Usage        ClaudeUsage          `json:"usage"`
 }
 
@@ -254,12 +255,19 @@ type ClaudeCacheCreationUsage struct {
 	Ephemeral1hInputTokens int `json:"ephemeral_1h_input_tokens,omitempty"`
 }
 
+type ClaudeOutputTokensDetails struct {
+	ThinkingTokens int `json:"thinking_tokens,omitempty"`
+}
+
 type ClaudeUsage struct {
-	InputTokens              int                       `json:"input_tokens"`
-	OutputTokens             int                       `json:"output_tokens"`
-	CacheCreationInputTokens int                       `json:"cache_creation_input_tokens,omitempty"`
-	CacheReadInputTokens     int                       `json:"cache_read_input_tokens,omitempty"`
-	CacheCreation            *ClaudeCacheCreationUsage `json:"cache_creation,omitempty"`
+	InputTokens              int                        `json:"input_tokens"`
+	OutputTokens             int                        `json:"output_tokens"`
+	CacheCreationInputTokens int                        `json:"cache_creation_input_tokens,omitempty"`
+	CacheReadInputTokens     int                        `json:"cache_read_input_tokens,omitempty"`
+	CacheCreation            *ClaudeCacheCreationUsage  `json:"cache_creation,omitempty"`
+	OutputTokensDetails      *ClaudeOutputTokensDetails `json:"output_tokens_details,omitempty"`
+	ServiceTier              string                     `json:"service_tier,omitempty"`
+	InferenceGeo             string                     `json:"inference_geo,omitempty"`
 }
 
 // ==================== Claude -> Kiro 转换 ====================

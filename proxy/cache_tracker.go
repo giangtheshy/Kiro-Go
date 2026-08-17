@@ -522,12 +522,16 @@ func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, 
 		"cache_read_input_tokens":     usage.CacheReadInputTokens,
 	}
 	if !includeCache {
+		result["service_tier"] = "standard"
+		result["inference_geo"] = "not_available"
 		return result
 	}
 	result["cache_creation"] = map[string]int{
 		"ephemeral_5m_input_tokens": usage.CacheCreation5mInputTokens,
 		"ephemeral_1h_input_tokens": usage.CacheCreation1hInputTokens,
 	}
+	result["service_tier"] = "standard"
+	result["inference_geo"] = "not_available"
 	return result
 }
 

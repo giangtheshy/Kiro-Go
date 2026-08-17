@@ -1440,6 +1440,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				"model":         model,
 				"stop_reason":   nil,
 				"stop_sequence": nil,
+				"stop_details":  nil,
 				"usage":         buildClaudeUsageMap(startInputTokens, 0, messageStartUsage, cacheProfile != nil),
 			},
 		})
@@ -1940,6 +1941,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			"delta": map[string]interface{}{
 				"stop_reason":   stopReason,
 				"stop_sequence": nil,
+				"stop_details":  nil,
 			},
 			"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
 		})
@@ -2409,6 +2411,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		// have no payload). Without this a truncated answer reports "end_turn" and the
 		// client treats a cut-off response as a clean finish.
 		resp.StopReason = claudeStopReasonWithUpstream(upstreamStopReason, toolUses, outputTokens, payloadMaxTokens(payload))
+		resp.StopDetails = nil
 		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
@@ -2418,6 +2421,15 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 				Ephemeral1hInputTokens: cacheUsage.CacheCreation1hInputTokens,
 			}
 		}
+		// Add thinking tokens count if thinking content exists
+		thinkingTokenCount := estimateApproxTokens(responseThinkingContent)
+		if thinkingTokenCount > 0 {
+			resp.Usage.OutputTokensDetails = &ClaudeOutputTokensDetails{
+				ThinkingTokens: thinkingTokenCount,
+			}
+		}
+		resp.Usage.ServiceTier = "standard"
+		resp.Usage.InferenceGeo = "not_available"
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(resp)
 		return
