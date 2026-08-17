@@ -60,9 +60,14 @@ func newToolUseID() string { return newAnthropicID("toolu_") }
 func newServerToolUseID() string { return newAnthropicID("srvtoolu_") }
 
 // toolInputChunkBytes is the target size of one input_json_delta fragment.
-// Small enough that a client rendering a tool call sees it fill in, large
-// enough that a big argument object does not turn into hundreds of frames.
-const toolInputChunkBytes = 48
+//
+// Sized against what the Messages API actually emits: fragments there follow
+// the model's tokens, which land in the 2–20 byte range, so a typical argument
+// object arrives over several frames. A larger window would deliver the common
+// short object — {"location":"Paris","unit":"celsius"} is 37 bytes — as a
+// single frame, which is exactly the all-at-once materialisation the chunking
+// exists to avoid.
+const toolInputChunkBytes = 16
 
 // chunkToolInputJSON splits a serialized tool-argument object into the
 // partial_json fragments an input_json_delta stream carries.
@@ -92,17 +97,43 @@ func chunkToolInputJSON(encoded string) []string {
 	return append(chunks, encoded[start:])
 }
 
+// isAnthropicID reports whether id is exactly prefix + "01" + 22 alphanumerics.
+//
+// A prefix test alone is not enough. The Kiro/CodeWhisperer backend returns ids
+// such as toolu_bdrk_01BZSE8P8Bm5SVnRJAUmFySz, which carries the right prefix
+// and would pass any HasPrefix check while announcing the Bedrock backend in
+// the middle of the id. The length and the alphabet are what actually separate
+// an API-issued id from a look-alike.
+func isAnthropicID(id, prefix string) bool {
+	rest, ok := strings.CutPrefix(id, prefix)
+	if !ok || len(rest) != 2+anthropicIDBodyLen || rest[0] != '0' || rest[1] != '1' {
+		return false
+	}
+	for i := 2; i < len(rest); i++ {
+		c := rest[i]
+		if c >= '0' && c <= '9' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 // normalizeToolUseID keeps an upstream id when it already looks like one the
 // Messages API would issue, and mints a replacement when it does not.
 //
-// The Kiro/CodeWhisperer backend hands back Bedrock-shaped ids (tooluse_…),
-// which fail the toolu_ prefix rule every Anthropic client and relay detector
-// applies. Rewriting is safe because the mapping never has to be reversed: each
-// request carries the whole conversation, so the assistant turn that announced
-// the call and the user turn that answers it both travel with the rewritten id.
+// The Kiro/CodeWhisperer backend hands back Bedrock-shaped ids — bare
+// tooluse_… as well as the toolu_bdrk_… form that mimics the Anthropic prefix.
+// Rewriting is safe because the mapping never has to be reversed: each request
+// carries the whole conversation, so the assistant turn that announced the call
+// and the user turn that answers it both travel with the rewritten id.
 func normalizeToolUseID(upstream string) string {
-	if strings.HasPrefix(upstream, "toolu_") {
+	if isAnthropicID(upstream, "toolu_") {
 		return upstream
 	}
 	return newToolUseID()
 }
+
+// newRequestID returns the value of the request-id response header, which the
+// Messages API sets on every reply and clients quote in bug reports.
+func newRequestID() string { return newAnthropicID("req_") }

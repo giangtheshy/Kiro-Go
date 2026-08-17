@@ -131,7 +131,7 @@ func TestWebSearchLoopForwardsClientToolCall(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
-			"toolUseId": "toolu_bash_1",
+			"toolUseId": "toolu_01BashAAAAAAAAAAAAAAAAAA",
 			"name":      "bash",
 			"input":     `{"cmd":"ls"}`,
 			"stop":      true,
@@ -146,7 +146,7 @@ func TestWebSearchLoopForwardsClientToolCall(t *testing.T) {
 	h.handleClaudeMessages(rec, req)
 
 	got := rec.Body.String()
-	if !strings.Contains(got, "toolu_bash_1") {
+	if !strings.Contains(got, "toolu_01BashAAAAAAAAAAAAAAAAAA") {
 		t.Fatalf("the client's tool call must reach the client:\n%s", got)
 	}
 	if delta := sseFrameContaining(got, "message_delta"); !strings.Contains(delta, `"stop_reason":"tool_use"`) {

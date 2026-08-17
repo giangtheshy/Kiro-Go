@@ -9,8 +9,6 @@ import (
 
 	"kiro-go/config"
 	"kiro-go/logger"
-
-	"github.com/google/uuid"
 )
 
 // The agentic loop handles native web_search mixed with the client's own tools.
@@ -67,10 +65,10 @@ func (h *Handler) callUpstreamForWebSearch(req *ClaudeRequest, thinking bool, ap
 					sb.WriteString(text)
 				}
 			},
-			OnToolUse:   func(tu KiroToolUse) { round.toolUses = append(round.toolUses, tu) },
-			OnComplete:  func(inTok, _ int) { round.inputTokens = inTok },
-			OnCredits:   func(c float64) { round.credits = c },
-			OnTruncated: func() { round.truncated = true },
+			OnToolUse:    func(tu KiroToolUse) { round.toolUses = append(round.toolUses, tu) },
+			OnComplete:   func(inTok, _ int) { round.inputTokens = inTok },
+			OnCredits:    func(c float64) { round.credits = c },
+			OnTruncated:  func() { round.truncated = true },
 			OnStopReason: func(reason string) { round.upstreamStopReason = reason },
 		}
 
@@ -167,8 +165,9 @@ func appendSearchRound(req *ClaudeRequest, round *webSearchRoundOutcome, searche
 				"input": map[string]interface{}{"query": query},
 			},
 			map[string]interface{}{
-				"type":    "web_search_tool_result",
-				"content": webSearchResultContent(results),
+				"type":        "web_search_tool_result",
+				"tool_use_id": srvID,
+				"content":     webSearchResultContent(results),
 			},
 		)
 	}
@@ -376,7 +375,7 @@ func (h *Handler) renderWebSearchLoopJSON(
 	truncated bool,
 ) {
 	body := map[string]interface{}{
-		"id":            "msg_" + uuid.New().String(),
+		"id":            newMessageID(),
 		"type":          "message",
 		"role":          "assistant",
 		"model":         model,
@@ -417,11 +416,10 @@ func (h *Handler) renderWebSearchLoopSSE(
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
-	msgID := "msg_" + uuid.New().String()
 	h.sendSSE(w, flusher, "message_start", map[string]interface{}{
 		"type": "message_start",
 		"message": map[string]interface{}{
-			"id":            msgID,
+			"id":            newMessageID(),
 			"type":          "message",
 			"role":          "assistant",
 			"content":       []interface{}{},
@@ -431,6 +429,7 @@ func (h *Handler) renderWebSearchLoopSSE(
 			"usage":         buildWebSearchUsage(inputTokens, 0, searches),
 		},
 	})
+	h.sendSSE(w, flusher, "ping", map[string]interface{}{"type": "ping"})
 
 	for idx, block := range content {
 		switch block["type"] {
@@ -450,14 +449,16 @@ func (h *Handler) renderWebSearchLoopSSE(
 				},
 			})
 			inputJSON, _ := json.Marshal(block["input"])
-			h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
-				"type":  "content_block_delta",
-				"index": idx,
-				"delta": map[string]interface{}{
-					"type":         "input_json_delta",
-					"partial_json": string(inputJSON),
-				},
-			})
+			for _, fragment := range chunkToolInputJSON(string(inputJSON)) {
+				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": idx,
+					"delta": map[string]interface{}{
+						"type":         "input_json_delta",
+						"partial_json": fragment,
+					},
+				})
+			}
 			h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
 				"type": "content_block_stop", "index": idx,
 			})

@@ -511,15 +511,19 @@ func billedClaudeInputTokens(inputTokens int, usage promptCacheUsage) int {
 }
 
 func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, includeCache bool) map[string]interface{} {
+	// The two cache counters are unconditional. The Messages API reports them on
+	// every response, zero when nothing was cached, and clients that read
+	// usage.cache_read_input_tokens without a presence check get a nil deref
+	// against a response that simply did not opt into caching.
 	result := map[string]interface{}{
-		"input_tokens":  billedClaudeInputTokens(inputTokens, usage),
-		"output_tokens": outputTokens,
+		"input_tokens":                billedClaudeInputTokens(inputTokens, usage),
+		"output_tokens":               outputTokens,
+		"cache_creation_input_tokens": usage.CacheCreationInputTokens,
+		"cache_read_input_tokens":     usage.CacheReadInputTokens,
 	}
 	if !includeCache {
 		return result
 	}
-	result["cache_creation_input_tokens"] = usage.CacheCreationInputTokens
-	result["cache_read_input_tokens"] = usage.CacheReadInputTokens
 	result["cache_creation"] = map[string]int{
 		"ephemeral_5m_input_tokens": usage.CacheCreation5mInputTokens,
 		"ephemeral_1h_input_tokens": usage.CacheCreation1hInputTokens,

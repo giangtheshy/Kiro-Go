@@ -1,12 +1,14 @@
 package proxy
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
+	"kiro-go/config"
+	"kiro-go/logger"
 )
 
 // The fast path serves a request whose only tool is the native web_search. The
@@ -66,12 +68,15 @@ func extractTextFromClaudeContent(content interface{}) string {
 	return ""
 }
 
-// buildWebSearchContentBlocks assembles the four blocks in the order a real
-// Anthropic response carries them: the model announcing the search, the server
-// tool call, the raw results, then a readable summary.
-func buildWebSearchContentBlocks(query, toolUseID string, results *WebSearchResults) []map[string]interface{} {
+// buildWebSearchContentBlocks assembles the blocks in the order a real Anthropic
+// response carries them: the server tool call, the raw results, then the answer
+// the model wrote from them.
+//
+// answer is the model's own prose. When the follow-up call that produces it
+// fails, the caller passes the rendered result list instead so the turn still
+// says something useful.
+func buildWebSearchContentBlocks(query, toolUseID string, results *WebSearchResults, answer string) []map[string]interface{} {
 	return []map[string]interface{}{
-		{"type": "text", "text": fmt.Sprintf("I'll search for %q.", query)},
 		{
 			"id":    toolUseID,
 			"type":  "server_tool_use",
@@ -79,19 +84,22 @@ func buildWebSearchContentBlocks(query, toolUseID string, results *WebSearchResu
 			"input": map[string]interface{}{"query": query},
 		},
 		{
-			"type":    "web_search_tool_result",
-			"content": webSearchResultContent(results),
+			"type":        "web_search_tool_result",
+			"tool_use_id": toolUseID,
+			"content":     webSearchResultContent(results),
 		},
-		{"type": "text", "text": generateSearchSummary(query, results)},
+		{"type": "text", "text": answer},
 	}
 }
 
 // webSearchResultContent renders each hit.
 //
-// Three details are load-bearing: the block carries NO tool_use_id (the real API
-// does not send one), the slice is allocated with make so it marshals to [] and
-// not null, and page_age stays an interface{} so a missing publishedDate becomes
-// null rather than an empty string.
+// Three details are load-bearing: the slice is allocated with make so it
+// marshals to [] and not null, page_age stays an interface{} so a missing
+// publishedDate becomes null rather than an empty string, and encrypted_content
+// is base64 rather than bare prose — the field is contractually an opaque blob
+// the client round-trips without reading, and shipping readable text there
+// invites clients to parse what they are meant to pass back untouched.
 func webSearchResultContent(results *WebSearchResults) []map[string]interface{} {
 	out := make([]map[string]interface{}, 0)
 	if results == nil {
@@ -103,8 +111,8 @@ func webSearchResultContent(results *WebSearchResults) []map[string]interface{} 
 			pageAge = time.UnixMilli(*r.PublishedDate).UTC().Format("January 2, 2006")
 		}
 		encryptedContent := ""
-		if r.Snippet != nil {
-			encryptedContent = *r.Snippet
+		if r.Snippet != nil && *r.Snippet != "" {
+			encryptedContent = base64.StdEncoding.EncodeToString([]byte(*r.Snippet))
 		}
 		out = append(out, map[string]interface{}{
 			"type":              "web_search_result",
@@ -177,6 +185,37 @@ func buildWebSearchUsage(inputTokens, outputTokens, searches int) map[string]int
 	}
 }
 
+// composeWebSearchAnswer asks the model to answer the question from the results
+// that were just fetched.
+//
+// Without this the turn ends in a rendered list of hits, which is not what the
+// Messages API returns and not what the caller asked for: web_search is a tool
+// the model uses to answer, not a search engine the caller queried. The results
+// enter as a user turn rather than a tool_result because the tool the client
+// declared is a SERVER tool — it has no client-side call to answer, and Kiro
+// rejects a tool_result that matches no tool it was given.
+//
+// Returns "" when the follow-up cannot be made, leaving the caller to fall back
+// to the rendered list rather than fail a search that actually succeeded.
+func (h *Handler) composeWebSearchAnswer(req *ClaudeRequest, query string, results *WebSearchResults, apiKeyID string) (string, *config.Account) {
+	working := *req
+	working.Tools = nil
+	working.ToolChoice = nil
+	working.Stream = false
+	working.Messages = append(append([]ClaudeMessage(nil), req.Messages...),
+		ClaudeMessage{Role: "assistant", Content: fmt.Sprintf("Let me search the web for %q.", query)},
+		ClaudeMessage{Role: "user", Content: generateSearchSummary(query, results) +
+			"\n\nUsing these search results, answer my question. Cite the sources you use by URL."},
+	)
+
+	round, account, err := h.callUpstreamForWebSearch(&working, false, apiKeyID)
+	if err != nil {
+		logger.Warnf("[WebSearch] answer composition failed, falling back to the result list: %v", err)
+		return "", nil
+	}
+	return strings.TrimSpace(round.text), account
+}
+
 // handleWebSearchRequest serves the fast path.
 func (h *Handler) handleWebSearchRequest(w http.ResponseWriter, req *ClaudeRequest, estimatedInputTokens int, apiKeyID string, startedAt time.Time, clientIP string) {
 	query := extractSearchQuery(req)
@@ -194,12 +233,17 @@ func (h *Handler) handleWebSearchRequest(w http.ResponseWriter, req *ClaudeReque
 		return
 	}
 
-	blocks := buildWebSearchContentBlocks(query, toolUseID, results)
-	summary := generateSearchSummary(query, results)
-	outputTokens := estimateApproxTokens(summary)
+	answer, answerAccount := h.composeWebSearchAnswer(req, query, results, apiKeyID)
+	if answer == "" {
+		answer = generateSearchSummary(query, results)
+	}
+	if answerAccount != nil {
+		account = answerAccount
+	}
 
-	// This path never calls Kiro chat, so it costs no credits — but the search
-	// itself is still recorded so it is not invisible in usage.
+	blocks := buildWebSearchContentBlocks(query, toolUseID, results, answer)
+	outputTokens := estimateApproxTokens(answer)
+
 	h.recordSuccessForApiKey(apiKeyID, requestUsage{
 		Input:    estimatedInputTokens,
 		Output:   outputTokens,
@@ -207,7 +251,7 @@ func (h *Handler) handleWebSearchRequest(w http.ResponseWriter, req *ClaudeReque
 	}, req.Model, account, "claude", startedAt)
 
 	if req.Stream {
-		h.streamWebSearchResponse(w, req.Model, query, toolUseID, results, blocks, estimatedInputTokens, outputTokens)
+		h.streamWebSearchResponse(w, req.Model, query, toolUseID, results, blocks, answer, estimatedInputTokens, outputTokens)
 		return
 	}
 	h.writeWebSearchJSON(w, req.Model, blocks, estimatedInputTokens, outputTokens)
@@ -217,7 +261,7 @@ func (h *Handler) handleWebSearchRequest(w http.ResponseWriter, req *ClaudeReque
 // the streaming path so the two can never drift apart.
 func (h *Handler) writeWebSearchJSON(w http.ResponseWriter, model string, blocks []map[string]interface{}, inputTokens, outputTokens int) {
 	_ = writeJSONOK(w, map[string]interface{}{
-		"id":            "msg_" + uuid.New().String(),
+		"id":            newMessageID(),
 		"type":          "message",
 		"role":          "assistant",
 		"model":         model,
@@ -238,6 +282,7 @@ func (h *Handler) streamWebSearchResponse(
 	model, query, toolUseID string,
 	results *WebSearchResults,
 	blocks []map[string]interface{},
+	answer string,
 	inputTokens, outputTokens int,
 ) {
 	flusher, ok := w.(http.Flusher)
@@ -251,11 +296,10 @@ func (h *Handler) streamWebSearchResponse(
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
-	msgID := "msg_" + uuid.New().String()
 	h.sendSSE(w, flusher, "message_start", map[string]interface{}{
 		"type": "message_start",
 		"message": map[string]interface{}{
-			"id":            msgID,
+			"id":            newMessageID(),
 			"type":          "message",
 			"role":          "assistant",
 			"content":       []interface{}{},
@@ -265,14 +309,12 @@ func (h *Handler) streamWebSearchResponse(
 			"usage":         buildWebSearchUsage(inputTokens, 0, 1),
 		},
 	})
+	h.sendSSE(w, flusher, "ping", map[string]interface{}{"type": "ping"})
 
-	intro := fmt.Sprintf("I'll search for %q.", query)
-	h.streamTextBlock(w, flusher, 0, intro)
-
-	// Block 1: the server tool call, complete at start.
+	// Block 0: the server tool call, complete at start.
 	h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
 		"type":  "content_block_start",
-		"index": 1,
+		"index": 0,
 		"content_block": map[string]interface{}{
 			"id":    toolUseID,
 			"type":  "server_tool_use",
@@ -281,24 +323,25 @@ func (h *Handler) streamWebSearchResponse(
 		},
 	})
 	h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
-		"type": "content_block_stop", "index": 1,
+		"type": "content_block_stop", "index": 0,
 	})
 
-	// Block 2: the raw results, also complete at start.
+	// Block 1: the raw results, also complete at start.
 	h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
 		"type":  "content_block_start",
-		"index": 2,
+		"index": 1,
 		"content_block": map[string]interface{}{
-			"type":    "web_search_tool_result",
-			"content": webSearchResultContent(results),
+			"type":        "web_search_tool_result",
+			"tool_use_id": toolUseID,
+			"content":     webSearchResultContent(results),
 		},
 	})
 	h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
-		"type": "content_block_stop", "index": 2,
+		"type": "content_block_stop", "index": 1,
 	})
 
-	// Block 3: the summary, streamed in rune-safe chunks.
-	h.streamTextBlock(w, flusher, 3, generateSearchSummary(query, results))
+	// Block 2: the model's answer, streamed in rune-safe chunks.
+	h.streamTextBlock(w, flusher, 2, answer)
 
 	h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
 		"type":  "message_delta",

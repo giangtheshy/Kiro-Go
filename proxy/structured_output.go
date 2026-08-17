@@ -91,6 +91,56 @@ func (s *structuredOutputSpec) applyToRequest(req *ClaudeRequest) bool {
 	return true
 }
 
+// instruction renders the schema as a plain requirement for the system prompt.
+//
+// This is the weaker of the two mechanisms — the model can ignore prose in a
+// way it cannot ignore a tool's input_schema — but it is the only one available
+// once the caller has tools of its own, and an instruction the model usually
+// follows beats dropping the constraint outright.
+func (s *structuredOutputSpec) instruction() string {
+	encoded, err := json.Marshal(s.Schema)
+	if err != nil {
+		return ""
+	}
+	return "Your final reply must be a single JSON value that validates against " +
+		"this JSON Schema:\n" + string(encoded) +
+		"\n\nEmit every required property. Do not wrap the JSON in Markdown code " +
+		"fences and do not add any prose before or after it."
+}
+
+// applyAsInstruction appends the schema requirement to the system prompt.
+//
+// The existing prompt is extended rather than replaced, and an array-shaped
+// system field gains a block instead of being flattened to a string — the
+// blocks carry cache_control markers, and collapsing them would silently
+// invalidate the caller's prompt cache.
+func (s *structuredOutputSpec) applyAsInstruction(req *ClaudeRequest) bool {
+	if s == nil {
+		return false
+	}
+	text := s.instruction()
+	if text == "" {
+		return false
+	}
+	switch existing := req.System.(type) {
+	case nil:
+		req.System = text
+	case string:
+		if strings.TrimSpace(existing) == "" {
+			req.System = text
+		} else {
+			req.System = existing + "\n\n" + text
+		}
+	case []interface{}:
+		req.System = append(existing, map[string]interface{}{"type": "text", "text": text})
+	default:
+		// An unrecognised shape is left alone rather than overwritten: losing the
+		// caller's system prompt is worse than losing the schema constraint.
+		return false
+	}
+	return true
+}
+
 // isStructuredCall reports whether a tool call is the synthetic one and should
 // be unwrapped rather than forwarded.
 func (s *structuredOutputSpec) isStructuredCall(name string) bool {

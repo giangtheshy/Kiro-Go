@@ -209,8 +209,13 @@ func TestWebSearchResultContentShape(t *testing.T) {
 	if len(decoded) != 2 {
 		t.Fatalf("expected 2 results, got %d", len(decoded))
 	}
+	// tool_use_id belongs on the web_search_tool_result wrapper, not on the
+	// individual hits inside its content array.
 	if _, present := decoded[0]["tool_use_id"]; present {
-		t.Fatal("web_search_tool_result must not carry tool_use_id")
+		t.Fatal("an individual web_search_result must not carry tool_use_id")
+	}
+	if decoded[0]["encrypted_content"] == "s" {
+		t.Fatal("encrypted_content must be an opaque blob, not the bare snippet")
 	}
 	if decoded[0]["page_age"] == nil {
 		t.Fatal("expected a formatted page_age when publishedDate is present")
@@ -229,8 +234,8 @@ func TestWebSearchResultContentShape(t *testing.T) {
 }
 
 func TestBuildWebSearchContentBlocksOrder(t *testing.T) {
-	blocks := buildWebSearchContentBlocks("q", "srvtoolu_x", &WebSearchResults{})
-	want := []string{"text", "server_tool_use", "web_search_tool_result", "text"}
+	blocks := buildWebSearchContentBlocks("q", "srvtoolu_x", &WebSearchResults{}, "the answer")
+	want := []string{"server_tool_use", "web_search_tool_result", "text"}
 	if len(blocks) != len(want) {
 		t.Fatalf("expected %d blocks, got %d", len(want), len(blocks))
 	}
@@ -239,8 +244,28 @@ func TestBuildWebSearchContentBlocksOrder(t *testing.T) {
 			t.Fatalf("block %d: got %v, want %s", i, blocks[i]["type"], w)
 		}
 	}
-	if blocks[1]["id"] != "srvtoolu_x" {
-		t.Fatalf("server_tool_use must carry the tool use id, got %v", blocks[1]["id"])
+	if blocks[0]["id"] != "srvtoolu_x" {
+		t.Fatalf("server_tool_use must carry the tool use id, got %v", blocks[0]["id"])
+	}
+	// The result block is what links the hits back to the call that produced
+	// them; without it a client cannot tell which search a result answered.
+	if blocks[1]["tool_use_id"] != "srvtoolu_x" {
+		t.Fatalf("web_search_tool_result must reference the server_tool_use id, got %v", blocks[1]["tool_use_id"])
+	}
+	if blocks[2]["text"] != "the answer" {
+		t.Fatalf("the final block must carry the model's answer, got %v", blocks[2]["text"])
+	}
+}
+
+// A Bedrock id that borrows the Anthropic prefix still announces the backend in
+// the middle of the id, so a prefix check alone is not enough.
+func TestNormalizeToolUseIDRewritesBedrockPrefixedShape(t *testing.T) {
+	got := normalizeToolUseID("toolu_bdrk_01BZSE8P8Bm5SVnRJAUmFySz")
+	if got == "toolu_bdrk_01BZSE8P8Bm5SVnRJAUmFySz" {
+		t.Fatal("toolu_bdrk_ ids must be rewritten, not passed through")
+	}
+	if !anthropicIDPattern.MatchString(got) {
+		t.Fatalf("rewritten id has the wrong shape: %q", got)
 	}
 }
 

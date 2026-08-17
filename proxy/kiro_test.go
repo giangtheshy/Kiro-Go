@@ -53,7 +53,7 @@ func TestNormalizeChunkOverlapDelta(t *testing.T) {
 
 func TestParseEventStreamFinishesPendingToolUseOnEOF(t *testing.T) {
 	stream := bytes.NewReader(awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
-		"toolUseId": "toolu_1",
+		"toolUseId": "toolu_01T1x1fJ34qAmk2tNTrN7Up6",
 		"name":      "mcpIdaProMcpStatus",
 		"input":     `{"server":"ida-pro-mcp"}`,
 	}))
@@ -77,7 +77,7 @@ func TestParseEventStreamFinishesPendingToolUseOnEOF(t *testing.T) {
 	if len(toolUses) != 1 {
 		t.Fatalf("expected pending tool use to be emitted on EOF, got %d", len(toolUses))
 	}
-	if toolUses[0].ToolUseID != "toolu_1" || toolUses[0].Name != "mcpIdaProMcpStatus" {
+	if toolUses[0].ToolUseID != "toolu_01T1x1fJ34qAmk2tNTrN7Up6" || toolUses[0].Name != "mcpIdaProMcpStatus" {
 		t.Fatalf("unexpected tool use: %#v", toolUses[0])
 	}
 	if got := toolUses[0].Input["server"]; got != "ida-pro-mcp" {
@@ -158,7 +158,7 @@ func TestHandleToolUseEventReplacesGeneratedIDWhenRealIDArrives(t *testing.T) {
 		t.Fatalf("unexpected error on first frame: %v", err)
 	}
 	current, _, err = handleToolUseEvent(map[string]interface{}{
-		"toolUseId": "toolu_real",
+		"toolUseId": "toolu_01RealAAAAAAAAAAAAAAAAAA",
 		"name":      "mcpIdaProMcpStatus",
 		"input":     `"ida-pro-mcp"}`,
 		"stop":      true,
@@ -173,7 +173,7 @@ func TestHandleToolUseEventReplacesGeneratedIDWhenRealIDArrives(t *testing.T) {
 	if len(toolUses) != 1 {
 		t.Fatalf("expected one completed tool use, got %d", len(toolUses))
 	}
-	if toolUses[0].ToolUseID != "toolu_real" {
+	if toolUses[0].ToolUseID != "toolu_01RealAAAAAAAAAAAAAAAAAA" {
 		t.Fatalf("expected real tool id to replace generated id, got %q", toolUses[0].ToolUseID)
 	}
 	if got := toolUses[0].Input["server"]; got != "ida-pro-mcp" {
@@ -360,8 +360,8 @@ func TestParseEventStreamSurfacesMidStreamException(t *testing.T) {
 		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "partial"}),
 		awsEventStreamFrameWithHeaders(t, map[string]string{
 			":message-type":   "exception",
-			":exception-type":  "ThrottlingException",
-			":content-type":    "application/json",
+			":exception-type": "ThrottlingException",
+			":content-type":   "application/json",
 		}, map[string]interface{}{"message": "Too many requests"}),
 	}, nil))
 

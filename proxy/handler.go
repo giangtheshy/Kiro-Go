@@ -513,6 +513,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// a wildcard Access-Control-Allow-Origin for /admin/* — that would invite any website
 	// to script the admin API against a logged-in operator's browser.
 	if !strings.HasPrefix(path, "/admin") {
+		// Every Messages API reply carries request-id; SDKs surface it on errors
+		// and clients quote it in bug reports, so a response without one gives an
+		// operator nothing to correlate a complaint against.
+		requestID := newRequestID()
+		w.Header().Set("request-id", requestID)
+		w.Header().Set("x-request-id", requestID)
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, anthropic-version, anthropic-beta, x-api-key, x-stainless-os, x-stainless-lang, x-stainless-package-version, x-stainless-runtime, x-stainless-runtime-version, x-stainless-arch")
@@ -1312,8 +1318,15 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	}
 	if structured != nil && !structured.applyToRequest(&req) {
 		// The caller has its own tools, so the schema tool cannot be forced
-		// without suppressing them. The request proceeds unconstrained.
-		logger.Warnf("[Structured] output_config.format ignored: request also declares %d tool(s)", len(req.Tools))
+		// without suppressing them. Fall back to stating the schema in the system
+		// prompt: weaker than a forced input_schema, but dropping the constraint
+		// entirely returns free prose to a caller that asked for parseable JSON,
+		// which is the one outcome they cannot recover from.
+		applied := structured.applyAsInstruction(&req)
+		logger.Warnf("[Structured] request declares %d tool(s), so the schema tool cannot be forced; instruction fallback applied=%v",
+			len(req.Tools), applied)
+		// The synthetic tool was never installed, so nothing in the response will
+		// need unwrapping either way.
 		structured = nil
 	}
 
