@@ -261,13 +261,13 @@ type ClaudeOutputTokensDetails struct {
 
 type ClaudeUsage struct {
 	InputTokens              int                        `json:"input_tokens"`
-	OutputTokens             int                        `json:"output_tokens"`
-	CacheCreationInputTokens int                        `json:"cache_creation_input_tokens,omitempty"`
-	CacheReadInputTokens     int                        `json:"cache_read_input_tokens,omitempty"`
+	CacheCreationInputTokens int                        `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int                        `json:"cache_read_input_tokens"`
 	CacheCreation            *ClaudeCacheCreationUsage  `json:"cache_creation,omitempty"`
+	OutputTokens             int                        `json:"output_tokens"`
 	OutputTokensDetails      *ClaudeOutputTokensDetails `json:"output_tokens_details,omitempty"`
-	ServiceTier              string                     `json:"service_tier,omitempty"`
-	InferenceGeo             string                     `json:"inference_geo,omitempty"`
+	ServiceTier              string                     `json:"service_tier"`
+	InferenceGeo             string                     `json:"inference_geo"`
 }
 
 // ==================== Claude -> Kiro 转换 ====================
@@ -1197,8 +1197,12 @@ func KiroToClaudeResponse(content, thinkingContent, thinkingSignature string, in
 		Model:      model,
 		StopReason: stopReason,
 		Usage: ClaudeUsage{
-			InputTokens:  inputTokens,
-			OutputTokens: outputTokens,
+			InputTokens:              inputTokens,
+			CacheCreationInputTokens: 0,
+			CacheReadInputTokens:     0,
+			OutputTokens:             outputTokens,
+			ServiceTier:              "standard",
+			InferenceGeo:             "not_available",
 		},
 	}
 }
