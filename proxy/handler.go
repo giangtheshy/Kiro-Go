@@ -1641,10 +1641,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 
 		processClaudeText := func(text string, isThinking bool, forceFlush bool) {
-			if isThinking && !thinking {
-				return
-			}
-
+			// Forward thinking blocks from upstream regardless of client request.
+			// Reference API behavior: if upstream sends thinking (e.g. claude-sonnet-5 Pro+),
+			// it appears in the response even when client didn't explicitly request it.
+			// The 'thinking' flag only controls whether we ADD thinking via request params,
+			// not whether we STRIP thinking from upstream responses.
 			if isThinking {
 				if !allowReasoningSource(&thinkingSource) {
 					return
