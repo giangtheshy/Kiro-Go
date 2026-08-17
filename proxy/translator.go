@@ -210,9 +210,14 @@ type ClaudeContentBlock struct {
 	ID        string       `json:"id,omitempty"`
 	Name      string       `json:"name,omitempty"`
 	Input     interface{}  `json:"input,omitempty"`
+	Caller    *ToolCaller  `json:"caller,omitempty"`
 	ToolUseID string       `json:"tool_use_id,omitempty"`
 	Content   interface{}  `json:"content,omitempty"` // for tool_result
 	Source    *ImageSource `json:"source,omitempty"`
+}
+
+type ToolCaller struct {
+	Type string `json:"type"`
 }
 
 type ImageSource struct {
@@ -1163,10 +1168,11 @@ func KiroToClaudeResponse(content, thinkingContent, thinkingSignature string, in
 
 	for _, tu := range toolUses {
 		blocks = append(blocks, ClaudeContentBlock{
-			Type:  "tool_use",
-			ID:    tu.ToolUseID,
-			Name:  tu.Name,
-			Input: tu.Input,
+			Type:   "tool_use",
+			ID:     tu.ToolUseID,
+			Name:   tu.Name,
+			Input:  tu.Input,
+			Caller: &ToolCaller{Type: "direct"},
 		})
 	}
 

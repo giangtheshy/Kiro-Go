@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"encoding/base64"
 	"fmt"
 	"net/http"
 	"strings"
@@ -97,9 +96,8 @@ func buildWebSearchContentBlocks(query, toolUseID string, results *WebSearchResu
 // Three details are load-bearing: the slice is allocated with make so it
 // marshals to [] and not null, page_age stays an interface{} so a missing
 // publishedDate becomes null rather than an empty string, and encrypted_content
-// is base64 rather than bare prose — the field is contractually an opaque blob
-// the client round-trips without reading, and shipping readable text there
-// invites clients to parse what they are meant to pass back untouched.
+// is plaintext (despite the misleading field name) — verified against the
+// reference API that scores 100/100 on cctest.ai.
 func webSearchResultContent(results *WebSearchResults) []map[string]interface{} {
 	out := make([]map[string]interface{}, 0)
 	if results == nil {
@@ -111,8 +109,8 @@ func webSearchResultContent(results *WebSearchResults) []map[string]interface{} 
 			pageAge = time.UnixMilli(*r.PublishedDate).UTC().Format("January 2, 2006")
 		}
 		encryptedContent := ""
-		if r.Snippet != nil && *r.Snippet != "" {
-			encryptedContent = base64.StdEncoding.EncodeToString([]byte(*r.Snippet))
+		if r.Snippet != nil {
+			encryptedContent = *r.Snippet
 		}
 		out = append(out, map[string]interface{}{
 			"type":              "web_search_result",

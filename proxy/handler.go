@@ -1788,10 +1788,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 					"type":  "content_block_start",
 					"index": idx,
 					"content_block": map[string]interface{}{
-						"type":  "tool_use",
-						"id":    tu.ToolUseID,
-						"name":  tu.Name,
-						"input": map[string]interface{}{},
+						"type":   "tool_use",
+						"id":     tu.ToolUseID,
+						"name":   tu.Name,
+						"input":  map[string]interface{}{},
+						"caller": map[string]interface{}{"type": "direct"},
 					},
 				})
 

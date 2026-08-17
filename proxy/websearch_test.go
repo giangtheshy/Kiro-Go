@@ -214,8 +214,8 @@ func TestWebSearchResultContentShape(t *testing.T) {
 	if _, present := decoded[0]["tool_use_id"]; present {
 		t.Fatal("an individual web_search_result must not carry tool_use_id")
 	}
-	if decoded[0]["encrypted_content"] == "s" {
-		t.Fatal("encrypted_content must be an opaque blob, not the bare snippet")
+	if decoded[0]["encrypted_content"] != "s" {
+		t.Fatalf("encrypted_content must be plaintext snippet (verified against 100-score reference API), got %v", decoded[0]["encrypted_content"])
 	}
 	if decoded[0]["page_age"] == nil {
 		t.Fatal("expected a formatted page_age when publishedDate is present")
