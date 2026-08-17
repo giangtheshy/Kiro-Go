@@ -9,6 +9,11 @@ func TestAccountFailureClassifiers(t *testing.T) {
 		msg  string
 	}{
 		{name: "quota", fn: isQuotaErrorMessage, msg: "HTTP 429: quota exhausted"},
+		// A hard monthly cap, verbatim from the Kiro runtime. It arrives as 402
+		// and mentions neither "quota" nor "429", so it has to be matched on the
+		// reason code or the account stays selectable and burns the whole month.
+		{name: "monthly cap", fn: isQuotaErrorMessage,
+			msg: `HTTP 402 from Kiro Runtime: {"message":"You have reached the limit.","reason":"MONTHLY_REQUEST_COUNT"}`},
 		{name: "overage", fn: isOverageErrorMessage, msg: "HTTP 402 from Kiro IDE: OVERAGE limit exceeded"},
 		{name: "suspension", fn: isSuspensionErrorMessage, msg: "Your User ID temporarily is suspended"},
 		{name: "profile", fn: isProfileUnavailableErrorMessage, msg: "no available Kiro profile"},

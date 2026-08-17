@@ -22,9 +22,19 @@ const noUpstreamAvailableMessage = "No available accounts"
 // and response body — is logged server-side and never travels to the client.
 var errNoUpstreamAvailable = errors.New(noUpstreamAvailableMessage)
 
+// The monthly cap needs its own reason code here. It arrives as HTTP *402*
+// carrying {"message":"You have reached the limit.","reason":"MONTHLY_REQUEST_COUNT"},
+// which contains none of "429", "quota" or "throttl" — so it used to fall
+// through to the default branch and be recorded as a generic soft error. That
+// left an account with a hard monthly cap fully selectable, and every request
+// routed to it burned another 402 until the month rolled over.
 func isQuotaErrorMessage(msg string) bool {
 	msg = strings.ToLower(msg)
-	return strings.Contains(msg, "429") || strings.Contains(msg, "quota") || strings.Contains(msg, "throttl")
+	return strings.Contains(msg, "429") ||
+		strings.Contains(msg, "quota") ||
+		strings.Contains(msg, "throttl") ||
+		strings.Contains(msg, "monthly_request_count") ||
+		strings.Contains(msg, "you have reached the limit")
 }
 
 // isRelayKeyRejectedError matches a relay refusing the credential itself.
