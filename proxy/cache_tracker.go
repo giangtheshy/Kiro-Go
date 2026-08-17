@@ -517,19 +517,18 @@ func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, 
 	// against a response that simply did not opt into caching.
 	result := map[string]interface{}{
 		"input_tokens":                billedClaudeInputTokens(inputTokens, usage),
-		"output_tokens":               outputTokens,
 		"cache_creation_input_tokens": usage.CacheCreationInputTokens,
 		"cache_read_input_tokens":     usage.CacheReadInputTokens,
 	}
-	if !includeCache {
-		result["service_tier"] = "standard"
-		result["inference_geo"] = "not_available"
-		return result
+	// cache_creation object is always present in streaming (even when 0)
+	// but only when includeCache=true (which means we have a cacheProfile)
+	if includeCache {
+		result["cache_creation"] = map[string]int{
+			"ephemeral_5m_input_tokens": usage.CacheCreation5mInputTokens,
+			"ephemeral_1h_input_tokens": usage.CacheCreation1hInputTokens,
+		}
 	}
-	result["cache_creation"] = map[string]int{
-		"ephemeral_5m_input_tokens": usage.CacheCreation5mInputTokens,
-		"ephemeral_1h_input_tokens": usage.CacheCreation1hInputTokens,
-	}
+	result["output_tokens"] = outputTokens
 	result["service_tier"] = "standard"
 	result["inference_geo"] = "not_available"
 	return result
