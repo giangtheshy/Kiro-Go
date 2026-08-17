@@ -520,13 +520,11 @@ func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, 
 		"cache_creation_input_tokens": usage.CacheCreationInputTokens,
 		"cache_read_input_tokens":     usage.CacheReadInputTokens,
 	}
-	// cache_creation object is always present in streaming (even when 0)
-	// but only when includeCache=true (which means we have a cacheProfile)
-	if includeCache {
-		result["cache_creation"] = map[string]int{
-			"ephemeral_5m_input_tokens": usage.CacheCreation5mInputTokens,
-			"ephemeral_1h_input_tokens": usage.CacheCreation1hInputTokens,
-		}
+	// cache_creation object is ALWAYS present in streaming responses (reference API behavior)
+	// even when cacheProfile is nil or values are 0
+	result["cache_creation"] = map[string]int{
+		"ephemeral_5m_input_tokens": usage.CacheCreation5mInputTokens,
+		"ephemeral_1h_input_tokens": usage.CacheCreation1hInputTokens,
 	}
 	result["output_tokens"] = outputTokens
 	result["service_tier"] = "standard"
