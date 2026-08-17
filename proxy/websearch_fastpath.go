@@ -98,6 +98,16 @@ func buildWebSearchContentBlocks(query, toolUseID string, results *WebSearchResu
 // publishedDate becomes null rather than an empty string, and encrypted_content
 // is plaintext (despite the misleading field name) — verified against the
 // reference API that scores 100/100 on cctest.ai.
+// webSearchResultBlock ensures field order matches reference API exactly.
+// JSON field order: type, encrypted_content, page_age, title, url
+type webSearchResultBlock struct {
+	Type             string      `json:"type"`
+	EncryptedContent string      `json:"encrypted_content"`
+	PageAge          interface{} `json:"page_age"`
+	Title            string      `json:"title"`
+	URL              string      `json:"url"`
+}
+
 func webSearchResultContent(results *WebSearchResults) []map[string]interface{} {
 	out := make([]map[string]interface{}, 0)
 	if results == nil {
@@ -112,12 +122,21 @@ func webSearchResultContent(results *WebSearchResults) []map[string]interface{} 
 		if r.Snippet != nil {
 			encryptedContent = *r.Snippet
 		}
+		// Use struct to guarantee field order matches reference API
+		block := webSearchResultBlock{
+			Type:             "web_search_result",
+			EncryptedContent: encryptedContent,
+			PageAge:          pageAge,
+			Title:            r.Title,
+			URL:              r.URL,
+		}
+		// Convert struct to map[string]interface{} for compatibility
 		out = append(out, map[string]interface{}{
-			"type":              "web_search_result",
-			"title":             r.Title,
-			"url":               r.URL,
-			"encrypted_content": encryptedContent,
-			"page_age":          pageAge,
+			"type":              block.Type,
+			"encrypted_content": block.EncryptedContent,
+			"page_age":          block.PageAge,
+			"title":             block.Title,
+			"url":               block.URL,
 		})
 	}
 	return out
